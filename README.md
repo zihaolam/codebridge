@@ -5,8 +5,7 @@ A terminal UI for managing many [Claude Code](https://claude.com/claude-code) (a
 terminal tab per session — with no central view of which session needs your attention —
 `command-center` gives you a single split view: a session list on the left and the
 selected session's **live, interactive** screen on the right, with status that updates as
-each session works, waits for approval, or finishes its turn. A tiled multi-session grid
-is one keypress away.
+each session works, waits for approval, or finishes its turn.
 
 It is a single self-contained Go binary (`cb`). It owns each session's pseudo-terminal
 directly — **no tmux dependency** — and a long-lived daemon keeps your sessions alive even
@@ -26,8 +25,7 @@ when the UI is closed.
                                          │ attach / detach
                           ┌──────────────┴───────────────┐
                           │  cb TUI (Bubble Tea)          │
-                          │  sidebar + live screen pane,  │
-                          │  or a tiled grid of sessions  │
+                          │  sidebar + live screen pane   │
                           └───────────────────────────────┘
 ```
 
@@ -66,7 +64,6 @@ moving the binary).
 
 ```sh
 cb                 # the split view (auto-starts the daemon)
-cb tile            # jump straight to the tiled grid of all sessions
 cb install-hooks   # install the Claude Code hooks
 cb install-codex   # install the Codex hooks
 cb stop            # kill all sessions and stop the daemon
@@ -80,14 +77,16 @@ cb daemon          # run the hub in the foreground (normally auto-started)
 |-----|--------|
 | `↑`/`↓` or `k`/`j` | move selection (the right pane follows) |
 | `enter` or `Ctrl-a` `→` | focus the screen pane (type into the session) |
-| `t` | tile all sessions |
 | `n` | start a new claude session |
 | `c` | start a new codex session |
 | `x` | kill the selected session |
 | `R` | rename the selected session (defaults to the start folder, e.g. `command-center`) |
 | `Ctrl-a` `q` | quit (the daemon and sessions keep running) |
 
-### Screen pane / tiled view
+The list scrolls automatically to keep the selected session in view, so a long
+list of sessions is fully reachable.
+
+### Screen pane (session has focus)
 
 A tmux-style prefix key, **`Ctrl-a`** by default (override with the `CB_PREFIX` env var,
 e.g. `CB_PREFIX=ctrl+b`), switches from typing-into-the-session to issuing a command.
@@ -97,15 +96,28 @@ e.g. `CB_PREFIX=ctrl+b`), switches from typing-into-the-session to issuing a com
 |----------------|--------|
 | `←` | return focus to the sidebar |
 | `→` | focus the screen pane |
+| `enter` | insert a newline in the session without submitting (works on any terminal) |
+| `[` | enter scroll mode to browse the session's scrollback |
+| `n` | start a new claude session |
+| `c` | start a new codex session |
 | `q` | quit cb (sessions keep running) |
 | `x` | kill the current session |
 | `g` | jump to the session that most recently needs approval |
-| `a` | send a literal `Ctrl-a` to the session |
-| `h`/`j`/`k`/`l` or arrows | move focus between panes (tiled view) |
-| `1`–`9` | focus pane N (tiled view) |
-| `d` | detach back to the dashboard (tiled view) |
-| `n` | spawn + add a new pane (tiled view) |
-| `x` | kill the focused session (tiled view) |
+
+### Scroll mode (browsing scrollback)
+
+`Ctrl-a` `[` freezes the screen pane and lets you scroll up through the session's
+history (the border turns magenta). cb deliberately does **not** capture the mouse,
+so your terminal's native text selection / copy keeps working; scrollback is browsed
+with the keyboard.
+
+| key | action |
+|-----|--------|
+| `↑`/`↓` or `k`/`j` | scroll one line |
+| `pgup`/`pgdn` (or `b`/`f`/space) | scroll a page |
+| `g` | jump to the oldest line |
+| `G` | jump back to the live bottom |
+| `esc` or `q` | leave scroll mode (back to the live screen) |
 
 ## State & files
 
@@ -115,5 +127,5 @@ e.g. `CB_PREFIX=ctrl+b`), switches from typing-into-the-session to issuing a com
 ## Status
 
 Complete: session core, hooks (Claude Code + Codex), the unified sidebar + live screen
-view, tiled panes, and lifecycle (auto-start, clean shutdown, dead-session reaping). See
-`CLAUDE.md` for architecture details and known gotchas.
+view, and lifecycle (auto-start, clean shutdown, dead-session reaping). See `CLAUDE.md`
+for architecture details and known gotchas.

@@ -4,7 +4,7 @@ import (
 	"os"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // prefixKeyName is the tmux-style control prefix: after it, the next key is a
@@ -24,65 +24,69 @@ func prefixLabel() string {
 	return prefixKeyName
 }
 
-// namedKeyBytes maps Bubble Tea key names (msg.String()) to the byte sequences
-// a terminal application expects. Covers the common xterm sequences; the
+// codeBytes maps Bubble Tea key codes (Key.Code) to the byte sequences a
+// terminal application expects. Covers the common xterm sequences; the
 // kitty-keyboard / full-fidelity cases are deferred.
-var namedKeyBytes = map[string][]byte{
-	"enter":     {'\r'},
-	"tab":       {'\t'},
-	"space":     {' '},
-	"esc":       {0x1b},
-	"escape":    {0x1b},
-	"backspace": {0x7f},
-	"delete":    []byte("\x1b[3~"),
-	"insert":    []byte("\x1b[2~"),
-	"up":        []byte("\x1b[A"),
-	"down":      []byte("\x1b[B"),
-	"right":     []byte("\x1b[C"),
-	"left":      []byte("\x1b[D"),
-	"home":      []byte("\x1b[H"),
-	"end":       []byte("\x1b[F"),
-	"pgup":      []byte("\x1b[5~"),
-	"pgdown":    []byte("\x1b[6~"),
-	"shift+tab": []byte("\x1b[Z"),
+var codeBytes = map[rune][]byte{
+	tea.KeyEnter:     {'\r'},
+	tea.KeyTab:       {'\t'},
+	tea.KeySpace:     {' '},
+	tea.KeyEscape:    {0x1b},
+	tea.KeyBackspace: {0x7f},
+	tea.KeyDelete:    []byte("\x1b[3~"),
+	tea.KeyInsert:    []byte("\x1b[2~"),
+	tea.KeyUp:        []byte("\x1b[A"),
+	tea.KeyDown:      []byte("\x1b[B"),
+	tea.KeyRight:     []byte("\x1b[C"),
+	tea.KeyLeft:      []byte("\x1b[D"),
+	tea.KeyHome:      []byte("\x1b[H"),
+	tea.KeyEnd:       []byte("\x1b[F"),
+	tea.KeyPgUp:      []byte("\x1b[5~"),
+	tea.KeyPgDown:    []byte("\x1b[6~"),
 }
 
 // keyToBytes converts a Bubble Tea key press into the raw bytes to forward to a
 // child process. Returns nil for keys with no sensible byte encoding.
-func keyToBytes(k tea.KeyMsg) []byte {
-	// Pasted text: forward the runes verbatim.
-	if k.Paste {
-		return []byte(string(k.Runes))
+func keyToBytes(k tea.KeyPressMsg) []byte {
+	alt := k.Mod&tea.ModAlt != 0
+
+	// shift+enter -> Kitty CSI-u so the child inserts a newline instead of
+	// submitting. Claude Code reads this when it has the Kitty keyboard protocol
+	// enabled on its PTY; v2 surfaces shift+enter to us only when the host
+	// terminal supports the same protocol (key disambiguation, on by default).
+	if k.Code == tea.KeyEnter && k.Mod&tea.ModShift != 0 {
+		return []byte("\x1b[13;2u")
 	}
 
-	if k.Type == tea.KeySpace {
-		if k.Alt {
-			return []byte{0x1b, ' '}
-		}
-		return []byte{' '}
+	// shift+tab -> CSI Z (back-tab); claude uses it to cycle modes.
+	if k.Code == tea.KeyTab && k.Mod&tea.ModShift != 0 {
+		return []byte("\x1b[Z")
 	}
 
-	// Printable runes (letters, digits, symbols, and multi-rune input).
-	if k.Type == tea.KeyRunes || len(k.Runes) > 0 {
-		b := []byte(string(k.Runes))
-		if k.Alt {
+	// Printable text (letters, digits, symbols, space, multi-rune input). Text is
+	// empty for special keys and modifier combos, so this only fires for real
+	// characters.
+	if k.Text != "" {
+		b := []byte(k.Text)
+		if alt {
 			return append([]byte{0x1b}, b...)
 		}
 		return b
 	}
 
-	s := k.String()
-
-	// ctrl+<letter> -> control byte (0x01..0x1a). ctrl+space/@ -> NUL.
-	if rest, ok := strings.CutPrefix(s, "ctrl+"); ok {
-		if b, ok := ctrlBytes(rest); ok {
+	// ctrl+<letter> -> control byte (0x01..0x1a); ctrl+space/@ -> NUL, etc.
+	if k.Mod&tea.ModCtrl != 0 {
+		if b, ok := ctrlBytes(string(k.Code)); ok {
+			if alt {
+				return append([]byte{0x1b}, b...)
+			}
 			return b
 		}
 	}
 
-	base := strings.TrimPrefix(s, "alt+")
-	if b, ok := namedKeyBytes[base]; ok {
-		if k.Alt || strings.HasPrefix(s, "alt+") {
+	// Named special keys (arrows, enter, backspace, …).
+	if b, ok := codeBytes[k.Code]; ok {
+		if alt {
 			return append([]byte{0x1b}, b...)
 		}
 		return b
@@ -92,7 +96,7 @@ func keyToBytes(k tea.KeyMsg) []byte {
 
 func ctrlBytes(name string) ([]byte, bool) {
 	switch name {
-	case "space", "@":
+	case "space", "@", " ":
 		return []byte{0x00}, true
 	case "\\":
 		return []byte{0x1c}, true

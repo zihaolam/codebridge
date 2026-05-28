@@ -40,15 +40,12 @@ func Run(args []string) error {
 		return hook.Run(args[1:])
 	case "ctl":
 		return runCtl(args[1:])
-	case "tile":
-		_, err := tui.Tile()
-		return err
 	case "install-hooks":
 		return hook.Install(args[1:])
 	case "install-codex":
 		return hook.InstallCodex(args[1:])
 	case "-h", "--help", "help":
-		fmt.Println("usage: cb [daemon|ctl|hook|install-hooks|install-codex|tile|stop] ...")
+		fmt.Println("usage: cb [daemon|ctl|hook|install-hooks|install-codex|stop] ...")
 		return nil
 	default:
 		return fmt.Errorf("unknown subcommand %q", args[0])
@@ -102,30 +99,14 @@ func runCtl(args []string) error {
 	}
 }
 
-// runDashboard runs the central dashboard, handing off to the attach view when
-// the user selects a session and returning to the dashboard on detach. It auto-
-// starts the daemon if it isn't already running.
+// runDashboard runs the unified sidebar + live-screen view until the user
+// quits. It auto-starts the daemon if it isn't already running.
 func runDashboard() error {
 	if err := ensureDaemon(); err != nil {
 		return err
 	}
-	selectID := ""
-	for {
-		action, err := tui.Dashboard(selectID)
-		if err != nil {
-			return err
-		}
-		switch action {
-		case tui.DashQuit:
-			return nil
-		case tui.DashTile:
-			focused, err := tui.Tile()
-			if err != nil {
-				return err
-			}
-			selectID = focused
-		}
-	}
+	_, err := tui.Dashboard("")
+	return err
 }
 
 // ensureDaemon starts `cb daemon` in the background if the socket isn't live.

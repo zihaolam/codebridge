@@ -15,7 +15,7 @@ import (
 // ProtocolVersion is bumped whenever the daemon/client wire protocol changes.
 // The client checks it on connect so a stale daemon (e.g. left running across a
 // rebuild) fails loudly instead of silently dropping attach/input messages.
-const ProtocolVersion = 2
+const ProtocolVersion = 4
 
 // Dir is the per-user state directory for cb.
 func Dir() string {
@@ -81,10 +81,12 @@ type SessionInfo struct {
 
 // StreamUp is a client→daemon message sent on an attached connection.
 type StreamUp struct {
-	Type string `json:"type"`           // "input" | "resize" | "detach"
-	Data string `json:"data,omitempty"` // base64-encoded input bytes
+	Type string `json:"type"`           // "input" | "paste" | "resize" | "detach" | "scroll"
+	Data string `json:"data,omitempty"` // base64-encoded input/paste bytes
 	Rows int    `json:"rows,omitempty"`
 	Cols int    `json:"cols,omitempty"`
+	// scroll: how many lines up from the live bottom to show (0 == follow live).
+	Offset int `json:"offset,omitempty"`
 }
 
 // StreamDown is a daemon→client message sent on an attached connection.
@@ -94,6 +96,10 @@ type StreamDown struct {
 	CursorX int    `json:"cursor_x,omitempty"`
 	CursorY int    `json:"cursor_y,omitempty"`
 	Alt     bool   `json:"alt,omitempty"`
+	// Offset is the scroll position this frame was rendered at (lines up from
+	// the live bottom); MaxOffset is how far up the scrollback allows.
+	Offset    int `json:"offset,omitempty"`
+	MaxOffset int `json:"max_offset,omitempty"`
 }
 
 // HookPayload captures the common Claude Code hook stdin fields we rely on.

@@ -1,8 +1,9 @@
 # CLAUDE.md
 
 Guidance for working in this repo. `command-center` is a Go TUI (`cb`) that manages many
-Claude Code sessions: a long-lived daemon owns each session's PTY, and a Bubble Tea client
-renders a dashboard / tiled grid / single-session attach. No tmux dependency.
+Claude Code / Codex sessions: a long-lived daemon owns each session's PTY, and a Bubble Tea
+client renders a single unified view — a session list sidebar plus the selected session's
+live, interactive screen. No tmux dependency.
 
 ## Build / test / run
 
@@ -21,7 +22,7 @@ under a PTY (see the Python `pty` harnesses used during development) or test by 
 ```sh
 ./dist/cb daemon &            # or let `cb` auto-start it
 ./dist/cb ctl spawn claude
-./dist/cb                     # sidebar + live screen; ^a →/← switch focus, t to tile
+./dist/cb                     # sidebar + live screen; ^a →/← switch focus
 ```
 
 ## Architecture
@@ -32,8 +33,10 @@ under a PTY (see the Python `pty` harnesses used during development) or test by 
   `wait` (reap + mark ended). Status enum is set by hook events, not by scraping output.
 - **`internal/daemon`** — the hub. Owns the session registry and a unix-socket listener
   (`daemon.go`). `stream.go` handles `attach`: a bidirectional stream that pushes deduped
-  screen frames (`~30fps`) and accepts input/resize/detach. Spawns sessions with
-  `CB_SESSION=<uuid>` injected so hooks can correlate.
+  screen frames (`~30fps`) and accepts input/resize/detach/scroll. A `scroll` message sets
+  a per-attach offset; the frame loop renders `Session.RenderScroll(offset)` (scrollback +
+  visible grid) and reports the clamped `Offset`/`MaxOffset` back in each frame. Spawns
+  sessions with `CB_SESSION=<uuid>` injected so hooks can correlate.
 - **`internal/ipc`** — the wire protocol: line-delimited JSON. `Request`/`Response` for
   one-shot calls (`ping`/`spawn`/`list`/`kill`/`hook`/`shutdown`), `StreamUp`/`StreamDown`
   for attached connections. `ProtocolVersion` gates against a stale daemon.
@@ -41,10 +44,14 @@ under a PTY (see the Python `pty` harnesses used during development) or test by 
   reads stdin JSON + `CB_SESSION` env and POSTs to the daemon, always exiting 0.
   `install.go` merges hook entries into `~/.claude/settings.json` (idempotent, writes a
   `.bak`); `Installed()` detects whether they're present.
-- **`internal/tui`** — Bubble Tea client. `dashboard.go` (session list, polls `list` every
-  500ms), `attach.go` (single session), `tile.go` (live grid: one attach connection per
-  pane, lipgloss-composited, focus-routed input). `keys.go` maps Bubble Tea keys → raw
-  bytes for forwarding.
+- **`internal/tui`** — Bubble Tea client. `dashboard.go` is the whole UI: a sidebar
+  (session list, polls `list` every 500ms) beside a live screen pane that opens one attach
+  stream to the selected session and forwards input when focused (`focusZone`). The sidebar
+  scrolls to keep the cursor visible (`clampTop`); `prefix [` enters a keyboard scroll mode
+  that browses the screen pane's scrollback via daemon-rendered frames. The mouse is left
+  uncaptured on purpose so the terminal's native text selection keeps working. `keys.go`
+  maps Bubble Tea keys → raw bytes for forwarding; the `ctrl+a` prefix (configurable via
+  `CB_PREFIX`) switches focus / quits.
 - **`internal/cli`** — subcommand router + `ensureDaemon` (auto-start with a readiness wait
   and protocol-version check).
 

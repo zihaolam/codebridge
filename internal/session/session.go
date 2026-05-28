@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
 )
@@ -29,10 +30,10 @@ const (
 )
 
 // emuPad is a spare column we give the emulator beyond the PTY width. Claude
-// Code (and other Ink-based TUIs) occasionally draw a full-width rule one
-// column wider than the reported terminal size; in a real terminal the last
-// column's deferred-wrap swallows it, but the emulator would otherwise wrap the
-// extra glyph onto a stray line. The spare column absorbs that overflow, and
+// Code (and other Ink-based TUIs) draw full-width rules and boxes that put a
+// glyph in the last column; in a real terminal the last column's deferred wrap
+// holds the cursor there until the next write, but the emulator wraps the extra
+// glyph onto a stray next line. The spare column absorbs that overflow, and
 // Render trims back to the PTY width so the stray glyph never shows.
 const emuPad = 1
 
@@ -147,6 +148,15 @@ func (s *Session) WriteInput(p []byte) (int, error) {
 	return s.ptmx.Write(p)
 }
 
+// Paste forwards pasted text to the child. The emulator wraps it in
+// bracketed-paste markers (ESC[200~ … ESC[201~) when the child has bracketed
+// paste mode enabled — as Claude Code does — so the whole paste arrives as one
+// unit and isn't chunked or interpreted character-by-character. The bytes flow
+// through the emulator's reply pipe, which replyLoop drains into the PTY.
+func (s *Session) Paste(text string) {
+	s.emu.Paste(text)
+}
+
 // Resize updates both the PTY window size (triggering SIGWINCH so the child
 // repaints) and the emulator grid.
 func (s *Session) Resize(rows, cols int) error {
@@ -166,17 +176,72 @@ func (s *Session) Render() string {
 	s.mu.RLock()
 	cols := s.cols
 	s.mu.RUnlock()
-	full := s.emu.Render()
+	return trimCols(s.emu.Render(), cols)
+}
+
+// trimCols clips each line of s to at most cols runes. cols <= 0 is a no-op.
+func trimCols(s string, cols int) string {
 	if cols <= 0 {
-		return full
+		return s
 	}
-	lines := strings.Split(full, "\n")
+	lines := strings.Split(s, "\n")
 	for i, ln := range lines {
 		if r := []rune(ln); len(r) > cols {
 			lines[i] = string(r[:cols])
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// RenderScroll returns a snapshot of the screen scrolled `offset` lines up from
+// the live bottom (offset 0 == the live screen). It composes lines from the
+// scrollback buffer and the visible grid into exactly `rows` lines, and reports
+// the clamped offset actually used plus the maximum offset (the scrollback
+// length) so a client can bound its scrolling and show the position. The view is
+// anchored to the live bottom, so new output shifts a scrolled view downward.
+func (s *Session) RenderScroll(offset int) (screen string, clamped int, maxOffset int) {
+	maxOffset = s.emu.ScrollbackLen()
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	if offset == 0 {
+		return s.Render(), 0, maxOffset
+	}
+
+	s.mu.RLock()
+	rows, cols := s.rows, s.cols
+	s.mu.RUnlock()
+
+	// Virtual buffer: scrollback lines [0,maxOffset) followed by the visible
+	// grid. top is the first virtual line shown; the window is `rows` tall.
+	vis := strings.Split(s.Render(), "\n")
+	top := maxOffset - offset
+	lines := make([]string, rows)
+	for y := 0; y < rows; y++ {
+		idx := top + y
+		switch {
+		case idx < 0:
+			lines[y] = ""
+		case idx < maxOffset:
+			line := make(uv.Line, cols)
+			for x := 0; x < cols; x++ {
+				if c := s.emu.ScrollbackCellAt(x, idx); c != nil {
+					line[x] = *c
+				} else {
+					line[x] = uv.EmptyCell
+				}
+			}
+			lines[y] = line.Render()
+		default:
+			if gy := idx - maxOffset; gy >= 0 && gy < len(vis) {
+				lines[y] = vis[gy]
+			}
+		}
+	}
+	return strings.Join(lines, "\n"), offset, maxOffset
 }
 
 // Cursor returns the current cursor cell position.

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"command-center/internal/ipc"
@@ -39,25 +40,32 @@ func (d *Daemon) attach(conn net.Conn, sc *bufio.Scanner, req ipc.Request) {
 	var once sync.Once
 	closeStop := func() { once.Do(func() { close(stop) }) }
 
+	// scrollOff is the client's requested scroll position (lines up from the
+	// live bottom, 0 == follow). Written by the up-loop, read by the frame loop.
+	var scrollOff atomic.Int64
+
 	go func() {
 		t := time.NewTicker(frameInterval)
 		defer t.Stop()
 		last := ""
+		lastOff, lastMax := -1, -1
 		for {
 			select {
 			case <-stop:
 				return
 			case <-t.C:
-				screen := s.Render()
-				if screen != last {
-					last = screen
+				screen, off, maxOff := s.RenderScroll(int(scrollOff.Load()))
+				if screen != last || off != lastOff || maxOff != lastMax {
+					last, lastOff, lastMax = screen, off, maxOff
 					cx, cy := s.Cursor()
 					_ = write(ipc.StreamDown{
-						Type:    "frame",
-						Screen:  screen,
-						CursorX: cx,
-						CursorY: cy,
-						Alt:     s.IsAltScreen(),
+						Type:      "frame",
+						Screen:    screen,
+						CursorX:   cx,
+						CursorY:   cy,
+						Alt:       s.IsAltScreen(),
+						Offset:    off,
+						MaxOffset: maxOff,
 					})
 				}
 				if s.Exited() {
@@ -78,10 +86,16 @@ func (d *Daemon) attach(conn net.Conn, sc *bufio.Scanner, req ipc.Request) {
 			if data, err := base64.StdEncoding.DecodeString(up.Data); err == nil {
 				_, _ = s.WriteInput(data)
 			}
+		case "paste":
+			if data, err := base64.StdEncoding.DecodeString(up.Data); err == nil {
+				s.Paste(string(data))
+			}
 		case "resize":
 			if up.Rows > 0 && up.Cols > 0 {
 				_ = s.Resize(up.Rows, up.Cols)
 			}
+		case "scroll":
+			scrollOff.Store(int64(up.Offset))
 		case "detach":
 			closeStop()
 			return

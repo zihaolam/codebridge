@@ -94,8 +94,8 @@ func TestSidebarViewRenders(t *testing.T) {
 		streamID: "aaaaaaaa11",
 		screen:   "hello from the session",
 	}
-	out := m.View()
-	for _, want := range []string{"api-fix", "command-center", "hello from the session"} {
+	out := m.renderLive()
+	for _, want := range []string{"api-fix", "codebridge", "hello from the session"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("view missing %q", want)
 		}
@@ -115,6 +115,27 @@ func TestDisplayName(t *testing.T) {
 	for _, c := range cases {
 		if got := displayName(c.s); got != c.want {
 			t.Errorf("displayName(%+v) = %q, want %q", c.s, got, c.want)
+		}
+	}
+}
+
+func TestClampTop(t *testing.T) {
+	cases := []struct {
+		name                        string
+		cursor, top, count, maxRows int
+		want                        int
+	}{
+		{"fits entirely", 3, 0, 5, 10, 0},
+		{"cursor above window scrolls up", 2, 5, 20, 6, 2},
+		{"cursor below window scrolls down", 9, 0, 20, 6, 4},
+		{"cursor inside window keeps top", 4, 2, 20, 6, 2},
+		{"clamp to last page", 19, 18, 20, 6, 14},
+		{"never negative", 0, 0, 2, 6, 0},
+	}
+	for _, c := range cases {
+		if got := clampTop(c.cursor, c.top, c.count, c.maxRows); got != c.want {
+			t.Errorf("%s: clampTop(%d,%d,%d,%d) = %d, want %d",
+				c.name, c.cursor, c.top, c.count, c.maxRows, got, c.want)
 		}
 	}
 }
