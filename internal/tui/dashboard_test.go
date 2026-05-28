@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	"command-center/internal/ipc"
@@ -63,6 +64,41 @@ func TestLatestPending(t *testing.T) {
 
 	if c, l := latestPending([]ipc.SessionInfo{{ID: "x", Status: "working"}}); c != 0 || l != "" {
 		t.Errorf("no-pending case = (%d,%q), want (0,\"\")", c, l)
+	}
+}
+
+func TestPendingSummaryExcludesSelf(t *testing.T) {
+	sessions := []ipc.SessionInfo{
+		{ID: "bbb", Status: "needs_approval", StatusSince: 200},
+		{ID: "ccc", Status: "needs_approval", StatusSince: 500},
+	}
+	// Excluding the most-recent one drops it from the count and the jump target.
+	count, latest := pendingSummary(sessions, "ccc")
+	if count != 1 || latest != "bbb" {
+		t.Errorf("pendingSummary excl ccc = (%d,%q), want (1,\"bbb\")", count, latest)
+	}
+	// Excluding the only remaining pending session yields nothing to nag about.
+	if c, l := pendingSummary([]ipc.SessionInfo{{ID: "x", Status: "needs_approval"}}, "x"); c != 0 || l != "" {
+		t.Errorf("pendingSummary excl only = (%d,%q), want (0,\"\")", c, l)
+	}
+}
+
+func TestSidebarViewRenders(t *testing.T) {
+	m := &dashboardModel{
+		w: 100, h: 30,
+		paneW: 60, paneH: 24,
+		sessions: []ipc.SessionInfo{
+			{ID: "aaaaaaaa11", Name: "api-fix", Status: "needs_approval", LastMessage: "run rm -rf?"},
+			{ID: "bbbbbbbb22", Status: "working"},
+		},
+		streamID: "aaaaaaaa11",
+		screen:   "hello from the session",
+	}
+	out := m.View()
+	for _, want := range []string{"api-fix", "command-center", "hello from the session", "run rm -rf?"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("view missing %q", want)
+		}
 	}
 }
 

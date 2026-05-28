@@ -6,6 +6,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+// prefixKeyName is the tmux-style control prefix. After it, the next key is a
+// command (focus switch, literal-prefix passthrough) rather than session input.
+const prefixKeyName = "ctrl+a"
+
 // namedKeyBytes maps Bubble Tea key names (msg.String()) to the byte sequences
 // a terminal application expects. Covers the common xterm sequences; the
 // kitty-keyboard / full-fidelity cases are deferred.

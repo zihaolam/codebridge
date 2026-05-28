@@ -268,7 +268,11 @@ func (m *tileModel) refreshStatuses() {
 			p.info = s
 		}
 	}
-	m.pendingCount, m.pendingLatest = latestPending(resp.Sessions)
+	focused := ""
+	if m.focus < len(m.panes) {
+		focused = m.panes[m.focus].id
+	}
+	m.pendingCount, m.pendingLatest = pendingSummary(resp.Sessions, focused)
 }
 
 // jumpToPending focuses the pane for the most-recent needs_approval session,

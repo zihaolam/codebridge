@@ -9,9 +9,10 @@ import (
 	"strings"
 )
 
-// events we register cb as an observer for. This is a superset; Claude Code
-// simply won't fire events it doesn't support, so extra names are harmless.
-var installEvents = []string{
+// claudeEvents are the hook events we register with Claude Code. This is a
+// superset; Claude Code simply won't fire events it doesn't support, so extra
+// names are harmless.
+var claudeEvents = []string{
 	"SessionStart",
 	"UserPromptSubmit",
 	"PreToolUse",
@@ -22,6 +23,20 @@ var installEvents = []string{
 	"SessionEnd",
 }
 
+// codexEvents are the hook events we register with Codex. Codex's hook payload
+// and config schema match Claude Code's, but its event set differs (no
+// Notification/SessionEnd; approvals arrive as PermissionRequest, and session
+// end is detected from the child process exiting). We only register events this
+// Codex version actually emits to avoid tripping strict config validation.
+var codexEvents = []string{
+	"SessionStart",
+	"UserPromptSubmit",
+	"PreToolUse",
+	"PostToolUse",
+	"PermissionRequest",
+	"Stop",
+}
+
 // Install merges cb hook entries into a Claude Code settings.json, preserving
 // any existing content and hooks. Flags:
 //
@@ -29,7 +44,28 @@ var installEvents = []string{
 //	--bin <path>       cb binary path used in the hook command (default: this exe)
 //	--print            print the merged result to stdout instead of writing
 func Install(args []string) error {
-	settingsPath := defaultSettingsPath()
+	return install(args, defaultSettingsPath(), claudeEvents, "Claude Code")
+}
+
+// InstallCodex merges cb hook entries into Codex's hooks.json (default
+// ~/.codex/hooks.json), which is a separate file from config.toml — so it never
+// disturbs an existing `notify` or other Codex settings. Same flags as Install,
+// except the target path flag is --hooks.
+func InstallCodex(args []string) error {
+	// Accept --hooks as an alias for --settings for a friendlier name.
+	norm := make([]string, len(args))
+	for i, a := range args {
+		if a == "--hooks" {
+			a = "--settings"
+		}
+		norm[i] = a
+	}
+	return install(norm, defaultCodexHooksPath(), codexEvents, "Codex")
+}
+
+// install does the shared merge: read the JSON file (if any), replace our prior
+// hook entries for each event with a fresh one, and write it back with a .bak.
+func install(args []string, settingsPath string, events []string, agent string) error {
 	binPath := defaultBinCommand()
 	print := false
 
@@ -69,12 +105,12 @@ func Install(args []string) error {
 	}
 
 	added := 0
-	for _, ev := range installEvents {
+	for _, ev := range events {
 		cmd := binPath + " hook " + ev
 		// Drop any prior cb entry for this event (e.g. an absolute path baked
 		// in before the binary was moved) so re-running heals stale commands
 		// instead of stacking a second, broken one.
-		arr := stripCcmgrHooks(asArray(hooks[ev]), ev)
+		arr := stripOurHooks(asArray(hooks[ev]), ev)
 		entry := map[string]any{
 			"matcher": "",
 			"hooks": []any{
@@ -108,7 +144,7 @@ func Install(args []string) error {
 	if err := os.WriteFile(settingsPath, out, 0o644); err != nil {
 		return err
 	}
-	fmt.Printf("installed %d cb hook(s) into %s\n", added, settingsPath)
+	fmt.Printf("installed %d cb hook(s) for %s into %s\n", added, agent, settingsPath)
 	return nil
 }
 
@@ -158,6 +194,19 @@ func defaultSettingsPath() string {
 	return filepath.Join(home, ".claude", "settings.json")
 }
 
+// defaultCodexHooksPath honors CODEX_HOME (Codex's state dir override) and
+// falls back to ~/.codex/hooks.json.
+func defaultCodexHooksPath() string {
+	if h := os.Getenv("CODEX_HOME"); h != "" {
+		return filepath.Join(h, "hooks.json")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".codex/hooks.json"
+	}
+	return filepath.Join(home, ".codex", "hooks.json")
+}
+
 // defaultBinCommand is the command string baked into the hook entries. If a
 // `cb` is resolvable on PATH we use the bare name, so the hooks keep working
 // when the binary is moved (e.g. into /usr/local/bin). Otherwise we fall back to
@@ -177,10 +226,15 @@ func asArray(v any) []any {
 	return arr
 }
 
-// stripCcmgrHooks removes inner hook commands that look like a cb hook for
-// the given event (binary basename "cb", command ending in " hook <ev>"),
+// our binary names, current and legacy, whose hook entries we own and may
+// replace on reinstall. "ccmgr" is the pre-rename name; keeping it here means
+// reinstalling heals configs left behind by the old binary.
+var ourBinNames = map[string]bool{"cb": true, "ccmgr": true}
+
+// stripOurHooks removes inner hook commands that look like one of ours for the
+// given event (binary basename in ourBinNames, command ending in " hook <ev>"),
 // dropping any entry left with no inner hooks.
-func stripCcmgrHooks(arr []any, ev string) []any {
+func stripOurHooks(arr []any, ev string) []any {
 	suffix := " hook " + ev
 	out := arr[:0]
 	for _, e := range arr {
@@ -194,13 +248,13 @@ func stripCcmgrHooks(arr []any, ev string) []any {
 		for _, h := range inner {
 			hm, _ := h.(map[string]any)
 			c, _ := hm["command"].(string)
-			if strings.HasSuffix(c, suffix) && filepath.Base(strings.Fields(c)[0]) == "cb" {
-				continue // a cb hook for this event: drop it
+			if strings.HasSuffix(c, suffix) && ourBinNames[filepath.Base(strings.Fields(c)[0])] {
+				continue // one of our hooks for this event: drop it
 			}
 			kept = append(kept, h)
 		}
 		if len(kept) == 0 {
-			continue // entry only held cb hooks: drop the whole entry
+			continue // entry only held our hooks: drop the whole entry
 		}
 		m["hooks"] = kept
 		out = append(out, m)

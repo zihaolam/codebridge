@@ -1,9 +1,12 @@
 package tui
 
 import (
+	"bufio"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"net"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
@@ -19,8 +22,17 @@ type DashAction int
 
 const (
 	DashQuit DashAction = iota
-	DashAttach
 	DashTile
+)
+
+// focusZone is which pane currently receives keystrokes: the sidebar (list
+// navigation + dashboard commands) or the screen pane (forwarded to the
+// session as raw input).
+type focusZone int
+
+const (
+	focusSidebar focusZone = iota
+	focusScreen
 )
 
 const dashRefreshInterval = 500 * time.Millisecond
@@ -53,28 +65,166 @@ type dashboardModel struct {
 	renameID  string // session being renamed
 	renameBuf string
 
-	chosen     string
 	action     DashAction
 	hooksOK    bool
 	wantSelect string // pre-select this session id once the list loads
+
+	focus  focusZone // sidebar navigation vs. screen input
+	prefix bool      // ctrl+a pressed; next key is a command
+
+	// live screen of the selected session (right pane). When focus==focusScreen,
+	// keystrokes are forwarded to this session over the same connection.
+	streamID string   // session currently streamed into the right pane
+	screen   string   // latest rendered frame (kept across switches to avoid flicker)
+	gone     bool     // streamed session ended
+	conn     net.Conn // attach stream (nil when none)
+	ch       chan previewMsg
+	paneW    int // inner cols of the screen pane (the session is sized to this)
+	paneH    int // inner rows available for the session screen
 }
 
-// Dashboard runs the central session list. selectID, if non-empty, is the
-// session to highlight on entry (e.g. the one just detached from). It returns
-// the selected session id and the action the caller should take.
-func Dashboard(selectID string) (string, DashAction, error) {
-	m := &dashboardModel{hooksOK: hook.Installed(), prev: map[string]string{}, wantSelect: selectID}
+// previewMsg carries a frame from the screen-pane attach stream. id tags which
+// session it came from so frames from a just-closed connection are ignored.
+type previewMsg struct {
+	id     string
+	screen string
+	gone   bool
+}
+
+// Dashboard runs the unified two-zone view: a session list on the left and the
+// selected session's live screen on the right. selectID, if non-empty, is the
+// session to highlight on entry. It returns the action the caller should take.
+func Dashboard(selectID string) (DashAction, error) {
+	m := &dashboardModel{
+		hooksOK:    hook.Installed(),
+		prev:       map[string]string{},
+		wantSelect: selectID,
+		ch:         make(chan previewMsg, 64),
+	}
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	res, err := p.Run()
+	if m.conn != nil {
+		_ = m.conn.Close()
+	}
 	if err != nil {
-		return "", DashQuit, err
+		return DashQuit, err
 	}
 	final := res.(*dashboardModel)
-	return final.chosen, final.action, nil
+	return final.action, nil
 }
 
 func (m *dashboardModel) Init() tea.Cmd {
-	return tea.Batch(refreshCmd, tick())
+	return tea.Batch(refreshCmd, tick(), m.waitFrame())
+}
+
+// waitFrame blocks on the shared screen channel and surfaces the next frame as
+// a message. It's re-armed after each frame, so a single long-lived loop serves
+// whichever session is currently selected.
+func (m *dashboardModel) waitFrame() tea.Cmd {
+	return func() tea.Msg { return <-m.ch }
+}
+
+// selectedID is the id of the session under the cursor, or "" if none.
+func (m *dashboardModel) selectedID() string {
+	if m.cursor >= 0 && m.cursor < len(m.sessions) {
+		return m.sessions[m.cursor].ID
+	}
+	return ""
+}
+
+func (m *dashboardModel) sessionByID(id string) *ipc.SessionInfo {
+	for i := range m.sessions {
+		if m.sessions[i].ID == id {
+			return &m.sessions[i]
+		}
+	}
+	return nil
+}
+
+// syncStream ensures the screen pane is attached to the currently selected
+// session: if the selection changed, it tears down the old stream and opens a
+// new one. The session is resized to the pane so its render fits. The old
+// screen is intentionally kept on display until the first frame of the new
+// session arrives, so switching sessions doesn't flash a blank pane.
+func (m *dashboardModel) syncStream() {
+	id := m.selectedID()
+	if id == m.streamID && (id == "" || m.conn != nil) {
+		return
+	}
+	if m.conn != nil {
+		_ = m.conn.Close()
+		m.conn = nil
+	}
+	m.streamID = id
+	m.gone = false
+	if id == "" {
+		m.screen = ""
+		return
+	}
+	conn, err := net.Dial("unix", ipc.SocketPath())
+	if err != nil {
+		return
+	}
+	req := ipc.Request{Type: "attach", ID: id}
+	if m.paneW > 0 && m.paneH > 0 {
+		req.Rows, req.Cols = m.paneH, m.paneW
+	}
+	if err := ipc.WriteJSON(conn, req); err != nil {
+		_ = conn.Close()
+		return
+	}
+	m.conn = conn
+	go previewReadLoop(id, conn, m.ch)
+}
+
+// sendInput forwards raw bytes to the streamed session (used when the screen
+// pane has focus).
+func (m *dashboardModel) sendInput(b []byte) {
+	if m.conn != nil {
+		_ = ipc.WriteJSON(m.conn, ipc.StreamUp{Type: "input", Data: base64.StdEncoding.EncodeToString(b)})
+	}
+}
+
+// previewReadLoop pumps a screen attach stream into ch until the connection
+// closes (which happens when we switch away or the session ends).
+func previewReadLoop(id string, conn net.Conn, ch chan previewMsg) {
+	sc := bufio.NewScanner(conn)
+	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for sc.Scan() {
+		var d ipc.StreamDown
+		if json.Unmarshal(sc.Bytes(), &d) != nil {
+			continue
+		}
+		if d.Type == "gone" {
+			ch <- previewMsg{id: id, gone: true}
+			return
+		}
+		ch <- previewMsg{id: id, screen: d.Screen}
+	}
+}
+
+const sidebarWidth = 22
+
+// relayoutStream recomputes the screen pane size from the window size and, if
+// it changed, tells the currently streamed session to resize to match.
+func (m *dashboardModel) relayoutStream() {
+	// width: window minus sidebar, the divider border, and its left padding.
+	innerW := m.w - sidebarWidth - 3
+	// height: window minus the title row, the pane header, and its divider.
+	innerH := m.h - 4
+	if innerW < 1 {
+		innerW = 1
+	}
+	if innerH < 1 {
+		innerH = 1
+	}
+	if innerW == m.paneW && innerH == m.paneH {
+		return
+	}
+	m.paneW, m.paneH = innerW, innerH
+	if m.conn != nil {
+		_ = ipc.WriteJSON(m.conn, ipc.StreamUp{Type: "resize", Rows: innerH, Cols: innerW})
+	}
 }
 
 func refreshCmd() tea.Msg {
@@ -86,10 +236,14 @@ func tick() tea.Cmd {
 	return tea.Tick(dashRefreshInterval, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
-func spawnClaudeCmd() tea.Msg {
-	cwd, _ := os.Getwd()
-	_, _ = ipc.Send(ipc.Request{Type: "spawn", Argv: []string{"claude"}, Cwd: cwd})
-	return refreshCmd()
+// spawnCmd starts a new session running bin (e.g. "claude" or "codex") in the
+// dashboard's working directory, then refreshes the list.
+func spawnCmd(bin string) tea.Cmd {
+	return func() tea.Msg {
+		cwd, _ := os.Getwd()
+		_, _ = ipc.Send(ipc.Request{Type: "spawn", Argv: []string{bin}, Cwd: cwd})
+		return refreshCmd()
+	}
 }
 
 func killCmd(id string) tea.Cmd {
@@ -110,12 +264,24 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
+		m.relayoutStream()
 		return m, nil
 
 	case tickMsg:
 		m.spin++
 		m.expireToasts()
 		return m, tea.Batch(refreshCmd, tick())
+
+	case previewMsg:
+		if msg.id == m.streamID {
+			if msg.gone {
+				m.gone = true
+				m.focus = focusSidebar // can't type into a dead session
+			} else {
+				m.screen = msg.screen
+			}
+		}
+		return m, m.waitFrame()
 
 	case sessionsMsg:
 		if msg.err != nil {
@@ -137,51 +303,111 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.cursor >= len(m.sessions) {
 			m.cursor = max(0, len(m.sessions)-1)
 		}
+		m.syncStream()
 		return m, nil
 
 	case tea.KeyMsg:
-		if m.renaming {
-			return m.updateRename(msg)
+		return m.handleKey(msg)
+	}
+	return m, nil
+}
+
+// handleKey routes a keystroke through the rename prompt, the ctrl+a prefix,
+// and then either the screen pane (forwarded as input) or the sidebar.
+func (m *dashboardModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.renaming {
+		return m.updateRename(msg)
+	}
+	if m.prefix {
+		m.prefix = false
+		return m.handlePrefix(msg)
+	}
+	if msg.String() == prefixKeyName {
+		m.prefix = true
+		return m, nil
+	}
+	if m.focus == focusScreen {
+		if b := keyToBytes(msg); b != nil {
+			m.sendInput(b)
 		}
-		switch msg.String() {
-		case "q", "ctrl+c":
-			m.action = DashQuit
+		return m, nil
+	}
+	return m.handleSidebarKey(msg)
+}
+
+// handlePrefix handles the key following ctrl+a: switch focus between the
+// sidebar and the screen pane, jump to a pending session, or pass a literal
+// ctrl+a through to the focused session.
+func (m *dashboardModel) handlePrefix(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "left", "h":
+		m.focus = focusSidebar
+	case "right", "l":
+		if m.streamID != "" && !m.gone {
+			m.focus = focusScreen
+		}
+	case prefixKeyName, "a":
+		if m.focus == focusScreen {
+			m.sendInput([]byte{0x01}) // literal Ctrl-a
+		}
+	case "g":
+		if _, latest := pendingSummary(m.sessions, ""); latest != "" {
+			for i, s := range m.sessions {
+				if s.ID == latest {
+					m.cursor = i
+					break
+				}
+			}
+			m.syncStream()
+			m.focus = focusScreen
+		}
+	}
+	return m, nil
+}
+
+// handleSidebarKey handles navigation and dashboard commands while the sidebar
+// has focus.
+func (m *dashboardModel) handleSidebarKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "ctrl+c":
+		m.action = DashQuit
+		return m, tea.Quit
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+			m.syncStream()
+		}
+	case "down", "j":
+		if m.cursor < len(m.sessions)-1 {
+			m.cursor++
+			m.syncStream()
+		}
+	case "enter", "right", "l":
+		if m.streamID != "" && !m.gone {
+			m.focus = focusScreen
+		}
+	case "t":
+		if len(m.sessions) > 0 {
+			m.action = DashTile
 			return m, tea.Quit
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
-			}
-		case "down", "j":
-			if m.cursor < len(m.sessions)-1 {
-				m.cursor++
-			}
-		case "enter":
-			if len(m.sessions) > 0 {
-				m.chosen = m.sessions[m.cursor].ID
-				m.action = DashAttach
-				return m, tea.Quit
-			}
-		case "t":
-			if len(m.sessions) > 0 {
-				m.action = DashTile
-				return m, tea.Quit
-			}
-		case "n":
-			return m, spawnClaudeCmd
-		case "x":
-			if len(m.sessions) > 0 {
-				return m, killCmd(m.sessions[m.cursor].ID)
-			}
-		case "R":
-			if len(m.sessions) > 0 {
-				s := m.sessions[m.cursor]
-				m.renaming = true
-				m.renameID = s.ID
-				m.renameBuf = s.Name
-			}
-		case "r":
-			return m, refreshCmd
 		}
+	case "n":
+		return m, spawnCmd("claude")
+	case "c":
+		return m, spawnCmd("codex")
+	case "x":
+		if len(m.sessions) > 0 {
+			return m, killCmd(m.sessions[m.cursor].ID)
+		}
+	case "R":
+		if len(m.sessions) > 0 {
+			s := m.sessions[m.cursor]
+			m.renaming = true
+			m.renameID = s.ID
+			m.renameBuf = s.Name
+		}
+	case "r":
+		return m, refreshCmd
 	}
 	return m, nil
 }
@@ -289,14 +515,23 @@ func (m *dashboardModel) detectTransitions(next []ipc.SessionInfo) {
 // latestPending returns how many sessions need approval and the id of the one
 // that entered needs_approval most recently (the "latest" to jump to).
 func latestPending(sessions []ipc.SessionInfo) (count int, latestID string) {
+	return pendingSummary(sessions, "")
+}
+
+// pendingSummary is latestPending with an exclusion: the session you're already
+// viewing (excludeID) is left out of both the count and the jump target, so the
+// banner doesn't nag you about an approval screen you're already looking at —
+// while still counting any other sessions that need approval.
+func pendingSummary(sessions []ipc.SessionInfo, excludeID string) (count int, latestID string) {
 	var newest int64 = -1
 	for _, s := range sessions {
-		if s.Status == "needs_approval" {
-			count++
-			if s.StatusSince > newest {
-				newest = s.StatusSince
-				latestID = s.ID
-			}
+		if s.Status != "needs_approval" || s.ID == excludeID {
+			continue
+		}
+		count++
+		if s.StatusSince > newest {
+			newest = s.StatusSince
+			latestID = s.ID
 		}
 	}
 	return count, latestID
@@ -319,119 +554,150 @@ func (m *dashboardModel) expireToasts() {
 	m.toasts = kept
 }
 
+var (
+	screenBorderStyle = lipgloss.NewStyle().
+				Border(lipgloss.NormalBorder(), false, false, false, true).
+				BorderForeground(lipgloss.Color("8")).
+				PaddingLeft(1)
+	screenFocusBorderStyle = screenBorderStyle.BorderForeground(lipgloss.Color("12"))
+	rowStyle               = lipgloss.NewStyle().Width(sidebarWidth)
+	selRowStyle            = rowStyle.Reverse(true)
+	selRowDimStyle         = rowStyle.Foreground(lipgloss.Color("12"))
+)
+
 func (m *dashboardModel) View() string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("command-center") + "  ")
-	b.WriteString(helpStyle.Render(fmt.Sprintf("%d session(s)", len(m.sessions))) + "\n\n")
-
+	header := titleStyle.Render("command-center") + "  " +
+		helpStyle.Render(fmt.Sprintf("%d session(s)", len(m.sessions)))
 	if m.errMsg != "" {
-		b.WriteString(statusStyle["needs_approval"].Render("daemon: "+m.errMsg) + "\n\n")
+		header += "  " + statusStyle["needs_approval"].Render("daemon: "+m.errMsg)
 	}
-
 	if !m.hooksOK {
-		b.WriteString(statusStyle["waiting_user"].Render("⚠ hooks not installed — status stays \"starting\". run: cb install-hooks") + "\n\n")
+		header += "\n" + statusStyle["waiting_user"].Render("⚠ hooks not installed — run: cb install-hooks")
 	}
 
-	if len(m.sessions) == 0 {
-		b.WriteString(helpStyle.Render("no sessions — press n to start a claude session\n"))
-	}
+	body := lipgloss.JoinHorizontal(lipgloss.Top, m.renderSidebar(), m.renderScreen())
 
-	// Surface needs-approval sessions first conceptually by ordering display,
-	// but keep stable ids; only sort a copy for the attention summary.
-	attention := attentionList(m.sessions)
-	if len(attention) > 0 {
-		b.WriteString(statusStyle["needs_approval"].Render("⚑ needs you: ") + strings.Join(attention, ", ") + "\n\n")
+	out := header + "\n" + body
+	if line := m.toastLine(); line != "" {
+		out += "\n" + line
 	}
-
-	for i, s := range m.sessions {
-		cursor := "  "
-		if i == m.cursor {
-			cursor = "▶ "
-		}
-		line := fmt.Sprintf("%s%s %s  %-8s  %s", cursor, m.indicator(s.Status), badge(s.Status), s.ID[:8], displayLabel(s))
-		if i == m.cursor {
-			line = selStyle.Render(line)
-		}
-		b.WriteString(line + "\n")
-		if s.Status == "needs_approval" && s.LastMessage != "" {
-			b.WriteString("        " + msgStyle.Render(s.LastMessage) + "\n")
-		}
+	switch {
+	case m.renaming:
+		out += "\n" + titleStyle.Render("rename: ") + m.renameBuf + "▎  " + helpStyle.Render("enter save · esc cancel")
+	case m.focus == focusScreen:
+		out += "\n" + helpStyle.Render("typing into session · ^a ← sidebar · ^a a = literal ^a")
+	default:
+		out += "\n" + helpStyle.Render("↑/↓ select · enter/^a→ focus · n claude · c codex · x kill · R rename · t tile · q quit")
 	}
-
-	if m.renaming {
-		b.WriteString("\n" + titleStyle.Render("rename: ") + m.renameBuf + "▎" +
-			"  " + helpStyle.Render("enter save · esc cancel"))
-	} else {
-		b.WriteString("\n" + helpStyle.Render("↑/↓ select · enter attach · t tile all · n new · x kill · R rename · r refresh · q quit"))
-	}
-	return m.withToasts(b.String())
-}
-
-const toastColWidth = 34
-
-// withToasts places the active toast stack in a right-hand column when there's
-// room; otherwise returns the body unchanged.
-func (m *dashboardModel) withToasts(body string) string {
-	if len(m.toasts) == 0 || m.w < 60 {
-		return body
-	}
-	leftW := m.w - toastColWidth - 1
-	left := lipgloss.NewStyle().Width(leftW).Render(body)
-	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", m.renderToasts())
-}
-
-func (m *dashboardModel) renderToasts() string {
-	boxes := make([]string, 0, len(m.toasts))
-	for _, t := range m.toasts {
-		color := lipgloss.Color("8")
-		if s, ok := statusStyle[t.level]; ok {
-			color = s.GetForeground().(lipgloss.Color)
-		}
-		box := lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(color).
-			Width(toastColWidth - 2).
-			Render(t.text)
-		boxes = append(boxes, box)
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, boxes...)
-}
-
-// displayLabel shows the user-assigned name when set (with the command faintly
-// appended for context), otherwise just the command.
-func displayLabel(s ipc.SessionInfo) string {
-	if s.Name != "" {
-		return titleStyle.Render(s.Name) + "  " + helpStyle.Render(cmdLabel(s))
-	}
-	return cmdLabel(s)
-}
-
-func cmdLabel(s ipc.SessionInfo) string {
-	label := strings.Join(s.Argv, " ")
-	if len(label) > 40 {
-		label = label[:39] + "…"
-	}
-	if s.Cwd != "" {
-		label += "  " + helpStyle.Render("("+lastPath(s.Cwd)+")")
-	}
-	return label
-}
-
-func lastPath(p string) string {
-	parts := strings.Split(strings.TrimRight(p, "/"), "/")
-	if len(parts) == 0 {
-		return p
-	}
-	return parts[len(parts)-1]
-}
-
-func attentionList(sessions []ipc.SessionInfo) []string {
-	var out []string
-	for _, s := range sessions {
-		if s.Status == "needs_approval" {
-			out = append(out, s.ID[:8])
-		}
-	}
-	sort.Strings(out)
 	return out
+}
+
+// renderSidebar draws the narrow left column: one row per session (status glyph
+// + name), the cursor row highlighted, and a count footer. The highlight is
+// reversed when the sidebar has focus, dimmer when the screen pane does.
+func (m *dashboardModel) renderSidebar() string {
+	var rows []string
+	for i, s := range m.sessions {
+		name := s.Name
+		if name == "" {
+			name = s.ID[:8]
+		}
+		row := m.indicator(s.Status) + " " + truncate(name, sidebarWidth-3)
+		switch {
+		case i != m.cursor:
+			rows = append(rows, rowStyle.Render(row))
+		case m.focus == focusSidebar:
+			rows = append(rows, selRowStyle.Render(row))
+		default:
+			rows = append(rows, selRowDimStyle.Render(row))
+		}
+	}
+	if len(rows) == 0 {
+		rows = append(rows, helpStyle.Render("no sessions"), helpStyle.Render("press n"))
+	}
+	list := strings.Join(rows, "\n")
+	footer := helpStyle.Render(fmt.Sprintf("%d session(s)", len(m.sessions)))
+	content := lipgloss.JoinVertical(lipgloss.Left, list, "", footer)
+	return lipgloss.NewStyle().Width(sidebarWidth).Height(maxInt(m.paneH+2, 1)).Render(content)
+}
+
+// renderScreen draws the right pane: a header for the selected session and its
+// live screen (the session is sized to fit this pane). When focused, the pane
+// border is highlighted and keystrokes are forwarded to the session.
+func (m *dashboardModel) renderScreen() string {
+	var head, screen string
+	if m.streamID == "" {
+		head = helpStyle.Render("no session selected")
+		screen = ""
+	} else {
+		s := m.sessionByID(m.streamID)
+		label, status := m.streamID[:8], ""
+		if s != nil {
+			status = s.Status
+			if s.Name != "" {
+				label = s.Name
+			}
+		}
+		head = m.indicator(status) + " " + titleStyle.Render(label) + "  " + badge(status)
+		if m.focus == focusScreen {
+			head += "  " + statusStyle["working"].Render("● input")
+		}
+		switch {
+		case m.gone:
+			screen = helpStyle.Render("(session ended)")
+		case m.screen == "":
+			screen = helpStyle.Render("loading…")
+		default:
+			screen = m.screen
+		}
+		if s != nil && s.Status == "needs_approval" && s.LastMessage != "" {
+			head += "\n" + msgStyle.Render(s.LastMessage)
+		}
+	}
+	divider := strings.Repeat("─", maxInt(m.paneW, 1))
+	content := head + "\n" + helpStyle.Render(divider) + "\n" + screen
+	border := screenBorderStyle
+	if m.focus == focusScreen {
+		border = screenFocusBorderStyle
+	}
+	return border.Width(maxInt(m.paneW, 1)).Height(maxInt(m.paneH+2, 1)).Render(content)
+}
+
+// toastLine renders any active toasts as a single compact line beneath the body.
+func (m *dashboardModel) toastLine() string {
+	if len(m.toasts) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(m.toasts))
+	for _, t := range m.toasts {
+		style := helpStyle
+		if s, ok := statusStyle[t.level]; ok {
+			style = s
+		}
+		parts = append(parts, style.Render(t.text))
+	}
+	return strings.Join(parts, helpStyle.Render("  ·  "))
+}
+
+// truncate shortens s to at most n runes, adding an ellipsis when cut. It
+// assumes s has no ANSI escapes (true for plain names/ids).
+func truncate(s string, n int) string {
+	if n < 1 {
+		n = 1
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n == 1 {
+		return "…"
+	}
+	return string(r[:n-1]) + "…"
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

@@ -55,6 +55,61 @@ func TestInstallHealsStalePath(t *testing.T) {
 	}
 }
 
+func TestInstallCodex(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	path := filepath.Join(dir, "hooks.json")
+
+	if err := InstallCodex([]string{"--bin", "cb"}); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(path)
+	s := string(data)
+	// Codex-appropriate events are registered...
+	for _, ev := range []string{"SessionStart", "PreToolUse", "PermissionRequest", "Stop"} {
+		if !contains(s, "cb hook "+ev) {
+			t.Errorf("codex hooks.json missing %q", ev)
+		}
+	}
+	// ...and Claude-only events Codex doesn't emit are not.
+	for _, ev := range []string{"Notification", "SessionEnd"} {
+		if contains(s, "cb hook "+ev) {
+			t.Errorf("codex hooks.json should not register %q", ev)
+		}
+	}
+
+	// Re-running heals rather than stacking: still exactly one SessionStart entry.
+	if err := InstallCodex([]string{"--bin", "cb"}); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(path)
+	if n := countSub(string(data), "cb hook SessionStart"); n != 1 {
+		t.Errorf("reinstall produced %d SessionStart entries, want 1", n)
+	}
+}
+
+func countSub(s, sub string) int {
+	n, i := 0, 0
+	for {
+		j := indexFrom(s, sub, i)
+		if j < 0 {
+			return n
+		}
+		n++
+		i = j + len(sub)
+	}
+}
+
+func indexFrom(s, sub string, from int) int {
+	for i := from; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (func() bool {
 		for i := 0; i+len(sub) <= len(s); i++ {

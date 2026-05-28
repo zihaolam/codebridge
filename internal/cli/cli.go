@@ -40,15 +40,15 @@ func Run(args []string) error {
 		return hook.Run(args[1:])
 	case "ctl":
 		return runCtl(args[1:])
-	case "attach":
-		return runAttach(args[1:])
 	case "tile":
 		_, err := tui.Tile()
 		return err
 	case "install-hooks":
 		return hook.Install(args[1:])
+	case "install-codex":
+		return hook.InstallCodex(args[1:])
 	case "-h", "--help", "help":
-		fmt.Println("usage: cb [daemon|ctl|hook|demo] ...")
+		fmt.Println("usage: cb [daemon|ctl|hook|install-hooks|install-codex|tile|stop] ...")
 		return nil
 	default:
 		return fmt.Errorf("unknown subcommand %q", args[0])
@@ -111,7 +111,7 @@ func runDashboard() error {
 	}
 	selectID := ""
 	for {
-		id, action, err := tui.Dashboard(selectID)
+		action, err := tui.Dashboard(selectID)
 		if err != nil {
 			return err
 		}
@@ -124,12 +124,6 @@ func runDashboard() error {
 				return err
 			}
 			selectID = focused
-		case tui.DashAttach:
-			last, err := attachLoop(id)
-			if err != nil {
-				return err
-			}
-			selectID = last
 		}
 	}
 }
@@ -173,47 +167,6 @@ func ensureDaemon() error {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return fmt.Errorf("daemon did not become ready")
-}
-
-// runAttach attaches the interactive client to a session. With no id, it
-// attaches to the only session (erroring if there are zero or several).
-func runAttach(args []string) error {
-	id := ""
-	if len(args) > 0 {
-		id = args[0]
-	}
-	if id == "" {
-		resp, err := ipc.Send(ipc.Request{Type: "list"})
-		if err != nil {
-			return err
-		}
-		switch len(resp.Sessions) {
-		case 0:
-			return fmt.Errorf("no sessions; spawn one with: cb ctl spawn <cmd...>")
-		case 1:
-			id = resp.Sessions[0].ID
-		default:
-			return fmt.Errorf("multiple sessions; pass an id: cb attach <id>")
-		}
-	}
-	_, err := attachLoop(id)
-	return err
-}
-
-// attachLoop attaches to a session, following Ctrl-a g jumps to other sessions
-// until the user detaches back to the dashboard. It returns the id of the last
-// session the user was viewing, so the dashboard can highlight it.
-func attachLoop(id string) (string, error) {
-	last := id
-	for id != "" {
-		last = id
-		next, err := tui.Attach(id)
-		if err != nil {
-			return last, err
-		}
-		id = next
-	}
-	return last, nil
 }
 
 // runDemo spawns a command under a session, drains it for a few seconds (or
