@@ -205,13 +205,27 @@ func previewReadLoop(id string, conn net.Conn, ch chan previewMsg) {
 
 const sidebarWidth = 22
 
+// chromeRows is the number of non-screen rows the View always renders: the
+// title row, the (conditional) hooks-warning row, a reserved toast row, and the
+// help row. The screen pane itself adds two more (its header + divider), which
+// relayoutStream subtracts separately. Keeping this exact stops the View from
+// growing taller than the terminal and clipping the top of the session list.
+func (m *dashboardModel) chromeRows() int {
+	rows := 3 // title + reserved toast line + help line
+	if !m.hooksOK {
+		rows++ // hooks-not-installed warning
+	}
+	return rows
+}
+
 // relayoutStream recomputes the screen pane size from the window size and, if
 // it changed, tells the currently streamed session to resize to match.
 func (m *dashboardModel) relayoutStream() {
 	// width: window minus sidebar, the divider border, and its left padding.
 	innerW := m.w - sidebarWidth - 3
-	// height: window minus the title row, the pane header, and its divider.
-	innerH := m.h - 4
+	// height: window minus the surrounding chrome and the pane's own
+	// header + divider rows.
+	innerH := m.h - m.chromeRows() - 2
 	if innerW < 1 {
 		innerW = 1
 	}
@@ -346,6 +360,9 @@ func (m *dashboardModel) handlePrefix(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.streamID != "" && !m.gone {
 			m.focus = focusScreen
 		}
+	case "q":
+		m.action = DashQuit
+		return m, tea.Quit
 	case prefixKeyName, "a":
 		if m.focus == focusScreen {
 			m.sendInput([]byte{0x01}) // literal Ctrl-a
@@ -369,7 +386,7 @@ func (m *dashboardModel) handlePrefix(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // has focus.
 func (m *dashboardModel) handleSidebarKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "q", "ctrl+c":
+	case "ctrl+c":
 		m.action = DashQuit
 		return m, tea.Quit
 	case "up", "k":
@@ -577,17 +594,16 @@ func (m *dashboardModel) View() string {
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, m.renderSidebar(), m.renderScreen())
 
-	out := header + "\n" + body
-	if line := m.toastLine(); line != "" {
-		out += "\n" + line
-	}
+	// Always reserve the toast row (even when empty) so the View height is
+	// constant and never overflows the terminal — see chromeRows.
+	out := header + "\n" + body + "\n" + m.toastLine()
 	switch {
 	case m.renaming:
 		out += "\n" + titleStyle.Render("rename: ") + m.renameBuf + "▎  " + helpStyle.Render("enter save · esc cancel")
 	case m.focus == focusScreen:
-		out += "\n" + helpStyle.Render("typing into session · ^a ← sidebar · ^a a = literal ^a")
+		out += "\n" + helpStyle.Render("typing into session · ^a ← sidebar · ^a a = literal ^a · ^a q quit")
 	default:
-		out += "\n" + helpStyle.Render("↑/↓ select · enter/^a→ focus · n claude · c codex · x kill · R rename · t tile · q quit")
+		out += "\n" + helpStyle.Render("↑/↓ select · enter/^a→ focus · n claude · c codex · x kill · R rename · t tile · ^a q quit")
 	}
 	return out
 }

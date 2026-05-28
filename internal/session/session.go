@@ -6,6 +6,7 @@ package session
 import (
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -26,6 +27,14 @@ const (
 	StatusIdle          Status = "idle"
 	StatusEnded         Status = "ended"
 )
+
+// emuPad is a spare column we give the emulator beyond the PTY width. Claude
+// Code (and other Ink-based TUIs) occasionally draw a full-width rule one
+// column wider than the reported terminal size; in a real terminal the last
+// column's deferred-wrap swallows it, but the emulator would otherwise wrap the
+// extra glyph onto a stray line. The spare column absorbs that overflow, and
+// Render trims back to the PTY width so the stray glyph never shows.
+const emuPad = 1
 
 // Session couples a PTY-backed child process with its emulator and status.
 type Session struct {
@@ -75,7 +84,7 @@ func New(id string, argv []string, cwd string, rows, cols int) (*Session, error)
 		Cwd:         cwd,
 		ptmx:        ptmx,
 		cmd:         c,
-		emu:         vt.NewSafeEmulator(cols, rows),
+		emu:         vt.NewSafeEmulator(cols+emuPad, rows),
 		status:      StatusStarting,
 		statusSince: time.Now(),
 		startedAt:   time.Now(),
@@ -144,16 +153,30 @@ func (s *Session) Resize(rows, cols int) error {
 	if err := pty.Setsize(s.ptmx, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)}); err != nil {
 		return err
 	}
-	s.emu.Resize(cols, rows)
+	s.emu.Resize(cols+emuPad, rows)
 	s.mu.Lock()
 	s.rows, s.cols = rows, cols
 	s.mu.Unlock()
 	return nil
 }
 
-// Render returns a string snapshot of the current screen.
+// Render returns a string snapshot of the current screen, trimmed to the PTY
+// width so the emulator's spare overflow column (see emuPad) never shows.
 func (s *Session) Render() string {
-	return s.emu.Render()
+	s.mu.RLock()
+	cols := s.cols
+	s.mu.RUnlock()
+	full := s.emu.Render()
+	if cols <= 0 {
+		return full
+	}
+	lines := strings.Split(full, "\n")
+	for i, ln := range lines {
+		if r := []rune(ln); len(r) > cols {
+			lines[i] = string(r[:cols])
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // Cursor returns the current cursor cell position.

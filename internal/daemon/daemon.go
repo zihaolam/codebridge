@@ -259,7 +259,11 @@ func shortLabel(s *session.Session) string {
 // active). Confirm names against the installed Claude Code version.
 func statusForEvent(event string, p ipc.HookPayload) (session.Status, string) {
 	switch event {
-	case "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolBatch":
+	case "SessionStart":
+		// A session that just started (or resumed) is idle and ready for input,
+		// not busy — don't show a working spinner until a prompt is submitted.
+		return session.StatusWaitingUser, ""
+	case "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolBatch":
 		return session.StatusWorking, ""
 	case "Notification", "PermissionRequest":
 		return session.StatusNeedsApproval, p.Message
