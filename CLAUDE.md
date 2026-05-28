@@ -7,7 +7,7 @@ renders a dashboard / tiled grid / single-session attach. No tmux dependency.
 ## Build / test / run
 
 ```sh
-go build -o ./cb .      # single binary
+go build -o ./dist/cb .    # single binary (dist/ is gitignored)
 go vet ./...
 go test ./...              # unit tests live in internal/tui and internal/hook
 gofmt -w internal/
@@ -19,9 +19,9 @@ Interactive parts can't be driven from plain stdin in CI — to exercise the cli
 under a PTY (see the Python `pty` harnesses used during development) or test by hand:
 
 ```sh
-./cb daemon &                 # or let `cb` auto-start it
-./cb ctl spawn claude
-./cb                          # dashboard; enter to attach, t to tile
+./dist/cb daemon &            # or let `cb` auto-start it
+./dist/cb ctl spawn claude
+./dist/cb                     # sidebar + live screen; ^a →/← switch focus, t to tile
 ```
 
 ## Architecture

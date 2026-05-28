@@ -132,6 +132,35 @@ func (m *dashboardModel) selectedID() string {
 	return ""
 }
 
+// displayName is the label shown for a session: the user-assigned name if set,
+// otherwise the basename of the directory it was started in (e.g. a session
+// launched in ~/Projects/command-center shows as "command-center"), falling
+// back to a short id.
+func displayName(s ipc.SessionInfo) string {
+	if s.Name != "" {
+		return s.Name
+	}
+	if base := folderBase(s.Cwd); base != "" {
+		return base
+	}
+	if len(s.ID) >= 8 {
+		return s.ID[:8]
+	}
+	return s.ID
+}
+
+// folderBase returns the last path segment of a directory path.
+func folderBase(dir string) string {
+	dir = strings.TrimRight(dir, "/")
+	if dir == "" {
+		return ""
+	}
+	if i := strings.LastIndex(dir, "/"); i >= 0 {
+		return dir[i+1:]
+	}
+	return dir
+}
+
 func (m *dashboardModel) sessionByID(id string) *ipc.SessionInfo {
 	for i := range m.sessions {
 		if m.sessions[i].ID == id {
@@ -205,10 +234,9 @@ func previewReadLoop(id string, conn net.Conn, ch chan previewMsg) {
 
 const sidebarWidth = 22
 
-// chromeRows is the number of non-screen rows the View always renders: the
-// title row, the (conditional) hooks-warning row, a reserved toast row, and the
-// help row. The screen pane itself adds two more (its header + divider), which
-// relayoutStream subtracts separately. Keeping this exact stops the View from
+// chromeRows is the number of non-pane rows the View always renders: the title
+// row, the (conditional) hooks-warning row, a reserved toast row, and the help
+// row. The two panes fill the rest. Keeping this exact stops the View from
 // growing taller than the terminal and clipping the top of the session list.
 func (m *dashboardModel) chromeRows() int {
 	rows := 3 // title + reserved toast line + help line
@@ -221,11 +249,10 @@ func (m *dashboardModel) chromeRows() int {
 // relayoutStream recomputes the screen pane size from the window size and, if
 // it changed, tells the currently streamed session to resize to match.
 func (m *dashboardModel) relayoutStream() {
-	// width: window minus sidebar, the divider border, and its left padding.
+	// width: window minus sidebar, the pane's left border, and its left padding.
 	innerW := m.w - sidebarWidth - 3
-	// height: window minus the surrounding chrome and the pane's own
-	// header + divider rows.
-	innerH := m.h - m.chromeRows() - 2
+	// height: the full pane height — everything left after the surrounding chrome.
+	innerH := m.h - m.chromeRows()
 	if innerW < 1 {
 		innerW = 1
 	}
@@ -363,6 +390,14 @@ func (m *dashboardModel) handlePrefix(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q":
 		m.action = DashQuit
 		return m, tea.Quit
+	case "x":
+		// Kill the current session (works while typing into it). Drop focus back
+		// to the sidebar; the stream's "gone" notice will tidy up the pane.
+		if m.streamID != "" {
+			id := m.streamID
+			m.focus = focusSidebar
+			return m, killCmd(id)
+		}
 	case prefixKeyName, "a":
 		if m.focus == focusScreen {
 			m.sendInput([]byte{0x01}) // literal Ctrl-a
@@ -421,7 +456,7 @@ func (m *dashboardModel) handleSidebarKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			s := m.sessions[m.cursor]
 			m.renaming = true
 			m.renameID = s.ID
-			m.renameBuf = s.Name
+			m.renameBuf = displayName(s)
 		}
 	case "r":
 		return m, refreshCmd
@@ -459,7 +494,6 @@ var (
 	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	selStyle    = lipgloss.NewStyle().Reverse(true)
 	helpStyle   = lipgloss.NewStyle().Faint(true)
-	msgStyle    = lipgloss.NewStyle().Faint(true).Italic(true)
 	statusStyle = map[string]lipgloss.Style{
 		"needs_approval": lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9")), // red
 		"waiting_user":   lipgloss.NewStyle().Foreground(lipgloss.Color("11")),           // yellow
@@ -490,13 +524,6 @@ func (m *dashboardModel) indicator(status string) string {
 	default:
 		return st.Render("•")
 	}
-}
-
-func badge(status string) string {
-	if s, ok := statusStyle[status]; ok {
-		return s.Render(fmt.Sprintf("%-14s", status))
-	}
-	return fmt.Sprintf("%-14s", status)
 }
 
 // detectTransitions compares incoming statuses to the last-seen ones and raises
@@ -578,8 +605,8 @@ var (
 				PaddingLeft(1)
 	screenFocusBorderStyle = screenBorderStyle.BorderForeground(lipgloss.Color("12"))
 	rowStyle               = lipgloss.NewStyle().Width(sidebarWidth)
-	selRowStyle            = rowStyle.Reverse(true)
-	selRowDimStyle         = rowStyle.Foreground(lipgloss.Color("12"))
+	selBarStyle            = lipgloss.NewStyle().Foreground(lipgloss.Color("11")) // yellow
+	selBarDimStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))  // grey
 )
 
 func (m *dashboardModel) View() string {
@@ -597,13 +624,14 @@ func (m *dashboardModel) View() string {
 	// Always reserve the toast row (even when empty) so the View height is
 	// constant and never overflows the terminal — see chromeRows.
 	out := header + "\n" + body + "\n" + m.toastLine()
+	p := prefixLabel()
 	switch {
 	case m.renaming:
 		out += "\n" + titleStyle.Render("rename: ") + m.renameBuf + "▎  " + helpStyle.Render("enter save · esc cancel")
 	case m.focus == focusScreen:
-		out += "\n" + helpStyle.Render("typing into session · ^a ← sidebar · ^a a = literal ^a · ^a q quit")
+		out += "\n" + helpStyle.Render(fmt.Sprintf("typing into session · prefix ← sidebar · prefix x kill · prefix q quit · prefix a = literal prefix  (prefix = %s)", p))
 	default:
-		out += "\n" + helpStyle.Render("↑/↓ select · enter/^a→ focus · n claude · c codex · x kill · R rename · t tile · ^a q quit")
+		out += "\n" + helpStyle.Render(fmt.Sprintf("↑/↓ select · enter/prefix → focus · n claude · c codex · x kill · R rename · t tile · prefix q quit  (prefix = %s)", p))
 	}
 	return out
 }
@@ -614,69 +642,61 @@ func (m *dashboardModel) View() string {
 func (m *dashboardModel) renderSidebar() string {
 	var rows []string
 	for i, s := range m.sessions {
-		name := s.Name
-		if name == "" {
-			name = s.ID[:8]
-		}
-		row := m.indicator(s.Status) + " " + truncate(name, sidebarWidth-3)
-		switch {
-		case i != m.cursor:
-			rows = append(rows, rowStyle.Render(row))
-		case m.focus == focusSidebar:
-			rows = append(rows, selRowStyle.Render(row))
-		default:
-			rows = append(rows, selRowDimStyle.Render(row))
-		}
-	}
-	if len(rows) == 0 {
-		rows = append(rows, helpStyle.Render("no sessions"), helpStyle.Render("press n"))
-	}
-	list := strings.Join(rows, "\n")
-	footer := helpStyle.Render(fmt.Sprintf("%d session(s)", len(m.sessions)))
-	content := lipgloss.JoinVertical(lipgloss.Left, list, "", footer)
-	return lipgloss.NewStyle().Width(sidebarWidth).Height(maxInt(m.paneH+2, 1)).Render(content)
-}
-
-// renderScreen draws the right pane: a header for the selected session and its
-// live screen (the session is sized to fit this pane). When focused, the pane
-// border is highlighted and keystrokes are forwarded to the session.
-func (m *dashboardModel) renderScreen() string {
-	var head, screen string
-	if m.streamID == "" {
-		head = helpStyle.Render("no session selected")
-		screen = ""
-	} else {
-		s := m.sessionByID(m.streamID)
-		label, status := m.streamID[:8], ""
-		if s != nil {
-			status = s.Status
-			if s.Name != "" {
-				label = s.Name
+		// Mark the selected row with a colored left bar instead of a full-row
+		// highlight: bright yellow when the sidebar has focus, grey when the
+		// screen pane does (selection still visible, but clearly not active).
+		gutter := " "
+		if i == m.cursor {
+			if m.focus == focusSidebar {
+				gutter = selBarStyle.Render("▌")
+			} else {
+				gutter = selBarDimStyle.Render("▌")
 			}
 		}
-		head = m.indicator(status) + " " + titleStyle.Render(label) + "  " + badge(status)
-		if m.focus == focusScreen {
-			head += "  " + statusStyle["working"].Render("● input")
-		}
-		switch {
-		case m.gone:
-			screen = helpStyle.Render("(session ended)")
-		case m.screen == "":
-			screen = helpStyle.Render("loading…")
-		default:
-			screen = m.screen
-		}
-		if s != nil && s.Status == "needs_approval" && s.LastMessage != "" {
-			head += "\n" + msgStyle.Render(s.LastMessage)
-		}
+		row := gutter + m.indicator(s.Status) + " " + truncate(displayName(s), sidebarWidth-3)
+		rows = append(rows, rowStyle.Render(row))
 	}
-	divider := strings.Repeat("─", maxInt(m.paneW, 1))
-	content := head + "\n" + helpStyle.Render(divider) + "\n" + screen
+	if len(rows) == 0 {
+		rows = append(rows, helpStyle.Render(" no sessions"), helpStyle.Render(" press n"))
+	}
+	// Reserve two rows (blank spacer + footer) so the list never overflows the
+	// pane height and pushes the footer off-screen.
+	if maxRows := maxInt(m.paneH-2, 1); len(rows) > maxRows {
+		rows = rows[:maxRows]
+	}
+	list := strings.Join(rows, "\n")
+	footer := helpStyle.Render(fmt.Sprintf(" %d session(s)", len(m.sessions)))
+	content := firstLines(lipgloss.JoinVertical(lipgloss.Left, list, "", footer), maxInt(m.paneH, 1))
+	return lipgloss.NewStyle().Width(sidebarWidth).Height(maxInt(m.paneH, 1)).Render(content)
+}
+
+// renderScreen draws the right pane: just the selected session's live screen
+// (the session is sized to fill this pane). Focus is shown by the border color;
+// the session's own status/title lives in the sidebar, so there's no header
+// here. Keystrokes are forwarded to the session when this pane has focus.
+func (m *dashboardModel) renderScreen() string {
+	var screen string
+	switch {
+	case m.streamID == "":
+		screen = helpStyle.Render("no session selected")
+	case m.gone:
+		screen = helpStyle.Render("(session ended)")
+	case m.screen == "":
+		screen = helpStyle.Render("loading…")
+	default:
+		screen = m.screen
+	}
+	// Bound the screen to the pane height so a tall session render can't overflow
+	// the View and clip the top (which would hide the session list).
+	screen = lastLines(screen, m.paneH)
 	border := screenBorderStyle
 	if m.focus == focusScreen {
 		border = screenFocusBorderStyle
 	}
-	return border.Width(maxInt(m.paneW, 1)).Height(maxInt(m.paneH+2, 1)).Render(content)
+	// lipgloss Width includes padding, and the style has PaddingLeft(1); add it
+	// back so the content area is exactly paneW (matching the session cols) and a
+	// full-width line doesn't wrap into an extra row.
+	return border.Width(maxInt(m.paneW+1, 1)).Height(maxInt(m.paneH, 1)).Render(screen)
 }
 
 // toastLine renders any active toasts as a single compact line beneath the body.
@@ -716,4 +736,30 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// lastLines keeps at most the final n lines of s (like a terminal showing the
+// bottom of the scrollback). Used to bound the live screen so a tall session
+// render can't push the whole View past the terminal height and clip the list.
+func lastLines(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// firstLines keeps at most the first n lines of s.
+func firstLines(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > n {
+		lines = lines[:n]
+	}
+	return strings.Join(lines, "\n")
 }

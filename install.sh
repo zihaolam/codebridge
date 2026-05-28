@@ -38,15 +38,15 @@ BINDIR="${BINDIR/#\~/$HOME}"
 CB_INSTALL="${BINDIR%/bin}"
 
 echo ">> building cb"
-go build -o cb .
+go build -o dist/cb .
 
 echo ">> installing to $BINDIR/cb"
 mkdir -p "$BINDIR" 2>/dev/null || true
 if [ -w "$BINDIR" ]; then
-  install -m 0755 cb "$BINDIR/cb"
+  install -m 0755 dist/cb "$BINDIR/cb"
 else
   echo "   ($BINDIR is not writable — using sudo)"
-  sudo install -m 0755 cb "$BINDIR/cb"
+  sudo install -m 0755 dist/cb "$BINDIR/cb"
 fi
 
 # Is BINDIR already on the PATH we started with?

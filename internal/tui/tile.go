@@ -378,7 +378,7 @@ func (m *tileModel) statusBar() string {
 	var banner string
 	if m.pendingCount > 0 {
 		banner = statusStyle["needs_approval"].Render(
-			fmt.Sprintf("⚑ %d pending approval(s) — Ctrl-a g to jump", m.pendingCount)) + "   "
+			fmt.Sprintf("⚑ %d pending approval(s) — prefix g to jump", m.pendingCount)) + "   "
 	}
 	var parts []string
 	for i, p := range m.panes {
@@ -390,7 +390,7 @@ func (m *tileModel) statusBar() string {
 		}
 		parts = append(parts, label)
 	}
-	return banner + strings.Join(parts, "  ") + "   " + helpStyle.Render("Ctrl-a: focus/jump/new/kill/detach")
+	return banner + strings.Join(parts, "  ") + "   " + helpStyle.Render(fmt.Sprintf("prefix (%s): focus/jump/new/kill/detach", prefixLabel()))
 }
 
 func digit(s string) int {

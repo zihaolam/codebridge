@@ -84,19 +84,21 @@ cb daemon          # run the hub in the foreground (normally auto-started)
 | `n` | start a new claude session |
 | `c` | start a new codex session |
 | `x` | kill the selected session |
-| `R` | rename the selected session |
+| `R` | rename the selected session (defaults to the start folder, e.g. `command-center`) |
 | `Ctrl-a` `q` | quit (the daemon and sessions keep running) |
 
 ### Screen pane / tiled view
 
-A tmux-style prefix key, **`Ctrl-a`**, switches from typing-into-the-session to issuing a
-command. `Ctrl-a` `q` always quits, from either zone.
+A tmux-style prefix key, **`Ctrl-a`** by default (override with the `CB_PREFIX` env var,
+e.g. `CB_PREFIX=ctrl+b`), switches from typing-into-the-session to issuing a command.
+`Ctrl-a` `q` always quits, from either zone.
 
 | `Ctrl-a` then… | action |
 |----------------|--------|
 | `←` | return focus to the sidebar |
 | `→` | focus the screen pane |
 | `q` | quit cb (sessions keep running) |
+| `x` | kill the current session |
 | `g` | jump to the session that most recently needs approval |
 | `a` | send a literal `Ctrl-a` to the session |
 | `h`/`j`/`k`/`l` or arrows | move focus between panes (tiled view) |

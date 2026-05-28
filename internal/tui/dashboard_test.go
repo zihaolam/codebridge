@@ -95,9 +95,26 @@ func TestSidebarViewRenders(t *testing.T) {
 		screen:   "hello from the session",
 	}
 	out := m.View()
-	for _, want := range []string{"api-fix", "command-center", "hello from the session", "run rm -rf?"} {
+	for _, want := range []string{"api-fix", "command-center", "hello from the session"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("view missing %q", want)
+		}
+	}
+}
+
+func TestDisplayName(t *testing.T) {
+	cases := []struct {
+		s    ipc.SessionInfo
+		want string
+	}{
+		{ipc.SessionInfo{ID: "abcdefgh12", Name: "api-fix", Cwd: "/home/x/proj"}, "api-fix"},
+		{ipc.SessionInfo{ID: "abcdefgh12", Cwd: "/Users/zihaolam/Projects/command-center"}, "command-center"},
+		{ipc.SessionInfo{ID: "abcdefgh12", Cwd: "/Users/zihaolam/Projects/command-center/"}, "command-center"},
+		{ipc.SessionInfo{ID: "abcdefgh12"}, "abcdefgh"},
+	}
+	for _, c := range cases {
+		if got := displayName(c.s); got != c.want {
+			t.Errorf("displayName(%+v) = %q, want %q", c.s, got, c.want)
 		}
 	}
 }

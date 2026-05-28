@@ -1,14 +1,28 @@
 package tui
 
 import (
+	"os"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-// prefixKeyName is the tmux-style control prefix. After it, the next key is a
-// command (focus switch, literal-prefix passthrough) rather than session input.
-const prefixKeyName = "ctrl+a"
+// prefixKeyName is the tmux-style control prefix: after it, the next key is a
+// command (focus switch, kill, quit, …) rather than session input. It's the
+// Bubble Tea key name (e.g. "ctrl+a", "ctrl+b") and can be overridden with the
+// CB_PREFIX environment variable.
+var prefixKeyName = func() string {
+	if v := strings.TrimSpace(os.Getenv("CB_PREFIX")); v != "" {
+		return v
+	}
+	return "ctrl+a"
+}()
+
+// prefixLabel is the human-readable form of the prefix used in help text,
+// e.g. "ctrl+a".
+func prefixLabel() string {
+	return prefixKeyName
+}
 
 // namedKeyBytes maps Bubble Tea key names (msg.String()) to the byte sequences
 // a terminal application expects. Covers the common xterm sequences; the
