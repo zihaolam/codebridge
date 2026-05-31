@@ -25,6 +25,11 @@ set -euo pipefail
 
 REPO="zihaolam/codebridge"
 
+# Tempdir used by download_release(); declared at script scope so the EXIT
+# trap below can reference it safely under `set -u`.
+tmpdir=""
+trap '[ -n "$tmpdir" ] && rm -rf "$tmpdir"' EXIT
+
 ORIG_PATH="$PATH"
 INSTALL_HOOKS=1
 for arg in "$@"; do
@@ -74,7 +79,7 @@ build_from_source() {
 
 download_release() {
   detect_platform
-  local version asset url tmpdir
+  local version asset url
   version="${VERSION:-}"
   if [ -z "$version" ]; then
     echo ">> resolving latest release"
@@ -91,7 +96,6 @@ download_release() {
   asset="cb_${OS}_${ARCH}.tar.gz"
   url="https://github.com/$REPO/releases/download/${version}/${asset}"
   tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
   echo ">> downloading $asset ($version)"
   if ! curl -fsSL "$url" -o "$tmpdir/$asset"; then
     echo "!! download failed: $url" >&2
