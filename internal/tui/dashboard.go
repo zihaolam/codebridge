@@ -535,20 +535,13 @@ func previewReadLoop(id string, conn net.Conn, ch chan previewMsg) {
 
 const sidebarWidth = 22
 
-// chromeRows is the number of non-pane rows the View always renders below the
-// body: a reserved toast row, a reserved bottom row (rename prompt when active,
-// blank otherwise — kept constant so the screen pane doesn't resize on entering
-// rename mode), and an optional hooks-warning row. The prefix command panel is
-// drawn as a floating overlay on top of the screen pane, so it doesn't count
-// here. The title lives at the top of the sidebar (not a full-width header),
-// so both panes span the full height above this chrome.
-func (m *dashboardModel) chromeRows() int {
-	rows := 2 // toast row + bottom slot (rename or blank)
-	if !m.hooksOK {
-		rows++ // hooks-not-installed warning
-	}
-	return rows
-}
+// chromeRows is the count of rows renderLive draws below the body block.
+// Chrome (toasts, the hooks-not-installed banner, the rename input) is now
+// painted as an overlay on top of the bottom rows of the body, so the sidebar
+// and screen pane fill the whole terminal and the overlay never changes the
+// pane size. Kept as a method so the layout-fits-terminal test can address
+// "the last body row" the same way whether or not chrome is overlaid.
+func (m *dashboardModel) chromeRows() int { return 0 }
 
 // relayoutStream recomputes the screen pane size from the window size and, if
 // it changed, tells the currently streamed session to resize to match.
@@ -1409,36 +1402,30 @@ func (m *dashboardModel) renderLive() string {
 	// pane spans the full height beside it — no full-width header band.
 	body := lipgloss.JoinHorizontal(lipgloss.Top, m.renderSidebar(), m.renderScreen())
 
-	// Float the prefix-command hints panel over the bottom of the screen pane
-	// when the user has tapped the prefix key (one-shot) or opened the sticky
-	// menu (prefix+h / prefix+?). It's an overlay (no body resize or session
-	// reflow) so the panel pops in/out without disturbing what's underneath.
-	if m.prefix || m.menu {
-		screenLeft := sidebarWidth + 2 // left border + left padding of screen pane
-		body = overlayBottom(body, m.renderPrefixPanel(), screenLeft, screenLeft+m.paneW)
+	// Chrome (toasts, hooks-not-installed banner, rename input) is overlaid
+	// onto the bottom rows of the body so the panes themselves fill the whole
+	// terminal — no more reserved blank rows that leave the borders short of
+	// the bottom. The overlay is left-aligned and only as wide as the chrome
+	// line itself, so the rest of the underlying row stays visible past it.
+	// Drawn *before* the prefix panel so the panel (which the user explicitly
+	// summons) wins for any rows where both want to paint.
+	if chrome := m.chromeLines(); len(chrome) > 0 {
+		body = overlayBottomLeft(body, chrome, 0)
 	}
 
-	// Always reserve the toast row (even when empty) so the View height is
-	// constant and never overflows the terminal — see chromeRows.
-	out := body + "\n" + m.toastLine()
-	if !m.hooksOK {
-		out += "\n" + statusStyle["waiting_user"].Render("⚠ hooks not installed — run: cb install-hooks")
+	// Float the prefix-command hints panel over the bottom of the body when
+	// the user has tapped the prefix key (one-shot) or opened the sticky menu
+	// (prefix+h / prefix+?). Full terminal width, which-key-style.
+	if m.prefix || m.menu {
+		body = overlayBottom(body, m.renderPrefixPanel(m.w), 0, m.w)
 	}
-	// Bottom row: rename input when active, otherwise an empty reserved row
-	// (the help/prefix hint that used to live here was replaced by the
-	// floating prefix panel — press the prefix key to summon it).
-	if m.renaming {
-		out += "\n" + titleStyle.Render("rename: ") + m.renameBuf + "▎  " + helpStyle.Render("enter save · esc cancel")
-	} else {
-		out += "\n"
-	}
+
 	// Bound every line to the terminal width. The body lines are already within
-	// width, but the chrome lines (toast, hooks warning, rename) can be longer
-	// than a narrow terminal; left unbounded they wrap at display time, adding a
-	// visual row that pushes the view past the terminal height and clips the
-	// bottom. Truncating is ANSI-aware so styling is preserved and not left
-	// dangling.
-	return clampLines(out, m.w)
+	// width, but chrome lines can be longer than a narrow terminal; left
+	// unbounded they wrap at display time, adding a visual row that pushes the
+	// view past the terminal height and clips the bottom. Truncating is
+	// ANSI-aware so styling is preserved and not left dangling.
+	return clampLines(body, m.w)
 }
 
 // clampLines truncates each line of s to at most w display columns, preserving
@@ -1676,34 +1663,40 @@ var (
 	kbdStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 )
 
-// renderPrefixPanel builds the floating command-hints panel: a four-column
-// grid of prefix commands with their current keys highlighted. Bindings are
-// read live from cfg.Bindings so a rebind shows up immediately the next time
-// the panel opens. The `h`/`?`-style system shortcuts are hardcoded because
-// they aren't routed through the rebinding table.
-func (m *dashboardModel) renderPrefixPanel() string {
+// renderPrefixPanel builds the floating command-hints panel: a multi-column
+// grid of prefix commands with their current keys highlighted. The panel is
+// stretched to the full terminal width passed in, with column widths split
+// evenly so every row's cells line up edge-to-edge (which-key style). Bindings
+// are read live from cfg.Bindings so a rebind shows up immediately the next
+// time the panel opens. The `h`/`?`-style system shortcuts are hardcoded
+// because they aren't routed through the rebinding table.
+func (m *dashboardModel) renderPrefixPanel(width int) string {
 	kbd := func(s string) string { return kbdStyle.Render(s) }
 	b := func(action string) string { return kbd(m.keyForAction(action)) }
-	cell := func(key, label string) string {
-		return padRight(key+" "+label, 22)
-	}
-	items := []string{
-		cell(b("new_claude"), "new claude"),
-		cell(b("new_codex"), "new codex"),
-		cell(b("kill"), "kill session"),
-		cell(b("rename"), "rename"),
-		cell(kbd("h"), "focus sidebar"),
-		cell(b("focus_screen"), "focus screen"),
-		cell(b("scroll"), "scrollback"),
-		cell(b("scope_toggle"), "toggle scope"),
-		cell(b("jump_pending"), "jump pending"),
-		cell(b("newline"), "newline"),
-		cell(b("yank"), "yank selection"),
-		cell(kbd("?"), "toggle hints"),
-		cell(b("config"), "open config"),
-		cell(b("quit"), "quit cb"),
+	type item struct{ key, label string }
+	items := []item{
+		{b("new_claude"), "new claude"},
+		{b("new_codex"), "new codex"},
+		{b("kill"), "kill session"},
+		{b("rename"), "rename"},
+		{kbd("h"), "focus sidebar"},
+		{b("focus_screen"), "focus screen"},
+		{b("scroll"), "scrollback"},
+		{b("scope_toggle"), "toggle scope"},
+		{b("jump_pending"), "jump pending"},
+		{b("newline"), "newline"},
+		{b("yank"), "yank selection"},
+		{kbd("?"), "toggle hints"},
+		{b("config"), "open config"},
+		{b("quit"), "quit cb"},
 	}
 	const cols = 4
+	frame := prefixPanelStyle.GetHorizontalFrameSize()
+	inner := width - frame
+	if inner < cols*8 {
+		inner = cols * 8
+	}
+	cellW := inner / cols
 	rows := make([]string, 0, (len(items)+cols-1)/cols+1)
 	rows = append(rows, helpStyle.Render(" prefix = "+prefixLabel()+" "))
 	for i := 0; i < len(items); i += cols {
@@ -1711,9 +1704,76 @@ func (m *dashboardModel) renderPrefixPanel() string {
 		if end > len(items) {
 			end = len(items)
 		}
-		rows = append(rows, strings.Join(items[i:end], " "))
+		cells := make([]string, end-i)
+		for j, it := range items[i:end] {
+			cells[j] = padDisplayWidth(it.key+" "+it.label, cellW)
+		}
+		rows = append(rows, strings.Join(cells, ""))
 	}
-	return prefixPanelStyle.Render(strings.Join(rows, "\n"))
+	return prefixPanelStyle.Width(width).Render(strings.Join(rows, "\n"))
+}
+
+// padDisplayWidth pads s with trailing spaces so its on-screen column width
+// equals n. ANSI escapes don't add to display width, so we can't use plain
+// len() — see padRight for the ASCII-only variant.
+func padDisplayWidth(s string, n int) string {
+	w := ansi.StringWidth(s)
+	if w >= n {
+		return s
+	}
+	return s + strings.Repeat(" ", n-w)
+}
+
+// chromeLines collects the ephemeral status rows (toast, hooks banner, rename
+// input) in top-to-bottom order. Returns nil when nothing's active so the
+// caller can skip the overlay entirely.
+func (m *dashboardModel) chromeLines() []string {
+	var lines []string
+	if t := m.toastLine(); t != "" {
+		lines = append(lines, t)
+	}
+	if !m.hooksOK {
+		lines = append(lines, statusStyle["waiting_user"].Render("⚠ hooks not installed — run: cb install-hooks"))
+	}
+	if m.renaming {
+		lines = append(lines, titleStyle.Render("rename: ")+m.renameBuf+"▎  "+helpStyle.Render("enter save · esc cancel"))
+	}
+	return lines
+}
+
+// overlayBottomLeft paints each line in lines over a row at the bottom of
+// body, left-aligned at colMin. Unlike overlayBottom this preserves the right
+// portion of the underlying row past the chrome line — so a narrow toast only
+// covers its own width and the rest of the session row keeps showing through.
+func overlayBottomLeft(body string, lines []string, colMin int) string {
+	if len(lines) == 0 {
+		return body
+	}
+	bl := strings.Split(body, "\n")
+	startRow := len(bl) - len(lines)
+	if startRow < 0 {
+		lines = lines[-startRow:]
+		startRow = 0
+	}
+	for i, ln := range lines {
+		row := startRow + i
+		if row < 0 || row >= len(bl) {
+			continue
+		}
+		underlying := bl[row]
+		lineW := ansi.StringWidth(underlying)
+		panelW := ansi.StringWidth(ln)
+		left := ansi.Cut(underlying, 0, colMin)
+		if lw := ansi.StringWidth(left); lw < colMin {
+			left += strings.Repeat(" ", colMin-lw)
+		}
+		right := ""
+		if colMin+panelW < lineW {
+			right = ansi.Cut(underlying, colMin+panelW, lineW)
+		}
+		bl[row] = left + ln + right
+	}
+	return strings.Join(bl, "\n")
 }
 
 // overlayBottom paints panel onto the bottom of body, horizontally centered
