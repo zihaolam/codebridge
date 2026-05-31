@@ -4,8 +4,75 @@ import (
 	"strings"
 	"testing"
 
+	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
+
 	"command-center/internal/ipc"
 )
+
+// fullWidthScreen builds a session screen of `rows` lines, each a styled
+// horizontal rule exactly `cols` display columns wide — the shape (Claude's
+// input-box rules) that exposed the wrap/overflow bugs.
+func fullWidthScreen(cols, rows int) string {
+	lines := make([]string, rows)
+	for i := range lines {
+		lines[i] = "\x1b[38;5;244m" + strings.Repeat("─", cols) + "\x1b[0m"
+	}
+	return strings.Join(lines, "\n")
+}
+
+func TestRenderScreenDoesNotWrapFullWidthLine(t *testing.T) {
+	const paneW, paneH = 100, 8
+	m := &dashboardModel{
+		paneW: paneW, paneH: paneH,
+		streamID: "live",
+		screen:   fullWidthScreen(paneW, 1),
+	}
+	rows := strings.Split(m.renderScreen(), "\n")
+	if len(rows) != paneH {
+		t.Fatalf("renderScreen produced %d rows, want paneH=%d (extra rows = wrapping)", len(rows), paneH)
+	}
+	// A full-width rule must sit entirely on the first row; an off-by-one Width
+	// wraps it and spills a dash onto the second row.
+	if strings.ContainsRune(ansi.Strip(rows[1]), '─') {
+		t.Errorf("full-width line wrapped onto row 1: %q", ansi.Strip(rows[1]))
+	}
+	want := paneW + screenBorderStyle.GetHorizontalFrameSize()
+	if w := ansi.StringWidth(rows[0]); w != want {
+		t.Errorf("pane width = %d, want %d (paneW + border + padding)", w, want)
+	}
+}
+
+func TestRenderLiveFitsTerminal(t *testing.T) {
+	const w, h = 120, 30
+	m := &dashboardModel{
+		w: w, h: h,
+		prev:     map[string]string{},
+		hooksOK:  true,
+		streamID: "live00000000",
+		sessions: []ipc.SessionInfo{{ID: "live00000000", Status: "working"}},
+	}
+	m.relayoutStream() // derive paneW/paneH from w/h exactly as the app does
+	m.screen = fullWidthScreen(m.paneW, m.paneH)
+
+	rows := strings.Split(m.renderLive(), "\n")
+	// No vertical overflow: a wrapped pane line would bake in newlines and push
+	// total rows past the terminal height, clipping the bottom (session + help).
+	if len(rows) > h {
+		t.Errorf("renderLive produced %d rows, exceeds terminal height %d", len(rows), h)
+	}
+	// No horizontal overflow: a row wider than the terminal wraps at display time
+	// and shoves everything below it down off-screen.
+	for i, r := range rows {
+		if wd := ansi.StringWidth(r); wd > w {
+			t.Errorf("row %d width %d exceeds terminal width %d", i, wd, w)
+		}
+	}
+	// The help/prefix-hint line is the last row and must survive.
+	if last := ansi.Strip(rows[len(rows)-1]); strings.TrimSpace(last) == "" {
+		t.Error("bottom help/prefix line is blank — bottom chrome was clipped")
+	}
+}
 
 func sess(id, status, msg string) ipc.SessionInfo {
 	return ipc.SessionInfo{ID: id + "00000000", Status: status, LastMessage: msg}
@@ -137,6 +204,29 @@ func TestClampTop(t *testing.T) {
 			t.Errorf("%s: clampTop(%d,%d,%d,%d) = %d, want %d",
 				c.name, c.cursor, c.top, c.count, c.maxRows, got, c.want)
 		}
+	}
+}
+
+func TestWheelScrollsPaneAndExitsAtBottom(t *testing.T) {
+	m := &dashboardModel{
+		streamID:   "live",
+		scrollMode: true, // already browsing scrollback
+		scrollMax:  20,
+		paneW:      40, paneH: 20,
+	}
+	// Wheel up over the pane (x past the sidebar band) moves toward older output.
+	m.handleWheel(tea.MouseWheelMsg{X: sidebarWidth + 5, Button: tea.MouseWheelUp})
+	if m.scrollOff != wheelScrollStep {
+		t.Fatalf("scrollOff = %d, want %d after one wheel-up", m.scrollOff, wheelScrollStep)
+	}
+	// Wheel down past the live bottom clamps to 0 and leaves scroll mode so
+	// keystrokes resume flowing to the session.
+	m.handleWheel(tea.MouseWheelMsg{X: sidebarWidth + 5, Button: tea.MouseWheelDown})
+	if m.scrollOff != 0 {
+		t.Fatalf("scrollOff = %d, want 0 after wheel-down past bottom", m.scrollOff)
+	}
+	if m.scrollMode {
+		t.Fatal("expected to leave scroll mode at the live bottom")
 	}
 }
 

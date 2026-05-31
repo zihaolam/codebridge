@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"command-center/internal/hook"
 	"command-center/internal/ipc"
@@ -55,10 +57,26 @@ type toast struct {
 const toastTTL = 6 * time.Second
 
 type dashboardModel struct {
-	sessions []ipc.SessionInfo
-	cursor   int
-	errMsg   string
-	w, h     int
+	// allSessions is the full list from the daemon; sessions is the visible
+	// subset after scope filtering (the working set the rest of the UI uses).
+	allSessions []ipc.SessionInfo
+	sessions    []ipc.SessionInfo
+	cursor      int
+	errMsg      string
+	w, h        int
+
+	// Scope: unless showAll, the list is filtered to the repo cb was launched in.
+	// scopeCommon is the git "common directory" (the shared .git) — identical for
+	// a repo's main checkout and every linked worktree, so they share one scope;
+	// a session matches when its cwd resolves to the same common dir. When cb
+	// isn't in a git repo, scopeCommon is "" and scopeRoot's subtree is used
+	// instead. scopeRoot is the main worktree root (shown in the header) or the
+	// launch dir when not in a repo, or "" when the cwd couldn't be determined.
+	// repoCache memoizes cwd -> common dir so polling doesn't re-resolve sessions.
+	scopeCommon string
+	scopeRoot   string
+	showAll     bool
+	repoCache   map[string]string
 
 	prev   map[string]string // last seen status per session id (for transition detection)
 	toasts []toast
@@ -114,18 +132,30 @@ type previewMsg struct {
 
 // Dashboard runs the unified two-zone view: a session list on the left and the
 // selected session's live screen on the right. selectID, if non-empty, is the
-// session to highlight on entry. It returns the action the caller should take.
-func Dashboard(selectID string) (DashAction, error) {
+// session to highlight on entry. cwd is the directory cb was launched in; the
+// session list is scoped to its git repo (including linked worktrees), or its
+// subtree when not a repo. showAll, when true, starts unscoped. It returns the
+// action the caller should take.
+func Dashboard(selectID, cwd string, showAll bool) (DashAction, error) {
+	common, root := deriveScope(cwd)
 	m := &dashboardModel{
-		hooksOK:    hook.Installed(),
-		prev:       map[string]string{},
-		wantSelect: selectID,
-		ch:         make(chan previewMsg, 64),
+		hooksOK:     hook.Installed(),
+		prev:        map[string]string{},
+		wantSelect:  selectID,
+		scopeCommon: common,
+		scopeRoot:   root,
+		showAll:     showAll,
+		repoCache:   map[string]string{},
+		ch:          make(chan previewMsg, 64),
 	}
-	// No mouse capture: leaving the terminal's native mouse handling alone keeps
-	// text selection / copy working. Scrollback is browsed via the keyboard
-	// scroll mode (prefix [) instead. Alt-screen is requested via the View now
-	// (v2 moved terminal feature flags out of program options).
+	// Mouse wheel is captured (see View's MouseMode) so scrolling the screen pane
+	// browses scrollback rather than the terminal turning the wheel into arrow
+	// keys that leak into the session as history nav. Reporting suppresses the
+	// terminal's plain drag-select, so hold Shift to select (Option on iTerm2, Fn
+	// on Terminal.app); freeze mode (prefix f) releases the mouse so plain
+	// drag-select works there too. Scrollback is also browsable via the keyboard
+	// scroll mode (prefix [). Alt-screen and mouse mode are requested via the View
+	// now (v2 moved terminal feature flags out of program options).
 	p := tea.NewProgram(m)
 	res, err := p.Run()
 	if m.conn != nil {
@@ -193,6 +223,191 @@ func (m *dashboardModel) sessionByID(id string) *ipc.SessionInfo {
 		}
 	}
 	return nil
+}
+
+// visibleSessions filters the daemon's full list down to the ones in scope.
+// With showAll set (or no scope root), every session passes through.
+func (m *dashboardModel) visibleSessions(all []ipc.SessionInfo) []ipc.SessionInfo {
+	if m.showAll || m.scopeRoot == "" {
+		return all
+	}
+	out := make([]ipc.SessionInfo, 0, len(all))
+	for _, s := range all {
+		if m.inScope(s.Cwd) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// inScope reports whether a session started in cwd belongs to the current
+// scope. In a git repo, membership is by shared common dir, so the main checkout
+// and all linked worktrees count as one repo; otherwise it falls back to the
+// launch-dir subtree.
+func (m *dashboardModel) inScope(cwd string) bool {
+	if m.scopeCommon != "" {
+		return m.commonDirCached(cwd) == m.scopeCommon
+	}
+	return pathWithin(m.scopeRoot, cwd)
+}
+
+// commonDirCached resolves cwd to its git common dir, memoizing the (stable)
+// result so the 500ms poll doesn't re-walk the filesystem for every session.
+func (m *dashboardModel) commonDirCached(cwd string) string {
+	if m.repoCache == nil {
+		m.repoCache = map[string]string{}
+	}
+	if v, ok := m.repoCache[cwd]; ok {
+		return v
+	}
+	v := gitCommonDir(cwd)
+	m.repoCache[cwd] = v
+	return v
+}
+
+// applyScope recomputes the visible list from the full one after the scope
+// toggle flips, keeping the same session selected when it's still visible and
+// re-attaching the screen pane to whatever ends up under the cursor. Current
+// statuses are recorded as already-seen so the next poll doesn't toast sessions
+// that merely came into view as fresh transitions.
+func (m *dashboardModel) applyScope() {
+	selID := m.selectedID()
+	m.sessions = m.visibleSessions(m.allSessions)
+	m.cursor = 0
+	for i, s := range m.sessions {
+		if s.ID == selID {
+			m.cursor = i
+			break
+		}
+	}
+	for _, s := range m.sessions {
+		m.prev[s.ID] = s.Status
+	}
+	if m.cursor >= len(m.sessions) {
+		m.cursor = max(0, len(m.sessions)-1)
+	}
+	m.syncStream()
+}
+
+// pathWithin reports whether path is root itself or lives beneath it. Both sides
+// are cleaned; matching is purely lexical (cb's launch cwd and a session's cwd
+// both come from os.Getwd, which resolves symlinks, so they're comparable).
+func pathWithin(root, path string) bool {
+	if root == "" {
+		return true
+	}
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	if path == root {
+		return true
+	}
+	return strings.HasPrefix(path, root+string(filepath.Separator))
+}
+
+// deriveScope computes the session-list scope for the directory cb was launched
+// in. common is the git common directory — the shared .git of the repo, which is
+// the SAME for the main checkout and every linked worktree, so sessions in any
+// worktree of one repo share a scope. root is a human-friendly directory for the
+// header (and the non-repo fallback): the main worktree root in a repo, else the
+// launch dir. When cwd isn't in a git repo, common is "" and the scope is the
+// launch-dir subtree.
+func deriveScope(cwd string) (common, root string) {
+	if cwd == "" {
+		return "", ""
+	}
+	cwd = filepath.Clean(cwd)
+	common = gitCommonDir(cwd)
+	if common == "" {
+		return "", cwd
+	}
+	// The main worktree root is the parent of the shared .git directory.
+	return common, filepath.Dir(common)
+}
+
+// gitCommonDir resolves dir to the absolute path of its repository's common
+// directory (the shared .git), or "" when dir isn't inside a git repo. This is
+// the key that ties a repo's main checkout and all its linked worktrees
+// together. Pure filesystem resolution, no git subprocess: find the nearest
+// .git; a .git directory is itself the common dir, while a worktree's .git file
+// points (via its gitdir + commondir files) back to the shared .git.
+func gitCommonDir(dir string) string {
+	dir = filepath.Clean(dir)
+	var gitPath string
+	for cur := dir; ; {
+		p := filepath.Join(cur, ".git")
+		if _, err := os.Stat(p); err == nil {
+			gitPath = p
+			break
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return "" // reached the filesystem root without finding .git
+		}
+		cur = parent
+	}
+	info, err := os.Stat(gitPath)
+	if err != nil {
+		return ""
+	}
+	if info.IsDir() {
+		return canonicalDir(gitPath) // main checkout (or bare repo)
+	}
+	// Linked worktree: ".git" is a file "gitdir: <path-to-worktree-gitdir>".
+	gitDir := readGitdir(gitPath)
+	if gitDir == "" {
+		return ""
+	}
+	// The worktree's gitdir holds a commondir file pointing at the shared .git.
+	if data, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil {
+		cd := strings.TrimSpace(string(data))
+		if !filepath.IsAbs(cd) {
+			cd = filepath.Join(gitDir, cd)
+		}
+		return canonicalDir(cd)
+	}
+	return canonicalDir(gitDir)
+}
+
+// readGitdir reads a worktree's ".git" file and returns the absolute path named
+// by its "gitdir:" line, or "" if it can't be parsed.
+func readGitdir(gitFile string) string {
+	data, err := os.ReadFile(gitFile)
+	if err != nil {
+		return ""
+	}
+	rest, ok := strings.CutPrefix(strings.TrimSpace(string(data)), "gitdir:")
+	if !ok {
+		return ""
+	}
+	gd := strings.TrimSpace(rest)
+	if !filepath.IsAbs(gd) {
+		gd = filepath.Join(filepath.Dir(gitFile), gd)
+	}
+	return filepath.Clean(gd)
+}
+
+// canonicalDir cleans p and resolves symlinks when it can, so two paths reaching
+// the same .git compare equal regardless of how they were reached.
+func canonicalDir(p string) string {
+	p = filepath.Clean(p)
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	return p
+}
+
+// scopeLabel is the short header line under the title that shows whether the
+// list is scoped to a directory or showing every session.
+func (m *dashboardModel) scopeLabel() string {
+	txt := "scope: all"
+	if !m.showAll && m.scopeRoot != "" {
+		name := folderBase(m.scopeRoot)
+		if name == "" {
+			name = m.scopeRoot
+		}
+		txt = "scope: " + name
+	}
+	return helpStyle.Render(truncate(txt, sidebarWidth-1))
 }
 
 // syncStream ensures the screen pane is attached to the currently selected
@@ -395,8 +610,11 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errMsg = msg.err.Error()
 		} else {
 			m.errMsg = ""
-			m.detectTransitions(msg.sessions)
-			m.sessions = msg.sessions
+			m.allSessions = msg.sessions
+			m.sessions = m.visibleSessions(msg.sessions)
+			// Toasts follow the visible set: when scoped, only notify about
+			// sessions in this repo (matching what the header advertises).
+			m.detectTransitions(m.sessions)
 		}
 		if m.wantSelect != "" {
 			for i, s := range m.sessions {
@@ -420,6 +638,9 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sendPaste(msg.Content)
 		}
 		return m, nil
+
+	case tea.MouseWheelMsg:
+		return m.handleWheel(msg)
 
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
@@ -496,6 +717,15 @@ func (m *dashboardModel) handlePrefix(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		// shift+enter, which legacy terminals can't.
 		if m.streamID != "" && !m.gone {
 			m.sendPaste("\n")
+		}
+	case "a":
+		// Toggle between this-repo scope and all sessions everywhere.
+		m.showAll = !m.showAll
+		m.applyScope()
+		if m.showAll {
+			m.pushToast("⊚ showing all sessions", "starting")
+		} else {
+			m.pushToast("⊙ scoped to "+folderBase(m.scopeRoot), "working")
 		}
 	case "n":
 		return m, m.spawnCmd("claude")
@@ -580,6 +810,50 @@ func (m *dashboardModel) sendScroll() {
 	if m.conn != nil {
 		_ = ipc.WriteJSON(m.conn, ipc.StreamUp{Type: "scroll", Offset: m.scrollOff})
 	}
+}
+
+// wheelScrollStep is how many scrollback lines one wheel notch moves.
+const wheelScrollStep = 3
+
+// handleWheel routes a mouse-wheel event by where it happened. Over the sidebar
+// (x within its column band) it moves the selection; over the screen pane it
+// browses the session's scrollback, entering scroll mode on the way up and
+// leaving it once a scroll-down returns to the live bottom so typing resumes
+// flowing to the session.
+func (m *dashboardModel) handleWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
+	e := msg.Mouse()
+	if e.X < sidebarWidth {
+		switch e.Button {
+		case tea.MouseWheelUp:
+			if m.cursor > 0 {
+				m.cursor--
+				m.syncStream()
+			}
+		case tea.MouseWheelDown:
+			if m.cursor < len(m.sessions)-1 {
+				m.cursor++
+				m.syncStream()
+			}
+		}
+		return m, nil
+	}
+	switch e.Button {
+	case tea.MouseWheelUp:
+		if !m.scrollMode {
+			m.enterScroll()
+		}
+		if m.scrollMode {
+			m.scrollBy(wheelScrollStep)
+		}
+	case tea.MouseWheelDown:
+		if m.scrollMode {
+			m.scrollBy(-wheelScrollStep)
+			if m.scrollOff == 0 {
+				m.exitScroll()
+			}
+		}
+	}
+	return m, nil
 }
 
 // handleScrollKey handles keystrokes while browsing scrollback in the screen pane.
@@ -799,6 +1073,15 @@ func (m *dashboardModel) View() tea.View {
 	}
 	v := tea.NewView(content)
 	v.AltScreen = true
+	// Capture the wheel (cell-motion = click/release/wheel/drag) so scrolling the
+	// screen pane browses scrollback instead of leaking arrow keys into the
+	// session. While frozen we release the mouse entirely so the host terminal
+	// does plain drag-selection for copy; this stays constant across frozen frames
+	// so the View still diffs to a no-op.
+	v.MouseMode = tea.MouseModeCellMotion
+	if m.frozen {
+		v.MouseMode = tea.MouseModeNone
+	}
 	return v
 }
 
@@ -820,11 +1103,31 @@ func (m *dashboardModel) renderLive() string {
 	case m.renaming:
 		out += "\n" + titleStyle.Render("rename: ") + m.renameBuf + "▎  " + helpStyle.Render("enter save · esc cancel")
 	case m.focus == focusScreen || m.scrollMode:
-		out += "\n" + helpStyle.Render(fmt.Sprintf("prefix ← sidebar · prefix ⏎ newline · prefix [ scroll · prefix f freeze/copy · prefix n/c new · prefix x kill · prefix q quit  (prefix = %s)", p))
+		out += "\n" + helpStyle.Render(fmt.Sprintf("prefix ← sidebar · prefix ⏎ newline · prefix [ scroll · prefix f freeze/copy · prefix n/c new · prefix x kill · prefix a scope · prefix q quit  (prefix = %s)", p))
 	default:
-		out += "\n" + helpStyle.Render(fmt.Sprintf("↑/↓ select · enter/prefix → focus · prefix [ scroll · prefix f freeze/copy · n claude · c codex · x kill · R rename · prefix q quit  (prefix = %s)", p))
+		out += "\n" + helpStyle.Render(fmt.Sprintf("↑/↓ select · enter/prefix → focus · prefix [ scroll · prefix f freeze/copy · n claude · c codex · x kill · R rename · prefix a scope · prefix q quit  (prefix = %s)", p))
 	}
-	return out
+	// Bound every line to the terminal width. The body lines are already within
+	// width, but the help/hint and toast chrome lines can be longer than a narrow
+	// terminal; left unbounded they wrap at display time, adding a visual row that
+	// pushes the view past the terminal height and clips the bottom (the prefix
+	// hints and the session's last line). Truncating is ANSI-aware so styling is
+	// preserved and not left dangling.
+	return clampLines(out, m.w)
+}
+
+// clampLines truncates each line of s to at most w display columns, preserving
+// ANSI styling (so a faint/colored line keeps its trailing reset). w <= 0 is a
+// no-op.
+func clampLines(s string, w int) string {
+	if w <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		lines[i] = ansi.Truncate(ln, w, "")
+	}
+	return strings.Join(lines, "\n")
 }
 
 // renderSidebar draws the narrow left column: one row per session (status glyph
@@ -851,9 +1154,10 @@ func (m *dashboardModel) renderSidebar() string {
 		rows = append(rows, helpStyle.Render(" no sessions"), helpStyle.Render(" press n"))
 	}
 
-	// The sidebar carries the app title at the top, then the session list, then a
-	// footer at the bottom. errMsg (a daemon problem) rides under the title.
-	header := titleStyle.Render("codebridge")
+	// The sidebar carries the app title at the top, then a scope line, then the
+	// session list, then a footer at the bottom. errMsg (a daemon problem) rides
+	// under the title.
+	header := titleStyle.Render("codebridge") + "\n" + m.scopeLabel()
 	if m.errMsg != "" {
 		header += "\n" + statusStyle["needs_approval"].Render(truncate("daemon: "+m.errMsg, sidebarWidth-1))
 	}
@@ -901,10 +1205,15 @@ func (m *dashboardModel) renderScreen() string {
 	case m.focus == focusScreen:
 		border = screenFocusBorderStyle
 	}
-	// lipgloss Width includes padding, and the style has PaddingLeft(1); add it
-	// back so the content area is exactly paneW (matching the session cols) and a
-	// full-width line doesn't wrap into an extra row.
-	return border.Width(maxInt(m.paneW+1, 1)).Height(maxInt(m.paneH, 1)).Render(screen)
+	// lipgloss Width is the *total* block width — it includes the border and
+	// padding, not just the content. So to give the session content exactly paneW
+	// columns (matching the cols the session is sized to), Width must be paneW plus
+	// the horizontal frame (left border + left padding). Using the style's own
+	// frame size keeps this correct if the border/padding ever change. Getting this
+	// wrong by one makes a full-width line (e.g. Claude's input-box rules) wrap onto
+	// a stray extra row.
+	frame := border.GetHorizontalFrameSize()
+	return border.Width(maxInt(m.paneW+frame, 1)).Height(maxInt(m.paneH, 1)).Render(screen)
 }
 
 // toastLine renders any active toasts as a single compact line beneath the body.

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	uv "github.com/charmbracelet/ultraviolet"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
 )
@@ -179,16 +180,21 @@ func (s *Session) Render() string {
 	return trimCols(s.emu.Render(), cols)
 }
 
-// trimCols clips each line of s to at most cols runes. cols <= 0 is a no-op.
+// trimCols clips each line of s to at most cols display columns. The emulator's
+// Render encodes styles as inline ANSI escapes, so the clip must be width-aware:
+// counting escape bytes as runes (the old behavior) cut visible content short
+// and could slice through an escape sequence, leaving a dangling color that
+// bleeds into the rest of the frame and throws off the client's width-aware line
+// wrapping (full-width rules wrapping onto a stray extra line). ansi.Truncate
+// measures display width and keeps escapes — including the trailing reset —
+// intact. cols <= 0 is a no-op.
 func trimCols(s string, cols int) string {
 	if cols <= 0 {
 		return s
 	}
 	lines := strings.Split(s, "\n")
 	for i, ln := range lines {
-		if r := []rune(ln); len(r) > cols {
-			lines[i] = string(r[:cols])
-		}
+		lines[i] = ansi.Truncate(ln, cols, "")
 	}
 	return strings.Join(lines, "\n")
 }

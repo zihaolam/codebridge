@@ -19,9 +19,13 @@ import (
 // Run dispatches the given args (os.Args[1:]) to a subcommand.
 func Run(args []string) error {
 	if len(args) == 0 {
-		return runDashboard()
+		return runDashboard(false)
 	}
 	switch args[0] {
+	case "--all", "-a":
+		// Launch the dashboard unscoped: show sessions from every directory
+		// rather than just the current repo. (Toggle in-app with prefix a.)
+		return runDashboard(true)
 	case "demo":
 		return runDemo(args[1:])
 	case "daemon":
@@ -45,7 +49,7 @@ func Run(args []string) error {
 	case "install-codex":
 		return hook.InstallCodex(args[1:])
 	case "-h", "--help", "help":
-		fmt.Println("usage: cb [daemon|ctl|hook|install-hooks|install-codex|stop] ...")
+		fmt.Println("usage: cb [--all|daemon|ctl|hook|install-hooks|install-codex|stop] ...")
 		return nil
 	default:
 		return fmt.Errorf("unknown subcommand %q", args[0])
@@ -100,12 +104,18 @@ func runCtl(args []string) error {
 }
 
 // runDashboard runs the unified sidebar + live-screen view until the user
-// quits. It auto-starts the daemon if it isn't already running.
-func runDashboard() error {
+// quits. It auto-starts the daemon if it isn't already running. Unless `all` is
+// set, the session list is scoped to the git repo containing the current
+// directory — including any of its linked worktrees, which share one scope.
+// Sessions started elsewhere are hidden until you toggle with prefix a. The
+// launch cwd is always passed so the in-app toggle works even with --all; the
+// TUI derives the scope from it.
+func runDashboard(all bool) error {
 	if err := ensureDaemon(); err != nil {
 		return err
 	}
-	_, err := tui.Dashboard("")
+	cwd, _ := os.Getwd()
+	_, err := tui.Dashboard("", cwd, all)
 	return err
 }
 
