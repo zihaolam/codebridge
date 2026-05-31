@@ -69,7 +69,7 @@ var ReservedKeys = map[string]string{
 	"down":   "navigation",
 	"k":      "navigation",
 	"j":      "navigation",
-	"ctrl+c": "copy selection / quit",
+	"ctrl+c": "quit / SIGINT to focused session",
 }
 
 // Config is the on-disk shape. Bindings maps an Action.Key to the key string

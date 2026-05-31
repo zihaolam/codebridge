@@ -97,6 +97,10 @@ var csiTilde = map[rune]byte{
 // child process. Returns nil for keys with no sensible byte encoding.
 func keyToBytes(k tea.KeyPressMsg) []byte {
 	alt := k.Mod&tea.ModAlt != 0
+	// Lock-state bits (CapsLock/NumLock/ScrollLock) can ride along on any
+	// keypress when the terminal speaks the Kitty keyboard protocol. They
+	// must not affect modifier-equality checks below, so strip them once.
+	primary := k.Mod &^ (tea.ModCapsLock | tea.ModNumLock | tea.ModScrollLock)
 
 	// shift+enter -> Kitty CSI-u so the child inserts a newline instead of
 	// submitting. Claude Code reads this when it has the Kitty keyboard protocol
@@ -119,7 +123,7 @@ func keyToBytes(k tea.KeyPressMsg) []byte {
 	// fires in the child. Only the unmodified Option/Cmd combos are rewritten;
 	// Shift-extended variants fall through to the CSI form below for any TUI
 	// that does want selection-by-word.
-	if k.Mod == tea.ModAlt {
+	if primary == tea.ModAlt {
 		switch k.Code {
 		case tea.KeyLeft:
 			return []byte("\x1bb")
@@ -127,13 +131,25 @@ func keyToBytes(k tea.KeyPressMsg) []byte {
 			return []byte("\x1bf")
 		}
 	}
-	if k.Mod == tea.ModSuper || k.Mod == tea.ModMeta {
+	if primary == tea.ModSuper || primary == tea.ModMeta {
 		switch k.Code {
 		case tea.KeyLeft:
 			return []byte{0x01}
 		case tea.KeyRight:
 			return []byte{0x05}
 		}
+	}
+
+	// iTerm2 / Terminal.app default mappings already pre-translate Option+Left
+	// and Option+Right into the readline word-nav bytes (\x1bb and \x1bf). The
+	// terminal hands us \x1bb, bubbletea decodes it as Alt+'b' with Text="" (it
+	// clears Text for any alt-prefix decode), and the printable-text branch
+	// below would skip it because Text is empty. Synthesize the byte from Code
+	// so word-nav still reaches the child on those terminals. Constrained to
+	// printable ASCII and Alt-only (plus lock bits) so it can't accidentally
+	// swallow Shift+Alt+letter or modified specials.
+	if primary == tea.ModAlt && k.Code >= 0x20 && k.Code < 0x7f && k.Text == "" {
+		return []byte{0x1b, byte(k.Code)}
 	}
 
 	// Modified navigation keys (arrows, Home/End, PgUp/PgDn, Insert/Delete) need

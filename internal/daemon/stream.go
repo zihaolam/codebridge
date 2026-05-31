@@ -49,15 +49,17 @@ func (d *Daemon) attach(conn net.Conn, sc *bufio.Scanner, req ipc.Request) {
 		defer t.Stop()
 		last := ""
 		lastOff, lastMax := -1, -1
+		lastCx, lastCy := -1, -1
 		for {
 			select {
 			case <-stop:
 				return
 			case <-t.C:
 				screen, off, maxOff := s.RenderScroll(int(scrollOff.Load()))
-				if screen != last || off != lastOff || maxOff != lastMax {
+				cx, cy := s.Cursor()
+				if screen != last || off != lastOff || maxOff != lastMax || cx != lastCx || cy != lastCy {
 					last, lastOff, lastMax = screen, off, maxOff
-					cx, cy := s.Cursor()
+					lastCx, lastCy = cx, cy
 					_ = write(ipc.StreamDown{
 						Type:      "frame",
 						Screen:    screen,

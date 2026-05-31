@@ -43,6 +43,76 @@ func TestRenderScreenDoesNotWrapFullWidthLine(t *testing.T) {
 	}
 }
 
+func TestViewShowsSessionCursorWhenScreenFocused(t *testing.T) {
+	const paneW, paneH = 100, 8
+	m := &dashboardModel{
+		w:        120,
+		h:        paneH,
+		paneW:    paneW,
+		paneH:    paneH,
+		focus:    focusScreen,
+		streamID: "live00000000",
+		screen:   fullWidthScreen(paneW, paneH),
+		cursorX:  7,
+		cursorY:  3,
+		hooksOK:  true,
+		sessions: []ipc.SessionInfo{{ID: "live00000000", Status: "idle"}},
+	}
+
+	v := m.View()
+	if v.Cursor == nil {
+		t.Fatal("expected focused session view to expose a terminal cursor")
+	}
+	wantX := sidebarWidth + screenBorderStyle.GetHorizontalFrameSize() + m.cursorX
+	if v.Cursor.X != wantX || v.Cursor.Y != m.cursorY {
+		t.Fatalf("cursor position = (%d,%d), want (%d,%d)", v.Cursor.X, v.Cursor.Y, wantX, m.cursorY)
+	}
+
+	m.focus = focusSidebar
+	if v := m.View(); v.Cursor != nil {
+		t.Fatal("expected sidebar focus to hide the session cursor")
+	}
+}
+
+func TestForwardedCmdCRecopiesHeldSelection(t *testing.T) {
+	cases := []struct {
+		name string
+		mod  tea.KeyMod
+		code rune
+	}{
+		{"super c", tea.ModSuper, 'c'},
+		{"meta c", tea.ModMeta, 'c'},
+		{"super upper c", tea.ModSuper, 'C'},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := &dashboardModel{
+				streamID: "live",
+				focus:    focusScreen,
+				selStart: selPos{line: 0, col: 0},
+				selEnd:   selPos{line: 0, col: 4},
+			}
+			_, cmd := m.handleKey(tea.KeyPressMsg{Code: c.code, Mod: c.mod})
+			if cmd == nil {
+				t.Fatal("expected forwarded Cmd+C to request selection extraction")
+			}
+		})
+	}
+}
+
+func TestCtrlCDoesNotRecopyHeldSelection(t *testing.T) {
+	m := &dashboardModel{
+		streamID: "live",
+		focus:    focusScreen,
+		selStart: selPos{line: 0, col: 0},
+		selEnd:   selPos{line: 0, col: 4},
+	}
+	_, cmd := m.handleKey(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if cmd != nil {
+		t.Fatal("expected Ctrl+C to remain session input, not selection copy")
+	}
+}
+
 func TestRenderLiveFitsTerminal(t *testing.T) {
 	const w, h = 120, 30
 	m := &dashboardModel{

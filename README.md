@@ -46,9 +46,19 @@ keyboard extension enabled)**. Other terminals (Terminal.app, stock iTerm2,
 Alacritty's default config, GNOME Terminal, etc.) will run codebridge, but a
 handful of bindings will be unavailable or fall back to alternatives:
 
-- **Copy with `cmd+c`** (in addition to `ctrl+c` / prefix `y`) — only the
-  supported terminals forward Cmd to the app; others intercept it for their own
-  selection.
+- **Copy with `cmd+c`** — macOS terminals (Terminal.app, default iTerm2, etc.)
+  often intercept `cmd+c` at the OS level for their *own* clipboard copy and
+  never forward the keystroke to the running program, so cb cannot see it. In
+  terminals that do forward Cmd via Kitty keyboard reporting, `cmd+c` re-copies
+  the held cb highlight. Everywhere else, cb sidesteps the keyboard:
+  - **Just release the mouse.** Drag-selecting in the screen pane auto-copies
+    the selection to the system clipboard (via OSC52) the moment you let go —
+    no keypress needed. Then `cmd+v` anywhere.
+  - **Prefix `y`** explicitly re-copies the held highlight. (`ctrl+c` is *not*
+    a copy key — it stays reserved for SIGINT to the focused session.)
+  - On iTerm2 specifically, you can rebind `⌘C` under *Preferences → Profiles
+    → Keys* to "Send Escape Sequence" so it forwards instead of being
+    intercepted, but the auto-copy flow above usually makes this unnecessary.
 - **Shift+Enter / Shift+Tab** in the focused session — without Kitty keyboard
   reporting, the terminal can't disambiguate the modifier and the session sees
   a plain Enter or Tab. Use the prefix `enter` binding to insert a newline on
@@ -176,9 +186,9 @@ note, since the env override always wins.
 ### Scroll mode (browsing scrollback)
 
 `Ctrl-a` `[` freezes the screen pane and lets you scroll up through the session's
-history (the border turns magenta). cb deliberately does **not** capture the mouse,
-so your terminal's native text selection / copy keeps working; scrollback is browsed
-with the keyboard.
+history (the border turns magenta). cb captures wheel and drag events so scrollback
+selection can autoscroll; hold Shift while dragging if you want your terminal's
+native selection instead.
 
 | key | action |
 |-----|--------|

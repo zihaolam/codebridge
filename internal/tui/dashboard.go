@@ -121,6 +121,8 @@ type dashboardModel struct {
 	// keystrokes are forwarded to this session over the same connection.
 	streamID string   // session currently streamed into the right pane
 	screen   string   // latest rendered frame (kept across switches to avoid flicker)
+	cursorX  int      // latest cursor column within the session screen
+	cursorY  int      // latest cursor row within the session screen
 	gone     bool     // streamed session ended
 	conn     net.Conn // attach stream (nil when none)
 	ch       chan previewMsg
@@ -159,6 +161,8 @@ type selPos struct{ line, col int }
 type previewMsg struct {
 	id     string
 	screen string
+	cx     int
+	cy     int
 	gone   bool
 	offset int
 	max    int
@@ -532,7 +536,7 @@ func previewReadLoop(id string, conn net.Conn, ch chan previewMsg) {
 			ch <- previewMsg{id: id, gone: true}
 			return
 		}
-		ch <- previewMsg{id: id, screen: d.Screen, offset: d.Offset, max: d.MaxOffset}
+		ch <- previewMsg{id: id, screen: d.Screen, cx: d.CursorX, cy: d.CursorY, offset: d.Offset, max: d.MaxOffset}
 	}
 }
 
@@ -656,7 +660,7 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// pane within milliseconds for an actively streaming Claude.
 				// Bumping scrollOff by the same delta keeps the highlighted
 				// content pinned where the user dragged it; the user resumes
-				// live by clearing the selection (ctrl+c / prefix y / new click)
+				// live by clearing the selection (any new click clears it)
 				// and then scrolling down or pressing G in scroll mode.
 				if m.selStart != m.selEnd && msg.max > m.scrollMax {
 					m.scrollOff += msg.max - m.scrollMax
@@ -669,6 +673,8 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.screen = msg.screen
+				m.cursorX = msg.cx
+				m.cursorY = msg.cy
 				m.scrollMax = msg.max
 				if m.scrollOff > m.scrollMax {
 					m.scrollOff = m.scrollMax
@@ -887,10 +893,9 @@ func (m *dashboardModel) handleMouseMotion(msg tea.MouseMotionMsg) (tea.Model, t
 
 // handleMouseRelease ends the drag, keeps the highlight painted, and pushes
 // the selected text onto the system clipboard via OSC52 right away. macOS
-// terminals almost always swallow cmd+c (and ctrl+c is genuinely overloaded —
-// it's the canonical "send SIGINT to claude" key when typing into the screen
-// pane), so auto-copy-on-release is the only ergonomic path: drag, release,
-// paste anywhere. ctrl+c / prefix+y still work as explicit re-copies. A
+// terminals almost always swallow cmd+c, and ctrl+c is reserved as the SIGINT
+// key for the focused session, so auto-copy-on-release is the only ergonomic
+// path: drag, release, paste anywhere. prefix+y is the explicit re-copy. A
 // no-drag click — start == end — clears the state immediately so a tap doesn't
 // leave a stale zero-width selection lingering on the model.
 func (m *dashboardModel) handleMouseRelease(msg tea.MouseReleaseMsg) (tea.Model, tea.Cmd) {
@@ -919,6 +924,16 @@ func normalizeSel(a, b selPos) (selPos, selPos) {
 	return b, a
 }
 
+// isForwardedCmdC reports whether a terminal sent the macOS copy chord through
+// to the application. Most macOS terminals intercept Cmd+C themselves, but
+// Kitty-keyboard-capable terminals can surface it as Super+C or Meta+C.
+func isForwardedCmdC(msg tea.KeyPressMsg) bool {
+	if msg.Mod&(tea.ModSuper|tea.ModMeta) == 0 {
+		return false
+	}
+	return msg.Code == 'c' || msg.Code == 'C'
+}
+
 // handleKey routes a keystroke through the rename prompt, the ctrl+a prefix,
 // and then either the screen pane (forwarded as input) or the sidebar.
 func (m *dashboardModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -942,26 +957,13 @@ func (m *dashboardModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.prefix = true
 		return m, nil
 	}
-	// While a finalized selection is held, ctrl+c is the natural copy shortcut
-	// and always reaches us. cmd+c (reported as super+c, or meta+c on some
-	// terminals) is also accepted for terminals that forward it via the Kitty
-	// keyboard protocol — many macOS terminals still swallow it for their own
-	// selection, but where it does come through we honor it. Copy-only — the
-	// highlight stays until the user clicks somewhere, so repeated copies are
-	// harmless. Without a selection, these keys fall through to their usual
-	// roles (quit from the sidebar, raw ^C to the session from the screen).
-	if !m.selecting && m.streamID != "" && m.selStart != m.selEnd {
-		copyHit := msg.String() == "ctrl+c"
-		if !copyHit && msg.Code == 'c' && msg.Mod&(tea.ModSuper|tea.ModMeta) != 0 {
-			// cmd+c arrives as super+c (or meta+c on some terminals). Match on
-			// the modifier directly because msg.String() falls back to Key.Text
-			// when set, which a few terminals populate even for Cmd combos.
-			copyHit = true
-		}
-		if copyHit {
-			start, end := normalizeSel(m.selStart, m.selEnd)
-			return m, extractCmd(m.streamID, start, end)
-		}
+	// Copy on selection is auto-fired from handleMouseRelease (drag → release →
+	// clipboard). If a terminal forwards Cmd+C via Kitty keyboard reporting,
+	// honor it as a re-copy of the held highlight. Ctrl+C is intentionally NOT a
+	// copy shortcut here: it stays SIGINT for the focused session.
+	if !m.selecting && m.streamID != "" && m.selStart != m.selEnd && isForwardedCmdC(msg) {
+		start, end := normalizeSel(m.selStart, m.selEnd)
+		return m, extractCmd(m.streamID, start, end)
 	}
 	if m.scrollMode {
 		return m.handleScrollKey(msg)
@@ -1395,11 +1397,30 @@ var (
 func (m *dashboardModel) View() tea.View {
 	v := tea.NewView(m.renderLive())
 	v.AltScreen = true
+	if m.shouldShowSessionCursor() {
+		v.Cursor = tea.NewCursor(sidebarWidth+screenBorderStyle.GetHorizontalFrameSize()+m.cursorX, m.cursorY)
+	}
 	// Capture the wheel (cell-motion = click/release/wheel/drag) so scrolling the
 	// screen pane browses scrollback instead of leaking arrow keys into the
 	// session.
 	v.MouseMode = tea.MouseModeCellMotion
 	return v
+}
+
+func (m *dashboardModel) shouldShowSessionCursor() bool {
+	return m.focus == focusScreen &&
+		!m.configOpen &&
+		!m.renaming &&
+		!m.prefix &&
+		!m.menu &&
+		m.streamID != "" &&
+		!m.gone &&
+		!m.scrollMode &&
+		m.screen != "" &&
+		m.cursorX >= 0 &&
+		m.cursorX < m.paneW &&
+		m.cursorY >= 0 &&
+		m.cursorY < m.paneH
 }
 
 func (m *dashboardModel) renderLive() string {
