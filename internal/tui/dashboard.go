@@ -194,8 +194,11 @@ func Dashboard(selectID, cwd string, showAll bool) (DashAction, error) {
 	// text in-app (autoscrolls continuously while the cursor parks at an edge —
 	// see selTickMsg) — that's what mouse capture costs us, since otherwise the
 	// host terminal would handle drag-selection but couldn't autoscroll on
-	// alt-screen. The selection stays painted after release; ctrl+c or prefix y
-	// copies it to the system clipboard via OSC52, and any new click dismisses.
+	// alt-screen. On mouse-release the selection is auto-copied to the system
+	// clipboard via OSC52 (macOS terminals swallow cmd+c, so a key-driven copy
+	// is unreliable); the highlight stays painted as a hint that the text
+	// landed, ctrl+c / prefix y still re-copy on demand, and any new click
+	// dismisses the highlight.
 	// Holding Shift bypasses our capture so the host terminal's native
 	// (no-autoscroll) selection still works for users on terminals where OSC52
 	// is disabled. Scrollback is also browsable via the keyboard scroll mode
@@ -882,8 +885,12 @@ func (m *dashboardModel) handleMouseMotion(msg tea.MouseMotionMsg) (tea.Model, t
 	return m, nil
 }
 
-// handleMouseRelease ends the drag but keeps the selection visible so the user
-// can read it before deciding to yank (prefix y) or dismiss (any click). A
+// handleMouseRelease ends the drag, keeps the highlight painted, and pushes
+// the selected text onto the system clipboard via OSC52 right away. macOS
+// terminals almost always swallow cmd+c (and ctrl+c is genuinely overloaded —
+// it's the canonical "send SIGINT to claude" key when typing into the screen
+// pane), so auto-copy-on-release is the only ergonomic path: drag, release,
+// paste anywhere. ctrl+c / prefix+y still work as explicit re-copies. A
 // no-drag click — start == end — clears the state immediately so a tap doesn't
 // leave a stale zero-width selection lingering on the model.
 func (m *dashboardModel) handleMouseRelease(msg tea.MouseReleaseMsg) (tea.Model, tea.Cmd) {
@@ -893,8 +900,13 @@ func (m *dashboardModel) handleMouseRelease(msg tea.MouseReleaseMsg) (tea.Model,
 	m.selecting = false
 	if m.selStart == m.selEnd {
 		m.selStart, m.selEnd = selPos{}, selPos{}
+		return m, nil
 	}
-	return m, nil
+	if m.streamID == "" {
+		return m, nil
+	}
+	start, end := normalizeSel(m.selStart, m.selEnd)
+	return m, extractCmd(m.streamID, start, end)
 }
 
 // normalizeSel returns (a, b) in forward reading order: earlier line first,
