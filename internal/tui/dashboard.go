@@ -112,13 +112,18 @@ type dashboardModel struct {
 	scrollMax  int
 	sidebarTop int
 
-	// frozen freezes the whole view for text selection: while set, View returns a
-	// cached snapshot so Bubble Tea writes nothing to the terminal, letting the
-	// host terminal keep a native drag-selection alive. Sessions keep running
-	// underneath; we just stop painting. See freeze/unfreeze.
-	frozen     bool
-	frozenView string
+	// In-app drag selection over the screen pane. Anchored in virtual-line space
+	// (scrollback index + visible-grid index) so the selection stays bound to its
+	// content as the view autoscrolls. On release we ask the daemon to extract the
+	// plain text in this range and put it on the system clipboard via OSC52.
+	selecting bool
+	selStart  selPos
+	selEnd    selPos
 }
+
+// selPos is a position in the session's virtual buffer: line is an index into
+// (scrollback + visible grid), col is a display column on that line.
+type selPos struct{ line, col int }
 
 // previewMsg carries a frame from the screen-pane attach stream. id tags which
 // session it came from so frames from a just-closed connection are ignored.
@@ -150,12 +155,15 @@ func Dashboard(selectID, cwd string, showAll bool) (DashAction, error) {
 	}
 	// Mouse wheel is captured (see View's MouseMode) so scrolling the screen pane
 	// browses scrollback rather than the terminal turning the wheel into arrow
-	// keys that leak into the session as history nav. Reporting suppresses the
-	// terminal's plain drag-select, so hold Shift to select (Option on iTerm2, Fn
-	// on Terminal.app); freeze mode (prefix f) releases the mouse so plain
-	// drag-select works there too. Scrollback is also browsable via the keyboard
-	// scroll mode (prefix [). Alt-screen and mouse mode are requested via the View
-	// now (v2 moved terminal feature flags out of program options).
+	// keys that leak into the session as history nav. Plain click+drag selects
+	// text in-app (autoscrolls past the edge, copies to the system clipboard on
+	// release via OSC52) — that's what mouse capture costs us, since otherwise
+	// the host terminal would handle drag-selection but couldn't autoscroll on
+	// alt-screen. Holding Shift bypasses our capture so the host terminal's
+	// native (no-autoscroll) selection still works for users on terminals where
+	// OSC52 is disabled. Scrollback is also browsable via the keyboard scroll
+	// mode (prefix [). Alt-screen and mouse mode are requested via the View now
+	// (v2 moved terminal feature flags out of program options).
 	p := tea.NewProgram(m)
 	res, err := p.Run()
 	if m.conn != nil {
@@ -426,10 +434,14 @@ func (m *dashboardModel) syncStream() {
 	}
 	m.streamID = id
 	m.gone = false
-	// Scroll position is per-session; reset to live when switching.
+	// Scroll position and any in-progress drag selection are per-session; reset
+	// to live when switching so we don't anchor a selection in another session's
+	// virtual-line space.
 	m.scrollMode = false
 	m.scrollOff = 0
 	m.scrollMax = 0
+	m.selecting = false
+	m.selStart, m.selEnd = selPos{}, selPos{}
 	if id == "" {
 		m.screen = ""
 		return
@@ -570,9 +582,6 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
-		// A resize repaints the whole terminal and clears any selection anyway, so
-		// drop the frozen snapshot rather than show it at the wrong size.
-		m.frozen, m.frozenView = false, ""
 		m.relayoutStream()
 		return m, nil
 
@@ -634,7 +643,7 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.PasteMsg:
 		// Bracketed paste is its own message in v2. Forward it to the focused
 		// session as a single paste so the daemon wraps it in paste markers.
-		if m.focus == focusScreen && !m.scrollMode && !m.frozen {
+		if m.focus == focusScreen && !m.scrollMode {
 			m.sendPaste(msg.Content)
 		}
 		return m, nil
@@ -642,10 +651,163 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseWheelMsg:
 		return m.handleWheel(msg)
 
+	case tea.MouseClickMsg:
+		return m.handleMouseClick(msg)
+	case tea.MouseMotionMsg:
+		return m.handleMouseMotion(msg)
+	case tea.MouseReleaseMsg:
+		return m.handleMouseRelease(msg)
+
+	case extractedMsg:
+		// Extraction came back from the daemon — push it to the system clipboard
+		// and flash a toast so the user knows it landed. Empty text usually means
+		// the user clicked without dragging; just clear and move on.
+		if msg.text != "" {
+			m.pushToast(fmt.Sprintf("⎘ copied %d chars", len(msg.text)), "working")
+			return m, tea.SetClipboard(msg.text)
+		}
+		return m, nil
+
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 	}
 	return m, nil
+}
+
+// extractedMsg carries the text returned by the daemon's extract RPC so we can
+// hand it to tea.SetClipboard from the main Update goroutine.
+type extractedMsg struct{ text string }
+
+// extractCmd asks the daemon for the plain text of the selected range. start
+// and end must already be normalized (start <= end in virtual-line / col order).
+func extractCmd(id string, start, end selPos) tea.Cmd {
+	return func() tea.Msg {
+		resp, err := ipc.Send(ipc.Request{
+			Type:      "extract",
+			ID:        id,
+			LineStart: start.line,
+			LineEnd:   end.line,
+			ColStart:  start.col,
+			ColEnd:    end.col,
+		})
+		if err != nil || !resp.OK {
+			return extractedMsg{}
+		}
+		return extractedMsg{text: resp.Text}
+	}
+}
+
+// paneCellAt converts a terminal-space mouse coordinate to the cell inside the
+// screen pane's content area: (col, row) in [0, paneW) × [0, paneH). It also
+// reports whether the click landed inside the pane at all. The pane begins one
+// column for the left border plus one column of left padding to the right of
+// the sidebar; rows start at the top of the View.
+func (m *dashboardModel) paneCellAt(x, y int) (col, row int, inside bool) {
+	col = x - sidebarWidth - 2
+	row = y
+	inside = col >= 0 && col < m.paneW && row >= 0 && row < m.paneH
+	return
+}
+
+// vLine maps a visual row in the current frame to its index in the virtual
+// buffer (scrollback length minus current scroll offset, plus the row). This
+// is the anchor we record so a selection survives autoscrolling: as the offset
+// changes, the visual row of the same virtual line shifts but the virtual line
+// itself is fixed.
+func (m *dashboardModel) vLine(row int) int { return row + m.scrollMax - m.scrollOff }
+
+// edgeAutoscroll bumps the scroll offset by one line when the cursor is at or
+// past the top/bottom edge during a drag, so the user can extend a selection
+// past the visible window without releasing the mouse.
+func (m *dashboardModel) edgeAutoscroll(row int) {
+	switch {
+	case row <= 0 && m.scrollOff < m.scrollMax:
+		if !m.scrollMode {
+			m.scrollMode = true
+		}
+		m.scrollOff++
+		m.sendScroll()
+	case row >= m.paneH-1 && m.scrollOff > 0:
+		m.scrollOff--
+		m.sendScroll()
+		if m.scrollOff == 0 {
+			m.scrollMode = false
+		}
+	}
+}
+
+// handleMouseClick begins an in-app drag selection when the user presses the
+// left mouse button inside the screen pane (no modifiers). Other buttons /
+// regions are ignored — a stray click on the sidebar shouldn't disturb the
+// session selection or the cursor. We also clear any prior selection so a fresh
+// click starts a fresh region.
+func (m *dashboardModel) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
+	e := msg.Mouse()
+	if e.Button != tea.MouseLeft || e.Mod != 0 {
+		return m, nil
+	}
+	col, row, inside := m.paneCellAt(e.X, e.Y)
+	if !inside || m.streamID == "" || m.gone {
+		return m, nil
+	}
+	pos := selPos{line: m.vLine(row), col: col}
+	m.selecting = true
+	m.selStart, m.selEnd = pos, pos
+	return m, nil
+}
+
+// handleMouseMotion extends the active selection while the button is held and
+// triggers edge autoscroll. Without a live selection we ignore motion entirely
+// so cursor wander doesn't churn the screen pane.
+func (m *dashboardModel) handleMouseMotion(msg tea.MouseMotionMsg) (tea.Model, tea.Cmd) {
+	if !m.selecting {
+		return m, nil
+	}
+	e := msg.Mouse()
+	col := e.X - sidebarWidth - 2
+	row := e.Y
+	if col < 0 {
+		col = 0
+	}
+	if col > m.paneW {
+		col = m.paneW
+	}
+	m.edgeAutoscroll(row)
+	if row < 0 {
+		row = 0
+	}
+	if row > m.paneH-1 {
+		row = m.paneH - 1
+	}
+	m.selEnd = selPos{line: m.vLine(row), col: col}
+	return m, nil
+}
+
+// handleMouseRelease finalizes a selection: it normalizes the (start, end) pair
+// into forward order, asks the daemon for the plain text spanning that range,
+// and (in extractedMsg) puts it on the system clipboard via OSC52. A click with
+// no drag selects nothing — just clear the state.
+func (m *dashboardModel) handleMouseRelease(msg tea.MouseReleaseMsg) (tea.Model, tea.Cmd) {
+	if !m.selecting {
+		return m, nil
+	}
+	m.selecting = false
+	start, end := normalizeSel(m.selStart, m.selEnd)
+	m.selStart, m.selEnd = selPos{}, selPos{}
+	if start == end || m.streamID == "" {
+		return m, nil
+	}
+	return m, extractCmd(m.streamID, start, end)
+}
+
+// normalizeSel returns (a, b) in forward reading order: earlier line first,
+// and on the same line the earlier column first. Without this a backwards drag
+// (right-to-left or bottom-to-top) would produce an empty extraction.
+func normalizeSel(a, b selPos) (selPos, selPos) {
+	if a.line < b.line || (a.line == b.line && a.col <= b.col) {
+		return a, b
+	}
+	return b, a
 }
 
 // handleKey routes a keystroke through the rename prompt, the ctrl+a prefix,
@@ -661,16 +823,6 @@ func (m *dashboardModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	if msg.String() == prefixKeyName {
 		m.prefix = true
-		return m, nil
-	}
-	// While frozen, swallow everything except an explicit unfreeze so a stray
-	// keystroke can't type into the session or move the cursor (which would
-	// repaint and clear the selection you're trying to copy).
-	if m.frozen {
-		switch msg.String() {
-		case "esc", "q":
-			m.unfreeze()
-		}
 		return m, nil
 	}
 	if m.scrollMode {
@@ -703,12 +855,6 @@ func (m *dashboardModel) handlePrefix(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 			m.exitScroll()
 		} else {
 			m.enterScroll()
-		}
-	case "f":
-		if m.frozen {
-			m.unfreeze()
-		} else {
-			m.freeze()
 		}
 	case "enter":
 		// Insert a newline into the focused session without submitting. This works
@@ -774,22 +920,6 @@ func (m *dashboardModel) exitScroll() {
 	m.scrollMode = false
 	m.scrollOff = 0
 	m.sendScroll()
-}
-
-// freeze snapshots the current view and stops repainting so the host terminal
-// keeps a native text selection alive (sessions keep running underneath; we just
-// stop drawing). The snapshot is taken with frozen already set so it carries the
-// "FROZEN" help line, and View returns the identical string every call after —
-// Bubble Tea then diffs to a no-op and writes nothing.
-func (m *dashboardModel) freeze() {
-	m.frozen = true
-	m.frozenView = m.renderLive()
-}
-
-// unfreeze resumes live painting; the next View reflects current state.
-func (m *dashboardModel) unfreeze() {
-	m.frozen = false
-	m.frozenView = ""
 }
 
 // scrollBy moves the scroll position by delta lines (positive = toward older
@@ -1063,25 +1193,12 @@ var (
 )
 
 func (m *dashboardModel) View() tea.View {
-	// While frozen, return the cached snapshot unchanged so Bubble Tea writes
-	// nothing and the host terminal keeps the user's selection. The View struct
-	// must be identical each call for the renderer to diff to a no-op, so the
-	// same AltScreen flag is set on both paths.
-	content := m.frozenView
-	if !m.frozen {
-		content = m.renderLive()
-	}
-	v := tea.NewView(content)
+	v := tea.NewView(m.renderLive())
 	v.AltScreen = true
 	// Capture the wheel (cell-motion = click/release/wheel/drag) so scrolling the
 	// screen pane browses scrollback instead of leaking arrow keys into the
-	// session. While frozen we release the mouse entirely so the host terminal
-	// does plain drag-selection for copy; this stays constant across frozen frames
-	// so the View still diffs to a no-op.
+	// session.
 	v.MouseMode = tea.MouseModeCellMotion
-	if m.frozen {
-		v.MouseMode = tea.MouseModeNone
-	}
 	return v
 }
 
@@ -1098,14 +1215,12 @@ func (m *dashboardModel) renderLive() string {
 	}
 	p := prefixLabel()
 	switch {
-	case m.frozen:
-		out += "\n" + statusStyle["needs_approval"].Render("❄ FROZEN") + helpStyle.Render(" — drag to select, copy, then esc/q to resume")
 	case m.renaming:
 		out += "\n" + titleStyle.Render("rename: ") + m.renameBuf + "▎  " + helpStyle.Render("enter save · esc cancel")
 	case m.focus == focusScreen || m.scrollMode:
-		out += "\n" + helpStyle.Render(fmt.Sprintf("prefix ← sidebar · prefix ⏎ newline · prefix [ scroll · prefix f freeze/copy · prefix n/c new · prefix x kill · prefix a scope · prefix q quit  (prefix = %s)", p))
+		out += "\n" + helpStyle.Render(fmt.Sprintf("prefix ← sidebar · prefix ⏎ newline · prefix [ scroll · prefix n/c new · prefix x kill · prefix a scope · prefix q quit  (prefix = %s)", p))
 	default:
-		out += "\n" + helpStyle.Render(fmt.Sprintf("↑/↓ select · enter/prefix → focus · prefix [ scroll · prefix f freeze/copy · n claude · c codex · x kill · R rename · prefix a scope · prefix q quit  (prefix = %s)", p))
+		out += "\n" + helpStyle.Render(fmt.Sprintf("↑/↓ select · enter/prefix → focus · prefix [ scroll · n claude · c codex · x kill · R rename · prefix a scope · prefix q quit  (prefix = %s)", p))
 	}
 	// Bound every line to the terminal width. The body lines are already within
 	// width, but the help/hint and toast chrome lines can be longer than a narrow
@@ -1179,6 +1294,49 @@ func (m *dashboardModel) renderSidebar() string {
 	return lipgloss.NewStyle().Width(sidebarWidth).Height(maxInt(m.paneH, 1)).Render(content)
 }
 
+// applySelectionHighlight overlays inverse-video styling on the selected cells
+// of the current screen frame. We translate from virtual-line space back to the
+// visible rows of this frame (lines outside the window become no-ops), then
+// splice each affected line into [before, selected, after] via ansi.Cut — which
+// is grapheme-aware so it doesn't slice through an escape or a wide character.
+// The selected slice is wrapped in SGR 7 / 27 (reverse on / off) so the host
+// terminal renders it as a highlight, similar to its own native selection.
+func (m *dashboardModel) applySelectionHighlight(screen string) string {
+	if !m.selecting {
+		return screen
+	}
+	start, end := normalizeSel(m.selStart, m.selEnd)
+	topV := m.scrollMax - m.scrollOff // virtual line shown on row 0
+	lines := strings.Split(screen, "\n")
+	for i := range lines {
+		v := topV + i
+		if v < start.line || v > end.line {
+			continue
+		}
+		lo, hi := 0, m.paneW
+		if v == start.line {
+			lo = start.col
+		}
+		if v == end.line {
+			hi = end.col
+		}
+		if hi <= lo {
+			continue
+		}
+		left := ansi.Cut(lines[i], 0, lo)
+		mid := ansi.Cut(lines[i], lo, hi)
+		right := ansi.Cut(lines[i], hi, m.paneW)
+		if ansi.StringWidth(mid) == 0 {
+			// Past the printed content on this line: highlight a blank gutter so
+			// the user can still see the selected region extending across empty
+			// space (mid-paragraph multi-line drags).
+			mid = strings.Repeat(" ", hi-lo)
+		}
+		lines[i] = left + "\x1b[7m" + mid + "\x1b[27m" + right
+	}
+	return strings.Join(lines, "\n")
+}
+
 // renderScreen draws the right pane: just the selected session's live screen
 // (the session is sized to fill this pane). Focus is shown by the border color;
 // the session's own status/title lives in the sidebar, so there's no header
@@ -1194,6 +1352,9 @@ func (m *dashboardModel) renderScreen() string {
 		screen = helpStyle.Render("loading…")
 	default:
 		screen = m.screen
+		if m.selecting {
+			screen = m.applySelectionHighlight(screen)
+		}
 	}
 	// Bound the screen to the pane height so a tall session render can't overflow
 	// the View and clip the top (which would hide the session list).

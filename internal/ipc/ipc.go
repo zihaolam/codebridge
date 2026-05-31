@@ -15,7 +15,7 @@ import (
 // ProtocolVersion is bumped whenever the daemon/client wire protocol changes.
 // The client checks it on connect so a stale daemon (e.g. left running across a
 // rebuild) fails loudly instead of silently dropping attach/input messages.
-const ProtocolVersion = 4
+const ProtocolVersion = 5
 
 // Dir is the per-user state directory for cb.
 func Dir() string {
@@ -36,7 +36,7 @@ func SocketPath() string {
 
 // Request is a message from a client (or hook) to the daemon.
 type Request struct {
-	Type string `json:"type"` // "spawn" | "list" | "kill" | "hook"
+	Type string `json:"type"` // "spawn" | "list" | "kill" | "hook" | "extract"
 
 	// spawn
 	Argv []string `json:"argv,omitempty"`
@@ -44,7 +44,7 @@ type Request struct {
 	Rows int      `json:"rows,omitempty"`
 	Cols int      `json:"cols,omitempty"`
 
-	// kill / rename
+	// kill / rename / extract
 	ID string `json:"id,omitempty"`
 
 	// rename
@@ -54,6 +54,13 @@ type Request struct {
 	Event   string          `json:"event,omitempty"`   // hook_event_name, e.g. "Stop"
 	Session string          `json:"session,omitempty"` // value of CB_SESSION
 	Payload json.RawMessage `json:"payload,omitempty"` // raw hook stdin JSON
+
+	// extract: virtual-buffer text range (scrollback + visible). Lines/cols are
+	// inclusive at the start, exclusive at the end of the last line's text.
+	LineStart int `json:"line_start,omitempty"`
+	LineEnd   int `json:"line_end,omitempty"`
+	ColStart  int `json:"col_start,omitempty"`
+	ColEnd    int `json:"col_end,omitempty"`
 }
 
 // Response is the daemon's reply.
@@ -64,6 +71,7 @@ type Response struct {
 	Sessions []SessionInfo `json:"sessions,omitempty"` // list result
 	Version  int           `json:"version,omitempty"`  // ping result: daemon protocol version
 	PID      int           `json:"pid,omitempty"`      // ping result: daemon process id
+	Text     string        `json:"text,omitempty"`     // extract result: plain text
 }
 
 // SessionInfo is a snapshot of a session's metadata for the client.

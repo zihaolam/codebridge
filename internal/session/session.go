@@ -250,6 +250,87 @@ func (s *Session) RenderScroll(offset int) (screen string, clamped int, maxOffse
 	return strings.Join(lines, "\n"), offset, maxOffset
 }
 
+// ExtractText returns plain text for the virtual-buffer range
+// (scrollback + visible) [lineStart, lineEnd]. On the start line, text begins at
+// colStart; on the end line, text ends at colEnd (exclusive); intermediate lines
+// are returned in full. Lines outside the buffer are skipped. Trailing spaces on
+// each line are trimmed so block-rectangular padding doesn't bleed into copied
+// text.
+func (s *Session) ExtractText(lineStart, lineEnd, colStart, colEnd int) string {
+	s.mu.RLock()
+	rows, cols := s.rows, s.cols
+	s.mu.RUnlock()
+
+	maxOff := s.emu.ScrollbackLen()
+	last := maxOff + rows - 1
+	if lineStart < 0 {
+		lineStart = 0
+	}
+	if lineEnd > last {
+		lineEnd = last
+	}
+	if lineEnd < lineStart {
+		return ""
+	}
+	clampCol := func(c int) int {
+		if c < 0 {
+			c = 0
+		}
+		if c > cols {
+			c = cols
+		}
+		return c
+	}
+	colStart, colEnd = clampCol(colStart), clampCol(colEnd)
+
+	visLines := strings.Split(s.Render(), "\n")
+	lineText := func(line int) string {
+		if line < maxOff {
+			var sb strings.Builder
+			for x := 0; x < cols; x++ {
+				if c := s.emu.ScrollbackCellAt(x, line); c != nil && c.Content != "" {
+					sb.WriteString(c.Content)
+				} else {
+					sb.WriteByte(' ')
+				}
+			}
+			return sb.String()
+		}
+		gy := line - maxOff
+		if gy < 0 || gy >= len(visLines) {
+			return ""
+		}
+		return ansi.Strip(visLines[gy])
+	}
+	sliceCols := func(line string, lo, hi int) string {
+		r := []rune(line)
+		if lo > len(r) {
+			lo = len(r)
+		}
+		if hi > len(r) {
+			hi = len(r)
+		}
+		if hi < lo {
+			hi = lo
+		}
+		return strings.TrimRight(string(r[lo:hi]), " ")
+	}
+
+	out := make([]string, 0, lineEnd-lineStart+1)
+	for line := lineStart; line <= lineEnd; line++ {
+		txt := lineText(line)
+		lo, hi := 0, cols
+		if line == lineStart {
+			lo = colStart
+		}
+		if line == lineEnd {
+			hi = colEnd
+		}
+		out = append(out, sliceCols(txt, lo, hi))
+	}
+	return strings.Join(out, "\n")
+}
+
 // Cursor returns the current cursor cell position.
 func (s *Session) Cursor() (x, y int) {
 	p := s.emu.CursorPosition()

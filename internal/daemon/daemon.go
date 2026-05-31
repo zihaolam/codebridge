@@ -141,6 +141,8 @@ func (d *Daemon) dispatch(req ipc.Request) ipc.Response {
 		return d.rename(req.ID, req.Name)
 	case "hook":
 		return d.hook(req)
+	case "extract":
+		return d.extract(req)
 	default:
 		return ipc.Response{Error: "unknown request type: " + req.Type}
 	}
@@ -192,6 +194,17 @@ func (d *Daemon) kill(id string) ipc.Response {
 	}
 	log.Printf("killed session %s", id)
 	return ipc.Response{OK: true}
+}
+
+// extract returns plain text from a session's virtual buffer (scrollback +
+// visible) for the requested line/col range, used by the TUI to copy a
+// drag-selected region to the system clipboard.
+func (d *Daemon) extract(req ipc.Request) ipc.Response {
+	s := d.lookup(req.ID)
+	if s == nil {
+		return ipc.Response{Error: "no such session: " + req.ID}
+	}
+	return ipc.Response{OK: true, Text: s.ExtractText(req.LineStart, req.LineEnd, req.ColStart, req.ColEnd)}
 }
 
 func (d *Daemon) rename(id, name string) ipc.Response {
@@ -265,8 +278,17 @@ func statusForEvent(event string, p ipc.HookPayload) (session.Status, string) {
 		return session.StatusWaitingUser, ""
 	case "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolBatch":
 		return session.StatusWorking, ""
-	case "Notification", "PermissionRequest":
+	case "PermissionRequest":
 		return session.StatusNeedsApproval, p.Message
+	case "Notification":
+		// Claude Code fires Notification for two distinct things: an actual
+		// tool-permission prompt, and an idle "waiting for your input" nudge
+		// after a turn completes. Only the former should raise the approval
+		// flag; the idle case is just waiting on the user.
+		if isApprovalMessage(p.Message) {
+			return session.StatusNeedsApproval, p.Message
+		}
+		return session.StatusWaitingUser, ""
 	case "Stop":
 		return session.StatusWaitingUser, ""
 	case "SessionEnd":
@@ -274,6 +296,18 @@ func statusForEvent(event string, p ipc.HookPayload) (session.Status, string) {
 	default:
 		return session.StatusWorking, ""
 	}
+}
+
+// isApprovalMessage reports whether a Notification message is asking the user to
+// approve/permit an action (as opposed to the generic idle "waiting for input"
+// nudge). Claude Code's permission prompts read like "Claude needs your
+// permission to use Bash"; the idle nudge reads "Claude is waiting for your
+// input".
+func isApprovalMessage(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "permission") ||
+		strings.Contains(m, "approval") ||
+		strings.Contains(m, "approve")
 }
 
 // pruneExited drops sessions whose child process has terminated, so ended
