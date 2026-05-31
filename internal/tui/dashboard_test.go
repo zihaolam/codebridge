@@ -68,9 +68,47 @@ func TestRenderLiveFitsTerminal(t *testing.T) {
 			t.Errorf("row %d width %d exceeds terminal width %d", i, wd, w)
 		}
 	}
-	// The help/prefix-hint line is the last row and must survive.
-	if last := ansi.Strip(rows[len(rows)-1]); strings.TrimSpace(last) == "" {
-		t.Error("bottom help/prefix line is blank — bottom chrome was clipped")
+	// The bottom chrome rows are intentionally blank now (rename input renders
+	// in the bottom slot when active; the old always-on help line was replaced
+	// by the floating prefix panel). What we care about is that the View still
+	// fits in the terminal and the body row just above the chrome stays
+	// populated (so the session didn't get clipped).
+	chrome := m.chromeRows()
+	lastBody := len(rows) - chrome - 1
+	if body := strings.TrimSpace(ansi.Strip(rows[lastBody])); body == "" {
+		t.Errorf("last body row %d is blank — view was clipped", lastBody)
+	}
+}
+
+func TestPrefixPanelOverlay(t *testing.T) {
+	const w, h = 120, 30
+	m := &dashboardModel{
+		w: w, h: h,
+		prev:     map[string]string{},
+		hooksOK:  true,
+		streamID: "live00000000",
+		sessions: []ipc.SessionInfo{{ID: "live00000000", Status: "working"}},
+		prefix:   true, // panel visible
+	}
+	m.relayoutStream()
+	m.screen = fullWidthScreen(m.paneW, m.paneH)
+
+	out := m.renderLive()
+	if !strings.Contains(ansi.Strip(out), "new claude") {
+		t.Error("prefix panel hint 'new claude' missing while m.prefix=true")
+	}
+	if !strings.Contains(ansi.Strip(out), "quit") {
+		t.Error("prefix panel hint 'quit' missing while m.prefix=true")
+	}
+	// Overlay must not push the View past the terminal height.
+	if rows := strings.Split(out, "\n"); len(rows) > h {
+		t.Errorf("renderLive with panel produced %d rows, exceeds terminal height %d", len(rows), h)
+	}
+	// Without the prefix flag the panel should be gone.
+	m.prefix = false
+	out = m.renderLive()
+	if strings.Contains(ansi.Strip(out), "new claude") {
+		t.Error("prefix panel leaked into normal render")
 	}
 }
 
@@ -183,6 +221,53 @@ func TestDisplayName(t *testing.T) {
 		if got := displayName(c.s); got != c.want {
 			t.Errorf("displayName(%+v) = %q, want %q", c.s, got, c.want)
 		}
+	}
+}
+
+func TestReapplyBGAfterResets(t *testing.T) {
+	const bg = "\x1b[48;5;238m"
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			"no escapes is passthrough",
+			"plain text",
+			"plain text",
+		},
+		{
+			"full reset re-injects BG",
+			"\x1b[1;32mhello\x1b[0m world",
+			"\x1b[1;32mhello\x1b[0m" + bg + " world",
+		},
+		{
+			"empty params (\\x1b[m) treated as reset",
+			"x\x1b[my",
+			"x\x1b[m" + bg + "y",
+		},
+		{
+			"default-BG (49) re-injects",
+			"x\x1b[49my",
+			"x\x1b[49m" + bg + "y",
+		},
+		{
+			"compound with 0 in param list re-injects",
+			"a\x1b[0;1;31mb\x1b[mc",
+			"a\x1b[0;1;31m" + bg + "b\x1b[m" + bg + "c",
+		},
+		{
+			"pure FG change does NOT re-inject (would over-paint)",
+			"a\x1b[31mb",
+			"a\x1b[31mb",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := reapplyBGAfterResets(c.in, bg); got != c.want {
+				t.Errorf("reapplyBGAfterResets(%q)\n got  %q\n want %q", c.in, got, c.want)
+			}
+		})
 	}
 }
 

@@ -18,6 +18,7 @@ func TestStatusForEvent_NotificationSplit(t *testing.T) {
 		{"idle nudge -> waiting", "Notification", "Claude is waiting for your input", session.StatusWaitingUser},
 		{"explicit permission event", "PermissionRequest", "approve tool?", session.StatusNeedsApproval},
 		{"turn complete", "Stop", "", session.StatusWaitingUser},
+		{"fresh session is idle, not turn-complete", "SessionStart", "", session.StatusIdle},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

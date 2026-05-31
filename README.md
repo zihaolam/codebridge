@@ -73,36 +73,64 @@ cb daemon          # run the hub in the foreground (normally auto-started)
 
 ### Sidebar keys (list has focus)
 
+Plain keys only navigate the list — every command goes through the prefix so the same
+binding works whether the list or the session has focus.
+
 | key | action |
 |-----|--------|
 | `↑`/`↓` or `k`/`j` | move selection (the right pane follows) |
-| `enter` or `Ctrl-a` `→` | focus the screen pane (type into the session) |
-| `n` | start a new claude session |
-| `c` | start a new codex session |
-| `x` | kill the selected session |
-| `R` | rename the selected session (defaults to the start folder, e.g. `command-center`) |
-| `Ctrl-a` `q` | quit (the daemon and sessions keep running) |
+| `enter` or `→` or `l` | focus the screen pane (type into the session) |
+| any `Ctrl-a` command | see the prefix table below |
 
 The list scrolls automatically to keep the selected session in view, so a long
 list of sessions is fully reachable.
 
-### Screen pane (session has focus)
+### Prefix commands
 
-A tmux-style prefix key, **`Ctrl-a`** by default (override with the `CB_PREFIX` env var,
-e.g. `CB_PREFIX=ctrl+b`), switches from typing-into-the-session to issuing a command.
-`Ctrl-a` `q` always quits, from either zone.
+A tmux-style prefix key, **`Ctrl-a`** by default, switches from typing-into-the-session
+to issuing a command. Press `Ctrl-a` then tap any of the keys below. The prefix can be
+changed in two ways: persistently from the **config menu** (`Ctrl-a o`, see below), or
+per-shell via the `CB_PREFIX` env var (e.g. `CB_PREFIX=ctrl+b`) which always overrides
+the config file. `Ctrl-a` then `?` (or `h`) toggles a floating cheat-sheet that lists the
+current bindings.
 
-| `Ctrl-a` then… | action |
-|----------------|--------|
-| `←` | return focus to the sidebar |
-| `→` | focus the screen pane |
-| `enter` | insert a newline in the session without submitting (works on any terminal) |
-| `[` | enter scroll mode to browse the session's scrollback |
-| `n` | start a new claude session |
-| `c` | start a new codex session |
-| `q` | quit cb (sessions keep running) |
-| `x` | kill the current session |
-| `g` | jump to the session that most recently needs approval |
+| `Ctrl-a` then… | default key | action |
+|----------------|-------------|--------|
+| focus sidebar  | `←`         | return focus to the list (not rebindable) |
+| focus screen   | `l` or `→`  | focus the screen pane |
+| toggle hints   | `h` or `?`  | show/hide the floating prefix cheat-sheet (not rebindable) |
+| newline        | `enter`     | insert a newline in the session without submitting (works on any terminal) |
+| scroll mode    | `[`         | freeze the screen pane to browse scrollback |
+| new claude     | `n`         | start a new claude session |
+| new codex      | `c`         | start a new codex session |
+| kill           | `x`         | kill the current session |
+| rename         | `r`         | rename the selected session (defaults to its start folder) |
+| jump pending   | `g`         | jump to the session that most recently needs approval |
+| scope toggle   | `a`         | toggle this-repo / all sessions |
+| yank           | `y`         | copy the held drag-selection to the system clipboard (OSC52) |
+| open config    | `o`         | open the config menu (see below) |
+| quit           | `q`         | quit cb (sessions keep running) |
+
+### Config menu (`Ctrl-a o`)
+
+Opens a modal that lets you change the prefix and rebind every prefix command above.
+Changes auto-save to `~/.config/cb/config.json` (or `$XDG_CONFIG_HOME/cb/config.json`)
+the moment you press them, so closing the modal commits nothing extra and esc-ing out
+of capture mode reverts cleanly.
+
+| key | action |
+|-----|--------|
+| `↑`/`↓` or `k`/`j` | move the cursor |
+| `enter` | rebind the highlighted row (next keypress becomes the new binding) |
+| `esc` (while capturing) | cancel the rebind |
+| `enter` on **reset all to defaults** | restore the factory bindings |
+| `esc` or `q` | close the modal |
+
+The menu refuses to rebind a key that another command already uses, and it refuses the
+reserved keys (`esc`, `h`, `?`, arrows, `j`/`k`, `Ctrl-c`) that the system layer claims
+before dispatch — both with an inline error so you can pick another key. If `CB_PREFIX`
+is set in your shell, the prefix row is shown read-only with a "(locked by CB_PREFIX)"
+note, since the env override always wins.
 
 ### Scroll mode (browsing scrollback)
 
@@ -123,6 +151,7 @@ with the keyboard.
 
 - `~/.cb/daemon.sock` — daemon control socket
 - `~/.cb/daemon.log` — daemon log
+- `~/.config/cb/config.json` (or `$XDG_CONFIG_HOME/cb/config.json`) — prefix and key bindings (managed by the in-app config menu)
 
 ## Status
 

@@ -273,9 +273,12 @@ func shortLabel(s *session.Session) string {
 func statusForEvent(event string, p ipc.HookPayload) (session.Status, string) {
 	switch event {
 	case "SessionStart":
-		// A session that just started (or resumed) is idle and ready for input,
-		// not busy — don't show a working spinner until a prompt is submitted.
-		return session.StatusWaitingUser, ""
+		// A freshly spawned (or resumed) session is idle: ready, but no turn
+		// has run yet. It maps to StatusIdle so the dashboard can distinguish
+		// "just created" (yellow) from "agent turn finished" (green ● via
+		// Stop -> waiting_user). Don't show a working spinner until a prompt
+		// is actually submitted.
+		return session.StatusIdle, ""
 	case "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolBatch":
 		return session.StatusWorking, ""
 	case "PermissionRequest":

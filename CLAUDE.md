@@ -58,11 +58,51 @@ under a PTY (see the Python `pty` harnesses used during development) or test by 
 ## Status model
 
 Hook event → status mapping lives in `daemon.statusForEvent`:
-`SessionStart`/`UserPromptSubmit`/`PreToolUse`/`PostToolUse` → `working`;
-`Notification`/`PermissionRequest` → `needs_approval` (stores the message);
-`Stop` → `waiting_user`; `SessionEnd` → `ended`. The hook CLI forwards *any* event name, so
-the mapping is the single place to adjust if Claude Code's event names change between
-versions.
+
+- `SessionStart` → `idle` (fresh session, no turn has run yet — distinct from
+  *turn complete* so the sidebar can colour them differently).
+- `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `PostToolBatch` → `working`.
+- `PermissionRequest` → `needs_approval` (stores `Message`).
+- `Notification` → `needs_approval` when the message looks like a permission
+  prompt (`isApprovalMessage`), else `waiting_user` (the generic "waiting for
+  input" nudge Claude Code fires at idle).
+- `Stop` → `waiting_user` (agent turn finished).
+- `SessionEnd` → `ended`.
+- Anything else → `working` (tolerant fallback while the session is active).
+
+A spawned session starts at `starting` (set by `session.New`) until the first
+hook event fires.
+
+The hook CLI forwards *any* event name, so `statusForEvent` is the single place
+to adjust if Claude Code's event names shift between versions.
+
+**Sidebar glyphs** (`dashboardModel.indicator` + `statusStyle`): green spinner
+while `working`, **green ●** for `waiting_user` (turn complete), **yellow ●**
+for `idle` (just created), cyan `…` for `starting`, red `⚑` for
+`needs_approval`, grey `✗` for `ended`. Toasts fire only on transitions *into*
+`needs_approval` and *into* `waiting_user` (with `old != ""` guarding against
+a first-observation false positive). New colours/icons should be added in both
+the style map and the indicator switch.
+
+## Workspace scoping
+
+The sidebar is scoped to the directory `cb` was launched in. In a git repo
+(including any linked worktree), scope is the repo's *common directory* — the
+shared `.git` — so the main checkout and every linked worktree count as one
+scope and their sessions appear together. Outside a git repo, scope is the
+launch-dir subtree. `deriveScope` / `gitCommonDir` resolve this with pure
+filesystem reads (no `git` subprocess); `repoCache` memoizes `cwd → common dir`
+so the 500ms `list` poll doesn't re-walk per session.
+
+Toggle with **prefix `a`**: `m.showAll` flips and `applyScope()` rebuilds the
+visible list, re-seeds `prev` (so the next poll doesn't toast sessions that
+merely came into view), and re-attaches the screen pane to whatever ends up
+under the cursor. The launch-time `--all` flag starts unscoped. `scopeLabel`
+renders the current mode in the sidebar header.
+
+`cb` is meant to feel per-repo by default — adding scope-sensitive features
+(filters, batch ops) should go through `visibleSessions` / `inScope`, not the
+raw `allSessions` list.
 
 ## Gotchas (hard-won)
 

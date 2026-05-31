@@ -34,6 +34,26 @@ func TestKeyToBytes(t *testing.T) {
 		{"ctrl+c", tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}, []byte{0x03}},
 		{"ctrl+a", tea.KeyPressMsg{Code: 'a', Mod: tea.ModCtrl}, []byte{0x01}},
 		{"ctrl+z", tea.KeyPressMsg{Code: 'z', Mod: tea.ModCtrl}, []byte{0x1a}},
+		// macOS Option+arrow → readline word movement (ESC b / ESC f). Plain Alt
+		// only — Shift/Ctrl-combined Alt still go through the CSI form below.
+		{"alt+left", tea.KeyPressMsg{Code: tea.KeyLeft, Mod: tea.ModAlt}, []byte("\x1bb")},
+		{"alt+right", tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModAlt}, []byte("\x1bf")},
+		// macOS Cmd+arrow → readline line nav (Ctrl+A / Ctrl+E).
+		{"cmd+left", tea.KeyPressMsg{Code: tea.KeyLeft, Mod: tea.ModSuper}, []byte{0x01}},
+		{"cmd+right", tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModSuper}, []byte{0x05}},
+		{"meta+left", tea.KeyPressMsg{Code: tea.KeyLeft, Mod: tea.ModMeta}, []byte{0x01}},
+		// Combined modifiers fall through to the xterm CSI-parameter form so any
+		// TUI that wants extend-selection-by-word still gets it.
+		{"shift+left", tea.KeyPressMsg{Code: tea.KeyLeft, Mod: tea.ModShift}, []byte("\x1b[1;2D")},
+		{"ctrl+left", tea.KeyPressMsg{Code: tea.KeyLeft, Mod: tea.ModCtrl}, []byte("\x1b[1;5D")},
+		{"shift+cmd+left", tea.KeyPressMsg{Code: tea.KeyLeft, Mod: tea.ModShift | tea.ModSuper}, []byte("\x1b[1;10D")},
+		{"shift+alt+left", tea.KeyPressMsg{Code: tea.KeyLeft, Mod: tea.ModShift | tea.ModAlt}, []byte("\x1b[1;4D")},
+		{"ctrl+alt+left", tea.KeyPressMsg{Code: tea.KeyLeft, Mod: tea.ModCtrl | tea.ModAlt}, []byte("\x1b[1;7D")},
+		// Alt+Up/Down aren't word movement — let the CSI form through.
+		{"alt+up", tea.KeyPressMsg{Code: tea.KeyUp, Mod: tea.ModAlt}, []byte("\x1b[1;3A")},
+		{"alt+down", tea.KeyPressMsg{Code: tea.KeyDown, Mod: tea.ModAlt}, []byte("\x1b[1;3B")},
+		{"shift+pgup", tea.KeyPressMsg{Code: tea.KeyPgUp, Mod: tea.ModShift}, []byte("\x1b[5;2~")},
+		{"alt+delete", tea.KeyPressMsg{Code: tea.KeyDelete, Mod: tea.ModAlt}, []byte("\x1b[3;3~")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
+	"command-center/internal/config"
 	"command-center/internal/hook"
 	"command-center/internal/ipc"
 )
@@ -47,6 +49,10 @@ type sessionsMsg struct {
 // spawnedMsg carries the id of a session just created via n/c so the next list
 // refresh selects it and the screen pane takes focus.
 type spawnedMsg struct{ id string }
+
+// spawnMissingMsg fires when the binary the user asked to spawn isn't on PATH,
+// so Update can surface a toast instead of silently no-op'ing.
+type spawnMissingMsg struct{ bin string }
 
 type toast struct {
 	text  string
@@ -92,6 +98,24 @@ type dashboardModel struct {
 
 	focus  focusZone // sidebar navigation vs. screen input
 	prefix bool      // ctrl+a pressed; next key is a command
+	// menu, when true, keeps the prefix-commands panel open until the user
+	// picks something or dismisses it. Triggered by prefix+h / prefix+?. While
+	// it's open, keystrokes are routed through the prefix handler so users can
+	// browse the hints and pick a command without re-pressing the prefix.
+	menu bool
+
+	// cfg is the live binding table loaded from ~/.config/cb/config.json on
+	// startup and edited in place by the config modal; runAction dispatches
+	// through cfg.Bindings so a rebind takes effect immediately.
+	cfg *config.Config
+	// Config-modal state. configOpen replaces the whole body when true;
+	// configCursor indexes into configRows(); configCapture means the next
+	// keystroke replaces the selected row's binding; configErr surfaces
+	// validation messages (reserved key, duplicate binding, save failure).
+	configOpen    bool
+	configCursor  int
+	configCapture bool
+	configErr     string
 
 	// live screen of the selected session (right pane). When focus==focusScreen,
 	// keystrokes are forwarded to this session over the same connection.
@@ -114,11 +138,16 @@ type dashboardModel struct {
 
 	// In-app drag selection over the screen pane. Anchored in virtual-line space
 	// (scrollback index + visible-grid index) so the selection stays bound to its
-	// content as the view autoscrolls. On release we ask the daemon to extract the
-	// plain text in this range and put it on the system clipboard via OSC52.
-	selecting bool
-	selStart  selPos
-	selEnd    selPos
+	// content as the view autoscrolls. After release the highlight stays put and
+	// the user yanks with prefix y; any new click clears it. While `selecting`,
+	// selDragRow/Col remembers the mouse's raw position so a repeating tick can
+	// keep autoscrolling while the cursor is parked at an edge (no motion = no
+	// MouseMotion events, so we need the tick).
+	selecting  bool
+	selStart   selPos
+	selEnd     selPos
+	selDragRow int
+	selDragCol int
 }
 
 // selPos is a position in the session's virtual buffer: line is an index into
@@ -143,6 +172,11 @@ type previewMsg struct {
 // action the caller should take.
 func Dashboard(selectID, cwd string, showAll bool) (DashAction, error) {
 	common, root := deriveScope(cwd)
+	cfg := config.Load()
+	// Apply the on-disk prefix to the package-level var that prefixLabel /
+	// handleKey read. SetPrefix is a no-op when CB_PREFIX is set, so the env
+	// override still wins for users who haven't migrated to the config file.
+	SetPrefix(cfg.Prefix)
 	m := &dashboardModel{
 		hooksOK:     hook.Installed(),
 		prev:        map[string]string{},
@@ -152,18 +186,21 @@ func Dashboard(selectID, cwd string, showAll bool) (DashAction, error) {
 		showAll:     showAll,
 		repoCache:   map[string]string{},
 		ch:          make(chan previewMsg, 64),
+		cfg:         cfg,
 	}
 	// Mouse wheel is captured (see View's MouseMode) so scrolling the screen pane
 	// browses scrollback rather than the terminal turning the wheel into arrow
 	// keys that leak into the session as history nav. Plain click+drag selects
-	// text in-app (autoscrolls past the edge, copies to the system clipboard on
-	// release via OSC52) — that's what mouse capture costs us, since otherwise
-	// the host terminal would handle drag-selection but couldn't autoscroll on
-	// alt-screen. Holding Shift bypasses our capture so the host terminal's
-	// native (no-autoscroll) selection still works for users on terminals where
-	// OSC52 is disabled. Scrollback is also browsable via the keyboard scroll
-	// mode (prefix [). Alt-screen and mouse mode are requested via the View now
-	// (v2 moved terminal feature flags out of program options).
+	// text in-app (autoscrolls continuously while the cursor parks at an edge —
+	// see selTickMsg) — that's what mouse capture costs us, since otherwise the
+	// host terminal would handle drag-selection but couldn't autoscroll on
+	// alt-screen. The selection stays painted after release; ctrl+c or prefix y
+	// copies it to the system clipboard via OSC52, and any new click dismisses.
+	// Holding Shift bypasses our capture so the host terminal's native
+	// (no-autoscroll) selection still works for users on terminals where OSC52
+	// is disabled. Scrollback is also browsable via the keyboard scroll mode
+	// (prefix [). Alt-screen and mouse mode are requested via the View now (v2
+	// moved terminal feature flags out of program options).
 	p := tea.NewProgram(m)
 	res, err := p.Run()
 	if m.conn != nil {
@@ -499,12 +536,14 @@ func previewReadLoop(id string, conn net.Conn, ch chan previewMsg) {
 const sidebarWidth = 22
 
 // chromeRows is the number of non-pane rows the View always renders below the
-// body: a reserved toast row, an optional hooks-warning row, and the help row.
-// The title now lives at the top of the sidebar (not a full-width header), so
-// both panes span the full height above this chrome. Keeping this exact stops
-// the View from growing taller than the terminal and clipping content.
+// body: a reserved toast row, a reserved bottom row (rename prompt when active,
+// blank otherwise — kept constant so the screen pane doesn't resize on entering
+// rename mode), and an optional hooks-warning row. The prefix command panel is
+// drawn as a floating overlay on top of the screen pane, so it doesn't count
+// here. The title lives at the top of the sidebar (not a full-width header),
+// so both panes span the full height above this chrome.
 func (m *dashboardModel) chromeRows() int {
-	rows := 2 // reserved toast line + help line
+	rows := 2 // toast row + bottom slot (rename or blank)
 	if !m.hooksOK {
 		rows++ // hooks-not-installed warning
 	}
@@ -549,6 +588,13 @@ func tick() tea.Cmd {
 // resize, leaving overlapping/garbled output (e.g. "Claude CodClaude Code"). On
 // success it reports the new session's id so the dashboard can select and focus it.
 func (m *dashboardModel) spawnCmd(bin string) tea.Cmd {
+	// Check the binary up-front: the daemon would silently fail to start a child
+	// that isn't on PATH (no error surfaces over IPC), so the user would just see
+	// the list refresh with no new session and no explanation. The client's PATH
+	// tracks the user's shell, which is where they'd install claude/codex.
+	if _, err := exec.LookPath(bin); err != nil {
+		return func() tea.Msg { return spawnMissingMsg{bin: bin} }
+	}
 	rows, cols := m.paneH, m.paneW
 	return func() tea.Msg {
 		cwd, _ := os.Getwd()
@@ -597,6 +643,10 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.focus = focusScreen
 		return m, refreshCmd
 
+	case spawnMissingMsg:
+		m.pushToast(fmt.Sprintf("✗ %s not installed — check your PATH", msg.bin), "needs_approval")
+		return m, nil
+
 	case previewMsg:
 		if msg.id == m.streamID {
 			if msg.gone {
@@ -604,6 +654,24 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus = focusSidebar // can't type into a dead session
 				m.scrollMode = false
 			} else {
+				// Lock the view while a selection is held: every new line the
+				// session emits grows scrollMax by one, which on a live view
+				// (scrollOff == 0) would push the selected lines up off the
+				// pane within milliseconds for an actively streaming Claude.
+				// Bumping scrollOff by the same delta keeps the highlighted
+				// content pinned where the user dragged it; the user resumes
+				// live by clearing the selection (ctrl+c / prefix y / new click)
+				// and then scrolling down or pressing G in scroll mode.
+				if m.selStart != m.selEnd && msg.max > m.scrollMax {
+					m.scrollOff += msg.max - m.scrollMax
+					if m.scrollOff > msg.max {
+						m.scrollOff = msg.max
+					}
+					m.sendScroll()
+					if m.scrollOff > 0 {
+						m.scrollMode = true
+					}
+				}
 				m.screen = msg.screen
 				m.scrollMax = msg.max
 				if m.scrollOff > m.scrollMax {
@@ -658,10 +726,27 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseReleaseMsg:
 		return m.handleMouseRelease(msg)
 
+	case selTickMsg:
+		// While the mouse is held at an edge during a drag, the host terminal
+		// emits no motion events — so we tick on our own and step the scroll on
+		// each fire, keeping the selection's end anchored to the row currently
+		// under the cursor. The loop dies on release (selecting == false).
+		if !m.selecting {
+			return m, nil
+		}
+		switch {
+		case m.selDragRow <= 0 && m.scrollOff < m.scrollMax:
+			m.edgeAutoscroll(0)
+			m.selEnd = selPos{line: m.vLine(0), col: m.selDragCol}
+		case m.selDragRow >= m.paneH-1 && m.scrollOff > 0:
+			m.edgeAutoscroll(m.paneH - 1)
+			m.selEnd = selPos{line: m.vLine(m.paneH - 1), col: m.selDragCol}
+		}
+		return m, selTick()
+
 	case extractedMsg:
 		// Extraction came back from the daemon — push it to the system clipboard
-		// and flash a toast so the user knows it landed. Empty text usually means
-		// the user clicked without dragging; just clear and move on.
+		// and flash a toast so the user knows it landed.
 		if msg.text != "" {
 			m.pushToast(fmt.Sprintf("⎘ copied %d chars", len(msg.text)), "working")
 			return m, tea.SetClipboard(msg.text)
@@ -716,9 +801,9 @@ func (m *dashboardModel) paneCellAt(x, y int) (col, row int, inside bool) {
 // itself is fixed.
 func (m *dashboardModel) vLine(row int) int { return row + m.scrollMax - m.scrollOff }
 
-// edgeAutoscroll bumps the scroll offset by one line when the cursor is at or
-// past the top/bottom edge during a drag, so the user can extend a selection
-// past the visible window without releasing the mouse.
+// edgeAutoscroll bumps the scroll offset by one line. Caller picks the
+// direction (top edge → scroll up to expose older content; bottom edge → scroll
+// down toward live). Stays a no-op when we're already at the bound.
 func (m *dashboardModel) edgeAutoscroll(row int) {
 	switch {
 	case row <= 0 && m.scrollOff < m.scrollMax:
@@ -736,29 +821,50 @@ func (m *dashboardModel) edgeAutoscroll(row int) {
 	}
 }
 
-// handleMouseClick begins an in-app drag selection when the user presses the
-// left mouse button inside the screen pane (no modifiers). Other buttons /
-// regions are ignored — a stray click on the sidebar shouldn't disturb the
-// session selection or the cursor. We also clear any prior selection so a fresh
-// click starts a fresh region.
+// selTickMsg fires the in-progress drag's continuous edge-autoscroll. See the
+// selTickMsg handler in Update for why a separate tick is needed (held-still
+// drags emit no motion events).
+type selTickMsg struct{}
+
+// selTickInterval is how often we re-check the cursor's row during a drag. Too
+// fast (10–20ms) and content blurs past unselectably; too slow and the edge
+// feels sticky. 60ms ≈ 16 lines/s, which matches the feel of native macOS
+// drag-scroll in Terminal.app.
+const selTickInterval = 60 * time.Millisecond
+
+func selTick() tea.Cmd {
+	return tea.Tick(selTickInterval, func(time.Time) tea.Msg { return selTickMsg{} })
+}
+
+// handleMouseClick begins an in-app drag selection on a plain left click inside
+// the screen pane. Any click anywhere clears a previous (finalized) selection
+// first — so a sidebar click, a release-without-drag, or just starting a new
+// drag all dismiss the prior highlight. Other buttons / modifiers are left to
+// the host terminal.
 func (m *dashboardModel) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 	e := msg.Mouse()
 	if e.Button != tea.MouseLeft || e.Mod != 0 {
 		return m, nil
 	}
+	m.selStart, m.selEnd = selPos{}, selPos{}
 	col, row, inside := m.paneCellAt(e.X, e.Y)
 	if !inside || m.streamID == "" || m.gone {
 		return m, nil
 	}
+	// A click inside the screen pane focuses it, so subsequent keystrokes flow
+	// to the session without needing the prefix chord.
+	m.focus = focusScreen
 	pos := selPos{line: m.vLine(row), col: col}
 	m.selecting = true
 	m.selStart, m.selEnd = pos, pos
-	return m, nil
+	m.selDragRow, m.selDragCol = row, col
+	return m, selTick()
 }
 
-// handleMouseMotion extends the active selection while the button is held and
-// triggers edge autoscroll. Without a live selection we ignore motion entirely
-// so cursor wander doesn't churn the screen pane.
+// handleMouseMotion updates the end of an active drag and stores the raw row
+// for the autoscroll tick (we want unclamped row so the tick can tell the
+// cursor is past the edge, not merely at it). Without a live drag, motion
+// events are ignored.
 func (m *dashboardModel) handleMouseMotion(msg tea.MouseMotionMsg) (tea.Model, tea.Cmd) {
 	if !m.selecting {
 		return m, nil
@@ -772,7 +878,7 @@ func (m *dashboardModel) handleMouseMotion(msg tea.MouseMotionMsg) (tea.Model, t
 	if col > m.paneW {
 		col = m.paneW
 	}
-	m.edgeAutoscroll(row)
+	m.selDragRow, m.selDragCol = row, col
 	if row < 0 {
 		row = 0
 	}
@@ -783,21 +889,19 @@ func (m *dashboardModel) handleMouseMotion(msg tea.MouseMotionMsg) (tea.Model, t
 	return m, nil
 }
 
-// handleMouseRelease finalizes a selection: it normalizes the (start, end) pair
-// into forward order, asks the daemon for the plain text spanning that range,
-// and (in extractedMsg) puts it on the system clipboard via OSC52. A click with
-// no drag selects nothing — just clear the state.
+// handleMouseRelease ends the drag but keeps the selection visible so the user
+// can read it before deciding to yank (prefix y) or dismiss (any click). A
+// no-drag click — start == end — clears the state immediately so a tap doesn't
+// leave a stale zero-width selection lingering on the model.
 func (m *dashboardModel) handleMouseRelease(msg tea.MouseReleaseMsg) (tea.Model, tea.Cmd) {
 	if !m.selecting {
 		return m, nil
 	}
 	m.selecting = false
-	start, end := normalizeSel(m.selStart, m.selEnd)
-	m.selStart, m.selEnd = selPos{}, selPos{}
-	if start == end || m.streamID == "" {
-		return m, nil
+	if m.selStart == m.selEnd {
+		m.selStart, m.selEnd = selPos{}, selPos{}
 	}
-	return m, extractCmd(m.streamID, start, end)
+	return m, nil
 }
 
 // normalizeSel returns (a, b) in forward reading order: earlier line first,
@@ -813,17 +917,35 @@ func normalizeSel(a, b selPos) (selPos, selPos) {
 // handleKey routes a keystroke through the rename prompt, the ctrl+a prefix,
 // and then either the screen pane (forwarded as input) or the sidebar.
 func (m *dashboardModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// The config modal owns every keystroke while open: nothing else dispatches
+	// (not even ctrl+c, since that's "close the modal" inside the menu).
+	if m.configOpen {
+		return m.handleConfigKey(msg)
+	}
 	if m.renaming {
 		return m.updateRename(msg)
 	}
 	// The prefix is honored from any mode, so ctrl+a q / ctrl+a [ always work.
-	if m.prefix {
+	// While the sticky menu is open, keystrokes route through the same handler
+	// so users can pick a command from the visible hints; handlePrefix is
+	// responsible for closing the menu when a command runs or esc is pressed.
+	if m.prefix || m.menu {
 		m.prefix = false
 		return m.handlePrefix(msg)
 	}
 	if msg.String() == prefixKeyName {
 		m.prefix = true
 		return m, nil
+	}
+	// While a finalized selection is held, ctrl+c is the natural shortcut: macOS
+	// terminals intercept cmd+c for their own selection so we can't bind it, but
+	// ctrl+c always reaches us. Copy-only — the highlight stays until the user
+	// clicks somewhere, so repeated ctrl+c is harmless and the user can re-yank
+	// the same range. Without a selection, ctrl+c falls through to its usual
+	// roles (quit from the sidebar, raw ^C to the session from the screen).
+	if msg.String() == "ctrl+c" && !m.selecting && m.streamID != "" && m.selStart != m.selEnd {
+		start, end := normalizeSel(m.selStart, m.selEnd)
+		return m, extractCmd(m.streamID, start, end)
 	}
 	if m.scrollMode {
 		return m.handleScrollKey(msg)
@@ -839,33 +961,94 @@ func (m *dashboardModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m.handleSidebarKey(msg)
 }
 
-// handlePrefix handles the key following ctrl+a: switch focus between the
-// sidebar and the screen pane, jump to a pending session, or pass a literal
-// ctrl+a through to the focused session.
+// handlePrefix handles the key following the prefix chord. System keys
+// (menu toggle, sidebar/screen focus arrows, esc) are reserved here and
+// don't go through the rebinding table — see config.ReservedKeys for why.
+// Everything else is dispatched through cfg.Bindings so rebinds in the
+// config modal take effect immediately.
+//
+// Also entered while the sticky hints panel is open; any non-toggle key
+// closes the menu after dispatching so the hints don't linger over what
+// the user just did.
 func (m *dashboardModel) handlePrefix(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "left", "h":
+	s := msg.String()
+	switch s {
+	case "h", "?":
+		m.menu = !m.menu
+		return m, nil
+	case "esc":
+		m.menu = false
+		return m, nil
+	case "left":
+		m.menu = false
 		m.focus = focusSidebar
-	case "right", "l":
+		return m, nil
+	case "right":
+		m.menu = false
 		if m.streamID != "" && !m.gone {
 			m.focus = focusScreen
 		}
-	case "[":
+		return m, nil
+	}
+	// Bound action? cfg.Bindings is the source of truth; rebinds at runtime
+	// flow straight through this lookup with no extra refresh step.
+	if a := m.actionForKey(s); a != "" {
+		m.menu = false
+		return m.runAction(a)
+	}
+	// Unrecognized key — close the menu so the panel doesn't linger.
+	m.menu = false
+	return m, nil
+}
+
+// actionForKey returns the action id bound to key, or "" when nothing is
+// bound. The capture path's conflict guard keeps bindings unique, so the
+// first match is also the only match.
+func (m *dashboardModel) actionForKey(key string) string {
+	if m.cfg == nil {
+		return ""
+	}
+	for action, k := range m.cfg.Bindings {
+		if k == key {
+			return action
+		}
+	}
+	return ""
+}
+
+// keyForAction returns the current binding for action, or "" when unknown.
+// Used by the help text / empty-state copy to show live bindings rather
+// than hardcoded letters that may not match what the user pressed.
+func (m *dashboardModel) keyForAction(action string) string {
+	if m.cfg == nil {
+		return ""
+	}
+	return m.cfg.Bindings[action]
+}
+
+// runAction is the dispatch table for everything reachable from the prefix
+// layer. Adding a new prefix command means adding an entry to config.Actions
+// and a case here.
+func (m *dashboardModel) runAction(action string) (tea.Model, tea.Cmd) {
+	switch action {
+	case "focus_screen":
+		if m.streamID != "" && !m.gone {
+			m.focus = focusScreen
+		}
+	case "scroll":
 		if m.scrollMode {
 			m.exitScroll()
 		} else {
 			m.enterScroll()
 		}
-	case "enter":
-		// Insert a newline into the focused session without submitting. This works
-		// on every terminal because we inject the newline ourselves (as a paste)
-		// rather than relying on the terminal being able to send a distinct
-		// shift+enter, which legacy terminals can't.
+	case "newline":
+		// Inject a newline into the focused session without submitting. We send
+		// it as a paste so it works on terminals that can't distinguish
+		// shift+enter from enter.
 		if m.streamID != "" && !m.gone {
 			m.sendPaste("\n")
 		}
-	case "a":
-		// Toggle between this-repo scope and all sessions everywhere.
+	case "scope_toggle":
 		m.showAll = !m.showAll
 		m.applyScope()
 		if m.showAll {
@@ -873,22 +1056,27 @@ func (m *dashboardModel) handlePrefix(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		} else {
 			m.pushToast("⊙ scoped to "+folderBase(m.scopeRoot), "working")
 		}
-	case "n":
+	case "new_claude":
 		return m, m.spawnCmd("claude")
-	case "c":
+	case "new_codex":
 		return m, m.spawnCmd("codex")
-	case "q":
+	case "quit":
 		m.action = DashQuit
 		return m, tea.Quit
-	case "x":
-		// Kill the current session (works while typing into it). Drop focus back
-		// to the sidebar; the stream's "gone" notice will tidy up the pane.
+	case "kill":
 		if m.streamID != "" {
 			id := m.streamID
 			m.focus = focusSidebar
 			return m, killCmd(id)
 		}
-	case "g":
+	case "rename":
+		if len(m.sessions) > 0 {
+			s := m.sessions[m.cursor]
+			m.renaming = true
+			m.renameID = s.ID
+			m.renameBuf = displayName(s)
+		}
+	case "jump_pending":
 		if _, latest := pendingSummary(m.sessions, ""); latest != "" {
 			for i, s := range m.sessions {
 				if s.ID == latest {
@@ -899,6 +1087,16 @@ func (m *dashboardModel) handlePrefix(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 			m.syncStream()
 			m.focus = focusScreen
 		}
+	case "yank":
+		// Hand the held drag selection to the daemon for extraction. Clipboard
+		// write happens in the extractedMsg handler (main goroutine). Only
+		// fires after the mouse release so the range isn't still-updating.
+		if !m.selecting && m.streamID != "" && m.selStart != m.selEnd {
+			start, end := normalizeSel(m.selStart, m.selEnd)
+			return m, extractCmd(m.streamID, start, end)
+		}
+	case "config":
+		m.openConfig()
 	}
 	return m, nil
 }
@@ -1028,23 +1226,6 @@ func (m *dashboardModel) handleSidebarKey(msg tea.KeyPressMsg) (tea.Model, tea.C
 		if m.streamID != "" && !m.gone {
 			m.focus = focusScreen
 		}
-	case "n":
-		return m, m.spawnCmd("claude")
-	case "c":
-		return m, m.spawnCmd("codex")
-	case "x":
-		if len(m.sessions) > 0 {
-			return m, killCmd(m.sessions[m.cursor].ID)
-		}
-	case "R":
-		if len(m.sessions) > 0 {
-			s := m.sessions[m.cursor]
-			m.renaming = true
-			m.renameID = s.ID
-			m.renameBuf = displayName(s)
-		}
-	case "r":
-		return m, refreshCmd
 	}
 	return m, nil
 }
@@ -1077,11 +1258,11 @@ var (
 	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	helpStyle   = lipgloss.NewStyle().Faint(true)
 	statusStyle = map[string]lipgloss.Style{
-		"needs_approval": lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9")), // red
-		"waiting_user":   lipgloss.NewStyle().Foreground(lipgloss.Color("11")),           // yellow
-		"working":        lipgloss.NewStyle().Foreground(lipgloss.Color("10")),           // green
-		"starting":       lipgloss.NewStyle().Foreground(lipgloss.Color("14")),           // cyan
-		"idle":           lipgloss.NewStyle().Faint(true),
+		"needs_approval": lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9")),  // red
+		"waiting_user":   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10")), // green: agent turn complete, ready for you
+		"working":        lipgloss.NewStyle().Foreground(lipgloss.Color("10")),            // green: spinner distinguishes from waiting_user
+		"starting":       lipgloss.NewStyle().Foreground(lipgloss.Color("14")),            // cyan
+		"idle":           lipgloss.NewStyle().Foreground(lipgloss.Color("11")),            // yellow: fresh session, no turn yet
 		"ended":          lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("8")), // grey
 	}
 )
@@ -1089,7 +1270,8 @@ var (
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 // indicator returns a short, colored glyph that conveys status at a glance: a
-// spinner while working, a flag when approval is needed, a dot otherwise.
+// spinner while working, a flag when approval is needed, a colored circle for
+// the resting states (green = turn complete, yellow = fresh / never run).
 func (m *dashboardModel) indicator(status string) string {
 	st := statusStyle[status]
 	switch status {
@@ -1098,7 +1280,9 @@ func (m *dashboardModel) indicator(status string) string {
 	case "needs_approval":
 		return st.Render("⚑")
 	case "waiting_user":
-		return st.Render("●")
+		return st.Render("●") // green — agent turn complete
+	case "idle":
+		return st.Render("●") // yellow — session created, no turn yet
 	case "starting":
 		return st.Render("…")
 	case "ended":
@@ -1203,9 +1387,25 @@ func (m *dashboardModel) View() tea.View {
 }
 
 func (m *dashboardModel) renderLive() string {
+	// Config modal owns the whole viewport — simpler than overlaying, and the
+	// dashboard underneath is incidental while the user is rebinding keys.
+	// Toasts and the hooks warning are suspended here; they'll be visible
+	// again as soon as the menu closes.
+	if m.configOpen {
+		return clampLines(centerOnScreen(m.renderConfigMenu(), m.w, m.h), m.w)
+	}
 	// The title lives at the top of the sidebar (renderSidebar), so the screen
 	// pane spans the full height beside it — no full-width header band.
 	body := lipgloss.JoinHorizontal(lipgloss.Top, m.renderSidebar(), m.renderScreen())
+
+	// Float the prefix-command hints panel over the bottom of the screen pane
+	// when the user has tapped the prefix key (one-shot) or opened the sticky
+	// menu (prefix+h / prefix+?). It's an overlay (no body resize or session
+	// reflow) so the panel pops in/out without disturbing what's underneath.
+	if m.prefix || m.menu {
+		screenLeft := sidebarWidth + 2 // left border + left padding of screen pane
+		body = overlayBottom(body, m.renderPrefixPanel(), screenLeft, screenLeft+m.paneW)
+	}
 
 	// Always reserve the toast row (even when empty) so the View height is
 	// constant and never overflows the terminal — see chromeRows.
@@ -1213,21 +1413,20 @@ func (m *dashboardModel) renderLive() string {
 	if !m.hooksOK {
 		out += "\n" + statusStyle["waiting_user"].Render("⚠ hooks not installed — run: cb install-hooks")
 	}
-	p := prefixLabel()
-	switch {
-	case m.renaming:
+	// Bottom row: rename input when active, otherwise an empty reserved row
+	// (the help/prefix hint that used to live here was replaced by the
+	// floating prefix panel — press the prefix key to summon it).
+	if m.renaming {
 		out += "\n" + titleStyle.Render("rename: ") + m.renameBuf + "▎  " + helpStyle.Render("enter save · esc cancel")
-	case m.focus == focusScreen || m.scrollMode:
-		out += "\n" + helpStyle.Render(fmt.Sprintf("prefix ← sidebar · prefix ⏎ newline · prefix [ scroll · prefix n/c new · prefix x kill · prefix a scope · prefix q quit  (prefix = %s)", p))
-	default:
-		out += "\n" + helpStyle.Render(fmt.Sprintf("↑/↓ select · enter/prefix → focus · prefix [ scroll · n claude · c codex · x kill · R rename · prefix a scope · prefix q quit  (prefix = %s)", p))
+	} else {
+		out += "\n"
 	}
 	// Bound every line to the terminal width. The body lines are already within
-	// width, but the help/hint and toast chrome lines can be longer than a narrow
-	// terminal; left unbounded they wrap at display time, adding a visual row that
-	// pushes the view past the terminal height and clips the bottom (the prefix
-	// hints and the session's last line). Truncating is ANSI-aware so styling is
-	// preserved and not left dangling.
+	// width, but the chrome lines (toast, hooks warning, rename) can be longer
+	// than a narrow terminal; left unbounded they wrap at display time, adding a
+	// visual row that pushes the view past the terminal height and clips the
+	// bottom. Truncating is ANSI-aware so styling is preserved and not left
+	// dangling.
 	return clampLines(out, m.w)
 }
 
@@ -1266,7 +1465,15 @@ func (m *dashboardModel) renderSidebar() string {
 		rows = append(rows, rowStyle.Render(row))
 	}
 	if len(rows) == 0 {
-		rows = append(rows, helpStyle.Render(" no sessions"), helpStyle.Render(" press n"))
+		// Pull the actual bindings so rebound keys read correctly in the hint.
+		newClaude := m.keyForAction("new_claude")
+		newCodex := m.keyForAction("new_codex")
+		rows = append(rows,
+			helpStyle.Render(" no sessions"),
+			"",
+			helpStyle.Render(truncate(" prefix+"+newClaude+" claude", sidebarWidth-1)),
+			helpStyle.Render(truncate(" prefix+"+newCodex+" codex", sidebarWidth-1)),
+		)
 	}
 
 	// The sidebar carries the app title at the top, then a scope line, then the
@@ -1294,15 +1501,21 @@ func (m *dashboardModel) renderSidebar() string {
 	return lipgloss.NewStyle().Width(sidebarWidth).Height(maxInt(m.paneH, 1)).Render(content)
 }
 
-// applySelectionHighlight overlays inverse-video styling on the selected cells
-// of the current screen frame. We translate from virtual-line space back to the
-// visible rows of this frame (lines outside the window become no-ops), then
-// splice each affected line into [before, selected, after] via ansi.Cut — which
-// is grapheme-aware so it doesn't slice through an escape or a wide character.
-// The selected slice is wrapped in SGR 7 / 27 (reverse on / off) so the host
-// terminal renders it as a highlight, similar to its own native selection.
+// selectionBG is the 256-color background applied to selected cells. We use a
+// mid-dark gray rather than SGR reverse so the highlight reads as a translucent
+// overlay (text keeps its own colors) instead of inverting to a white block.
+// 238 is dark enough to keep bright TUI text readable on most terminals.
+const selectionBG = "\x1b[48;5;238m"
+const selectionBGReset = "\x1b[49m"
+
+// applySelectionHighlight paints the selected cells of the current screen frame
+// with a gray background. We translate from virtual-line space back to the
+// visible rows of this frame (lines outside the window become no-ops), splice
+// each affected line into [before, selected, after] via ansi.Cut (grapheme- and
+// escape-aware), and wrap the middle in set/reset background SGR. Foreground
+// colors carry through, so the highlighted text stays legible.
 func (m *dashboardModel) applySelectionHighlight(screen string) string {
-	if !m.selecting {
+	if m.selStart == m.selEnd {
 		return screen
 	}
 	start, end := normalizeSel(m.selStart, m.selEnd)
@@ -1331,10 +1544,74 @@ func (m *dashboardModel) applySelectionHighlight(screen string) string {
 			// the user can still see the selected region extending across empty
 			// space (mid-paragraph multi-line drags).
 			mid = strings.Repeat(" ", hi-lo)
+		} else {
+			// The mid slice carries the source's own SGR escapes, and any reset
+			// inside it (\x1b[0m, \x1b[m) or explicit default-BG (\x1b[49m)
+			// would clear the gray background we set at the start — leaving
+			// every styled token unhighlighted. Re-emit the BG after each such
+			// sequence so the overlay survives nested styling.
+			mid = reapplyBGAfterResets(mid, selectionBG)
 		}
-		lines[i] = left + "\x1b[7m" + mid + "\x1b[27m" + right
+		lines[i] = left + selectionBG + mid + selectionBGReset + right
 	}
 	return strings.Join(lines, "\n")
+}
+
+// reapplyBGAfterResets scans s for CSI SGR sequences and appends bg after any
+// that clears the background — either a full reset (parameter 0 or empty) or
+// an explicit default-BG (parameter 49). This keeps a selection highlight
+// visible across styled text spans whose own escapes would otherwise wipe the
+// BG halfway through.
+func reapplyBGAfterResets(s, bg string) string {
+	if !strings.Contains(s, "\x1b[") {
+		return s
+	}
+	var out strings.Builder
+	out.Grow(len(s) + len(bg)*4)
+	for len(s) > 0 {
+		i := strings.Index(s, "\x1b[")
+		if i < 0 {
+			out.WriteString(s)
+			break
+		}
+		out.WriteString(s[:i])
+		// Locate the CSI final byte (0x40–0x7E). An unterminated sequence is
+		// emitted verbatim; we never invent bytes the source didn't send.
+		j := i + 2
+		for j < len(s) && (s[j] < 0x40 || s[j] > 0x7e) {
+			j++
+		}
+		if j >= len(s) {
+			out.WriteString(s[i:])
+			break
+		}
+		seq := s[i : j+1]
+		out.WriteString(seq)
+		if seq[len(seq)-1] == 'm' && sgrClearsBG(seq[2:len(seq)-1]) {
+			out.WriteString(bg)
+		}
+		s = s[j+1:]
+	}
+	return out.String()
+}
+
+// sgrClearsBG reports whether the given SGR parameter list contains a code
+// that resets the background: empty (treated as 0), 0 (full reset), or 49
+// (default BG). Multi-parameter forms like "0;1;38;5;46" are handled by
+// splitting on ';'. We don't try to model selector continuations (38;5;n,
+// 48;2;r;g;b) — those don't clear BG, and any "0" parameter alone is enough
+// to trigger a re-emit.
+func sgrClearsBG(params string) bool {
+	if params == "" {
+		return true
+	}
+	for _, p := range strings.Split(params, ";") {
+		switch p {
+		case "", "0", "00", "49":
+			return true
+		}
+	}
+	return false
 }
 
 // renderScreen draws the right pane: just the selected session's live screen
@@ -1352,7 +1629,7 @@ func (m *dashboardModel) renderScreen() string {
 		screen = helpStyle.Render("loading…")
 	default:
 		screen = m.screen
-		if m.selecting {
+		if m.selStart != m.selEnd {
 			screen = m.applySelectionHighlight(screen)
 		}
 	}
@@ -1375,6 +1652,96 @@ func (m *dashboardModel) renderScreen() string {
 	// a stray extra row.
 	frame := border.GetHorizontalFrameSize()
 	return border.Width(maxInt(m.paneW+frame, 1)).Height(maxInt(m.paneH, 1)).Render(screen)
+}
+
+// prefixPanelStyle is the bordered box for the floating command-hints panel.
+// The magenta border picks up the same accent used for the scrollback border,
+// so the "I'm in a mode" cue is consistent across the UI.
+var (
+	prefixPanelStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("13")).
+				Padding(0, 1)
+	kbdStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+)
+
+// renderPrefixPanel builds the floating command-hints panel: a two-column
+// list of prefix commands with their current keys highlighted. Bindings are
+// read live from cfg.Bindings so a rebind shows up immediately the next time
+// the panel opens. The arrow / `h`-style system shortcuts are hardcoded
+// because they aren't routed through the rebinding table.
+func (m *dashboardModel) renderPrefixPanel() string {
+	kbd := func(s string) string { return kbdStyle.Render(s) }
+	b := func(action string) string { return kbd(m.keyForAction(action)) }
+	// Build two-column rows by pairing entries. Labels are padded so the
+	// right column lines up regardless of the bound key's width.
+	cell := func(key, label string) string {
+		return padRight(key+" "+label, 22)
+	}
+	pairs := [][2]string{
+		{cell(b("new_claude"), "new claude"), cell(b("new_codex"), "new codex")},
+		{cell(b("kill"), "kill session"), cell(b("rename"), "rename")},
+		{cell(kbd("←"), "focus sidebar"), cell(b("focus_screen"), "focus screen")},
+		{cell(b("scroll"), "scrollback"), cell(b("scope_toggle"), "toggle scope")},
+		{cell(b("jump_pending"), "jump pending"), cell(b("newline"), "newline")},
+		{cell(b("yank"), "yank selection"), cell(kbd("h"), "toggle hints")},
+		{cell(b("config"), "open config"), cell(b("quit"), "quit cb")},
+	}
+	rows := make([]string, 0, len(pairs)+1)
+	rows = append(rows, helpStyle.Render(" prefix = "+prefixLabel()+" "))
+	for _, p := range pairs {
+		rows = append(rows, p[0]+" "+p[1])
+	}
+	return prefixPanelStyle.Render(strings.Join(rows, "\n"))
+}
+
+// overlayBottom paints panel onto the bottom of body, horizontally centered
+// within [colMin, colMax). Lines are spliced with ansi.Cut so the styling on
+// either side of the overlay is preserved. The panel is clipped (rather than
+// overflowing) when the available width is too narrow.
+func overlayBottom(body, panel string, colMin, colMax int) string {
+	if colMax <= colMin {
+		return body
+	}
+	pl := strings.Split(panel, "\n")
+	bl := strings.Split(body, "\n")
+	panelW := 0
+	for _, p := range pl {
+		if w := ansi.StringWidth(p); w > panelW {
+			panelW = w
+		}
+	}
+	avail := colMax - colMin
+	if panelW > avail {
+		panelW = avail
+		for i, p := range pl {
+			pl[i] = ansi.Truncate(p, panelW, "")
+		}
+	}
+	leftCol := colMin + (avail-panelW)/2
+	startRow := len(bl) - len(pl)
+	if startRow < 0 {
+		startRow = 0
+		pl = pl[len(pl)-len(bl):]
+	}
+	for i, p := range pl {
+		row := startRow + i
+		if row < 0 || row >= len(bl) {
+			continue
+		}
+		line := bl[row]
+		lineW := ansi.StringWidth(line)
+		left := ansi.Cut(line, 0, leftCol)
+		if lw := ansi.StringWidth(left); lw < leftCol {
+			left += strings.Repeat(" ", leftCol-lw)
+		}
+		right := ""
+		if leftCol+panelW < lineW {
+			right = ansi.Cut(line, leftCol+panelW, lineW)
+		}
+		bl[row] = left + p + right
+	}
+	return strings.Join(bl, "\n")
 }
 
 // toastLine renders any active toasts as a single compact line beneath the body.
