@@ -8,7 +8,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
-	"command-center/internal/config"
+	"codebridge/internal/config"
 )
 
 // configRow is one navigable line in the modal config view. kind tags the

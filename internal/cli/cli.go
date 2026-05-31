@@ -9,11 +9,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"command-center/internal/daemon"
-	"command-center/internal/hook"
-	"command-center/internal/ipc"
-	"command-center/internal/session"
-	"command-center/internal/tui"
+	"codebridge/internal/daemon"
+	"codebridge/internal/hook"
+	"codebridge/internal/ipc"
+	"codebridge/internal/session"
+	"codebridge/internal/tui"
 )
 
 // Run dispatches the given args (os.Args[1:]) to a subcommand.

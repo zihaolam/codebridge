@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"os"
 
-	"command-center/internal/cli"
+	"codebridge/internal/cli"
 )
 
 func main() {

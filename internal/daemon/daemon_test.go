@@ -3,8 +3,8 @@ package daemon
 import (
 	"testing"
 
-	"command-center/internal/ipc"
-	"command-center/internal/session"
+	"codebridge/internal/ipc"
+	"codebridge/internal/session"
 )
 
 func TestStatusForEvent_NotificationSplit(t *testing.T) {

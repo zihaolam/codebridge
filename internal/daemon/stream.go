@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"command-center/internal/ipc"
+	"codebridge/internal/ipc"
 )
 
 // frameInterval bounds how often we re-render and push a frame to a client.

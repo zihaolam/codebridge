@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for working in this repo. `command-center` is a Go TUI (`cb`) that manages many
+Guidance for working in this repo. `codebridge` is a Go TUI (`cb`) that manages many
 Claude Code / Codex sessions: a long-lived daemon owns each session's PTY, and a Bubble Tea
 client renders a single unified view — a session list sidebar plus the selected session's
 live, interactive screen. No tmux dependency.

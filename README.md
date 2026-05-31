@@ -1,9 +1,9 @@
-# command-center
+# codebridge
 
 A terminal UI for managing many [Claude Code](https://claude.com/claude-code) (and
 [Codex](https://developers.openai.com/codex)) sessions from one place. Instead of one
 terminal tab per session — with no central view of which session needs your attention —
-`command-center` gives you a single split view: a session list on the left and the
+`codebridge` gives you a single split view: a session list on the left and the
 selected session's **live, interactive** screen on the right, with status that updates as
 each session works, waits for approval, or finishes its turn.
 
@@ -37,6 +37,28 @@ Status comes from the **hook** system, not from scraping the terminal: the daemo
 `SessionStart` → *ready*, `UserPromptSubmit`/`PreToolUse`/`PostToolUse` → *working*,
 `Notification`/`PermissionRequest` → *needs approval*, `Stop` → *waiting for you*,
 `SessionEnd` → *ended*. Codex uses the same hook shape, so the mapping is shared.
+
+## Terminal support
+
+codebridge is only fully supported on terminals that forward the Kitty keyboard
+protocol — currently **Ghostty, WezTerm, Kitty, and iTerm2 (with the Kitty
+keyboard extension enabled)**. Other terminals (Terminal.app, stock iTerm2,
+Alacritty's default config, GNOME Terminal, etc.) will run codebridge, but a
+handful of bindings will be unavailable or fall back to alternatives:
+
+- **Copy with `cmd+c`** (in addition to `ctrl+c` / prefix `y`) — only the
+  supported terminals forward Cmd to the app; others intercept it for their own
+  selection.
+- **Shift+Enter / Shift+Tab** in the focused session — without Kitty keyboard
+  reporting, the terminal can't disambiguate the modifier and the session sees
+  a plain Enter or Tab. Use the prefix `enter` binding to insert a newline on
+  those terminals.
+- **Cmd+Arrow / Option+Arrow** for word/line nav — supported terminals send the
+  modified arrow; others map it to a different sequence (codebridge falls back
+  to the readline-conventional bytes where it can).
+
+If a key isn't doing what you expect, your terminal probably isn't passing it
+through.
 
 ## Install
 

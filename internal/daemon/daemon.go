@@ -18,9 +18,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"command-center/internal/ipc"
-	"command-center/internal/notify"
-	"command-center/internal/session"
+	"codebridge/internal/ipc"
+	"codebridge/internal/notify"
+	"codebridge/internal/session"
 )
 
 // Daemon owns the session registry and the unix socket listener.

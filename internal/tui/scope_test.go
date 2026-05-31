@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"command-center/internal/ipc"
+	"codebridge/internal/ipc"
 )
 
 func TestPathWithin(t *testing.T) {

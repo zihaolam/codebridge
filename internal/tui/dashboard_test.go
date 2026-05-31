@@ -7,7 +7,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
-	"command-center/internal/ipc"
+	"codebridge/internal/ipc"
 )
 
 // fullWidthScreen builds a session screen of `rows` lines, each a styled
@@ -213,8 +213,8 @@ func TestDisplayName(t *testing.T) {
 		want string
 	}{
 		{ipc.SessionInfo{ID: "abcdefgh12", Name: "api-fix", Cwd: "/home/x/proj"}, "api-fix"},
-		{ipc.SessionInfo{ID: "abcdefgh12", Cwd: "/Users/zihaolam/Projects/command-center"}, "command-center"},
-		{ipc.SessionInfo{ID: "abcdefgh12", Cwd: "/Users/zihaolam/Projects/command-center/"}, "command-center"},
+		{ipc.SessionInfo{ID: "abcdefgh12", Cwd: "/Users/zihaolam/Projects/codebridge"}, "codebridge"},
+		{ipc.SessionInfo{ID: "abcdefgh12", Cwd: "/Users/zihaolam/Projects/codebridge/"}, "codebridge"},
 		{ipc.SessionInfo{ID: "abcdefgh12"}, "abcdefgh"},
 	}
 	for _, c := range cases {

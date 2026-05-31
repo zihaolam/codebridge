@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — install cb (command-center) into a user-owned bin dir on your
+# install.sh — install cb (codebridge) into a user-owned bin dir on your
 # PATH (no sudo), then register hooks for whichever agents are installed.
 #
 # By default this downloads a prebuilt binary from GitHub Releases — no Go
@@ -139,7 +139,7 @@ rc_for_shell() {
 
 if [ "$on_path" -eq 0 ]; then
   RC="$(rc_for_shell)"
-  MARKER="# command-center (cb)"
+  MARKER="# codebridge (cb)"
   is_fish=0; [ "$(basename "${SHELL:-}")" = "fish" ] && is_fish=1
   # Emit a bun-style block (CB_INSTALL + $CB_INSTALL/bin on PATH) when the bin
   # dir is the conventional <root>/bin; otherwise just add BINDIR directly.

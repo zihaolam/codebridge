@@ -10,7 +10,7 @@ import (
 	"os"
 	"time"
 
-	"command-center/internal/ipc"
+	"codebridge/internal/ipc"
 )
 
 // Run forwards a hook event to the daemon. argv is the args after "hook"

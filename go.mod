@@ -1,4 +1,4 @@
-module command-center
+module codebridge
 
 go 1.25.0
 

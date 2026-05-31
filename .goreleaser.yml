@@ -29,7 +29,7 @@ archives:
       - README.md
       - install.sh
 
-checksums:
+checksum:
   name_template: "checksums.txt"
 
 snapshot:

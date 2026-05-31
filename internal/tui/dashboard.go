@@ -16,9 +16,9 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
-	"command-center/internal/config"
-	"command-center/internal/hook"
-	"command-center/internal/ipc"
+	"codebridge/internal/config"
+	"codebridge/internal/hook"
+	"codebridge/internal/ipc"
 )
 
 // DashAction is what the dashboard asks the caller to do after it exits.
@@ -234,7 +234,7 @@ func (m *dashboardModel) selectedID() string {
 
 // displayName is the label shown for a session: the user-assigned name if set,
 // otherwise the basename of the directory it was started in (e.g. a session
-// launched in ~/Projects/command-center shows as "command-center"), falling
+// launched in ~/Projects/codebridge shows as "codebridge"), falling
 // back to a short id.
 func displayName(s ipc.SessionInfo) string {
 	if s.Name != "" {
@@ -937,15 +937,26 @@ func (m *dashboardModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.prefix = true
 		return m, nil
 	}
-	// While a finalized selection is held, ctrl+c is the natural shortcut: macOS
-	// terminals intercept cmd+c for their own selection so we can't bind it, but
-	// ctrl+c always reaches us. Copy-only — the highlight stays until the user
-	// clicks somewhere, so repeated ctrl+c is harmless and the user can re-yank
-	// the same range. Without a selection, ctrl+c falls through to its usual
+	// While a finalized selection is held, ctrl+c is the natural copy shortcut
+	// and always reaches us. cmd+c (reported as super+c, or meta+c on some
+	// terminals) is also accepted for terminals that forward it via the Kitty
+	// keyboard protocol — many macOS terminals still swallow it for their own
+	// selection, but where it does come through we honor it. Copy-only — the
+	// highlight stays until the user clicks somewhere, so repeated copies are
+	// harmless. Without a selection, these keys fall through to their usual
 	// roles (quit from the sidebar, raw ^C to the session from the screen).
-	if msg.String() == "ctrl+c" && !m.selecting && m.streamID != "" && m.selStart != m.selEnd {
-		start, end := normalizeSel(m.selStart, m.selEnd)
-		return m, extractCmd(m.streamID, start, end)
+	if !m.selecting && m.streamID != "" && m.selStart != m.selEnd {
+		copyHit := msg.String() == "ctrl+c"
+		if !copyHit && msg.Code == 'c' && msg.Mod&(tea.ModSuper|tea.ModMeta) != 0 {
+			// cmd+c arrives as super+c (or meta+c on some terminals). Match on
+			// the modifier directly because msg.String() falls back to Key.Text
+			// when set, which a few terminals populate even for Cmd combos.
+			copyHit = true
+		}
+		if copyHit {
+			start, end := normalizeSel(m.selStart, m.selEnd)
+			return m, extractCmd(m.streamID, start, end)
+		}
 	}
 	if m.scrollMode {
 		return m.handleScrollKey(msg)
@@ -962,7 +973,7 @@ func (m *dashboardModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 // handlePrefix handles the key following the prefix chord. System keys
-// (menu toggle, sidebar/screen focus arrows, esc) are reserved here and
+// (hints toggle, sidebar/screen focus shortcuts, esc) are reserved here and
 // don't go through the rebinding table — see config.ReservedKeys for why.
 // Everything else is dispatched through cfg.Bindings so rebinds in the
 // config modal take effect immediately.
@@ -973,13 +984,13 @@ func (m *dashboardModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m *dashboardModel) handlePrefix(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	s := msg.String()
 	switch s {
-	case "h", "?":
+	case "?":
 		m.menu = !m.menu
 		return m, nil
 	case "esc":
 		m.menu = false
 		return m, nil
-	case "left":
+	case "h", "left":
 		m.menu = false
 		m.focus = focusSidebar
 		return m, nil
@@ -1665,32 +1676,42 @@ var (
 	kbdStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 )
 
-// renderPrefixPanel builds the floating command-hints panel: a two-column
-// list of prefix commands with their current keys highlighted. Bindings are
+// renderPrefixPanel builds the floating command-hints panel: a four-column
+// grid of prefix commands with their current keys highlighted. Bindings are
 // read live from cfg.Bindings so a rebind shows up immediately the next time
-// the panel opens. The arrow / `h`-style system shortcuts are hardcoded
-// because they aren't routed through the rebinding table.
+// the panel opens. The `h`/`?`-style system shortcuts are hardcoded because
+// they aren't routed through the rebinding table.
 func (m *dashboardModel) renderPrefixPanel() string {
 	kbd := func(s string) string { return kbdStyle.Render(s) }
 	b := func(action string) string { return kbd(m.keyForAction(action)) }
-	// Build two-column rows by pairing entries. Labels are padded so the
-	// right column lines up regardless of the bound key's width.
 	cell := func(key, label string) string {
 		return padRight(key+" "+label, 22)
 	}
-	pairs := [][2]string{
-		{cell(b("new_claude"), "new claude"), cell(b("new_codex"), "new codex")},
-		{cell(b("kill"), "kill session"), cell(b("rename"), "rename")},
-		{cell(kbd("←"), "focus sidebar"), cell(b("focus_screen"), "focus screen")},
-		{cell(b("scroll"), "scrollback"), cell(b("scope_toggle"), "toggle scope")},
-		{cell(b("jump_pending"), "jump pending"), cell(b("newline"), "newline")},
-		{cell(b("yank"), "yank selection"), cell(kbd("h"), "toggle hints")},
-		{cell(b("config"), "open config"), cell(b("quit"), "quit cb")},
+	items := []string{
+		cell(b("new_claude"), "new claude"),
+		cell(b("new_codex"), "new codex"),
+		cell(b("kill"), "kill session"),
+		cell(b("rename"), "rename"),
+		cell(kbd("h"), "focus sidebar"),
+		cell(b("focus_screen"), "focus screen"),
+		cell(b("scroll"), "scrollback"),
+		cell(b("scope_toggle"), "toggle scope"),
+		cell(b("jump_pending"), "jump pending"),
+		cell(b("newline"), "newline"),
+		cell(b("yank"), "yank selection"),
+		cell(kbd("?"), "toggle hints"),
+		cell(b("config"), "open config"),
+		cell(b("quit"), "quit cb"),
 	}
-	rows := make([]string, 0, len(pairs)+1)
+	const cols = 4
+	rows := make([]string, 0, (len(items)+cols-1)/cols+1)
 	rows = append(rows, helpStyle.Render(" prefix = "+prefixLabel()+" "))
-	for _, p := range pairs {
-		rows = append(rows, p[0]+" "+p[1])
+	for i := 0; i < len(items); i += cols {
+		end := i + cols
+		if end > len(items) {
+			end = len(items)
+		}
+		rows = append(rows, strings.Join(items[i:end], " "))
 	}
 	return prefixPanelStyle.Render(strings.Join(rows, "\n"))
 }

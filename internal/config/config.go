@@ -36,9 +36,9 @@ type Action struct {
 // (which doubles as the menu's row order). Adding a new prefix command means
 // appending here and dispatching it in the dashboard's runAction.
 //
-// Sidebar focus isn't here: it stays bound to the left arrow because letter
-// alternatives clash with reserved meta keys (h/? both toggle the floating
-// hints panel — a system layer the user can't rebind from inside this menu).
+// Sidebar focus isn't here: it stays bound to h / the left arrow as a system
+// shortcut, and `?` is reserved for toggling the floating hints panel —
+// system layers the user can't rebind from inside this menu.
 var Actions = []Action{
 	{Key: "new_claude", Label: "new claude session", Default: "n"},
 	{Key: "new_codex", Label: "new codex session", Default: "c"},
@@ -61,7 +61,7 @@ var Actions = []Action{
 // the menu surfaces this as a "reserved by" error so the user picks another.
 var ReservedKeys = map[string]string{
 	"esc":    "modal escape",
-	"h":      "toggle hints panel",
+	"h":      "focus sidebar",
 	"?":      "toggle hints panel",
 	"left":   "focus sidebar",
 	"right":  "focus screen pane",
