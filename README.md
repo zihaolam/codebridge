@@ -62,17 +62,36 @@ through.
 
 ## Install
 
-Requires Go 1.24+.
-
 ```sh
-./install.sh          # builds cb, installs it to ~/.cb/bin, adds it to your PATH,
-                      # and registers hooks for whichever of claude / codex you have
+curl -fsSL https://raw.githubusercontent.com/zihaolam/codebridge/main/install.sh | bash
 ```
 
-`install.sh` is sudo-free (it uses the bun/rustup pattern: its own `~/.cb/bin` dir plus a
-`CB_INSTALL`/`PATH` line in your shell rc). To do it by hand:
+That downloads the latest prebuilt `cb` binary from
+[GitHub Releases](https://github.com/zihaolam/codebridge/releases) (no Go
+toolchain required), installs it to `~/.cb/bin`, adds that dir to your `PATH`,
+and registers hooks for whichever of claude / codex you have. It's sudo-free
+(bun/rustup pattern: its own `~/.cb/bin` dir plus a `CB_INSTALL`/`PATH` line in
+your shell rc).
+
+Knobs:
 
 ```sh
+# pin to a specific release
+curl -fsSL https://raw.githubusercontent.com/zihaolam/codebridge/main/install.sh | VERSION=v0.1.0 bash
+
+# install somewhere other than ~/.cb/bin
+curl -fsSL https://raw.githubusercontent.com/zihaolam/codebridge/main/install.sh | BINDIR=~/bin bash
+
+# skip hook registration
+curl -fsSL https://raw.githubusercontent.com/zihaolam/codebridge/main/install.sh | bash -s -- --no-hooks
+```
+
+Build from source instead (needs Go 1.25+):
+
+```sh
+git clone https://github.com/zihaolam/codebridge && cd codebridge
+BUILD_FROM_SOURCE=1 ./install.sh
+# or fully by hand:
 go build -o ./cb .
 ./cb install-hooks    # wires cb into ~/.claude/settings.json (writes a .bak)
 ./cb install-codex    # wires cb into ~/.codex/hooks.json (leaves config.toml alone)
