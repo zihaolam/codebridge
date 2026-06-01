@@ -55,6 +55,18 @@ func (d *Daemon) attach(conn net.Conn, sc *bufio.Scanner, req ipc.Request) {
 			case <-stop:
 				return
 			case <-t.C:
+				// Defer rendering while the child is inside a DEC 2026
+				// Synchronized Output Mode block — codex brackets each
+				// redraw with one, and the intermediate state (erase
+				// display + reposition + half-written content) is exactly
+				// what the spec asks the terminal to hide. Without this
+				// skip the 30fps ticker captures the mid-batch state and
+				// the pane visibly jumps on every codex render. Latency
+				// after ESU is bounded by frameInterval, plus the
+				// session-side watchdog if the block never closes.
+				if s.IsSyncBlock() {
+					continue
+				}
 				screen, off, maxOff := s.RenderScroll(int(scrollOff.Load()))
 				cx, cy := s.Cursor()
 				if screen != last || off != lastOff || maxOff != lastMax || cx != lastCx || cy != lastCy {

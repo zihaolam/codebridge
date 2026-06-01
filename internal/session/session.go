@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -38,6 +39,12 @@ const (
 // Render trims back to the PTY width so the stray glyph never shows.
 const emuPad = 1
 
+// syncWatchdog bounds how long a Synchronized Output Mode (DEC 2026) block is
+// honored before we resume rendering. The DEC 2026 spec recommends a terminal
+// timeout in this range so a client that opens a sync block and dies without
+// closing it can't permanently freeze the view.
+const syncWatchdog = 150 * time.Millisecond
+
 // Session couples a PTY-backed child process with its emulator and status.
 type Session struct {
 	ID   string
@@ -47,6 +54,13 @@ type Session struct {
 	ptmx *os.File
 	cmd  *exec.Cmd
 	emu  *vt.SafeEmulator
+
+	// syncStartNanos is the unix-nano timestamp when the child entered DEC 2026
+	// (Synchronized Output Mode), or 0 when it isn't in a sync block. Set from
+	// the emulator's mode callbacks (called inside Write, so atomic-only — no
+	// locks that could deadlock the emulator). The frame loop in the daemon
+	// reads this to skip rendering mid-batch; see IsSyncBlock.
+	syncStartNanos atomic.Int64
 
 	mu              sync.RWMutex
 	name            string
@@ -94,10 +108,50 @@ func New(id string, argv []string, cwd string, rows, cols int) (*Session, error)
 		cols:        cols,
 	}
 
+	// Track DEC 2026 (Synchronized Output Mode) so the daemon's frame ticker
+	// can skip rendering mid-batch. Codex/ratatui wraps each redraw in
+	// ESC[?2026h … ESC[?2026l (erase display + reposition + rewrite the
+	// scroll-region UI); without honoring that, the 30 fps ticker captures the
+	// half-erased mid-batch state and ships it to the client, which looks like
+	// the pane "overscrolling and jumping" on every codex render. The vt
+	// emulator records 2026 in its mode map but applies the intermediate
+	// commands immediately, so we have to honor the batch ourselves.
+	// Callbacks fire from inside the emulator's Write under its mutex — keep
+	// them lock-free (atomic only) to avoid deadlocking with Render.
+	// SetCallbacks must run BEFORE readLoop so the first frame the child
+	// emits can't race against the (still-nil) callback set.
+	s.emu.SetCallbacks(vt.Callbacks{
+		EnableMode: func(m ansi.Mode) {
+			if m == ansi.ModeSynchronizedOutput {
+				s.syncStartNanos.Store(time.Now().UnixNano())
+			}
+		},
+		DisableMode: func(m ansi.Mode) {
+			if m == ansi.ModeSynchronizedOutput {
+				s.syncStartNanos.Store(0)
+			}
+		},
+	})
+
 	go s.readLoop()
 	go s.replyLoop()
 	go s.wait()
 	return s, nil
+}
+
+// IsSyncBlock reports whether the child is currently inside a DEC 2026
+// Synchronized Output Mode block. The frame loop checks this and skips
+// rendering while it's true so the client never sees the mid-batch state
+// (erase-display + cursor moves + half-written content) that codex/ratatui
+// brackets between BSU and ESU. A syncWatchdog-bounded stale flag is treated
+// as "not in a block" so a client that opens a sync and dies (or holds it
+// open longer than the spec recommends) can't freeze the view indefinitely.
+func (s *Session) IsSyncBlock() bool {
+	started := s.syncStartNanos.Load()
+	if started == 0 {
+		return false
+	}
+	return time.Now().UnixNano()-started <= int64(syncWatchdog)
 }
 
 // readLoop continuously drains the PTY into the emulator. It must keep running

@@ -341,15 +341,16 @@ func (m *dashboardModel) applyScope() {
 	m.syncStream()
 }
 
-// pathWithin reports whether path is root itself or lives beneath it. Both sides
-// are cleaned; matching is purely lexical (cb's launch cwd and a session's cwd
-// both come from os.Getwd, which resolves symlinks, so they're comparable).
+// pathWithin reports whether path is root itself or lives beneath it. Both
+// sides are run through canonicalCase so a lowercase os.Getwd doesn't fail to
+// match an uppercase on-disk path (or vice versa) on case-insensitive
+// filesystems.
 func pathWithin(root, path string) bool {
 	if root == "" {
 		return true
 	}
-	root = filepath.Clean(root)
-	path = filepath.Clean(path)
+	root = canonicalCase(filepath.Clean(root))
+	path = canonicalCase(filepath.Clean(path))
 	if path == root {
 		return true
 	}
@@ -439,13 +440,18 @@ func readGitdir(gitFile string) string {
 }
 
 // canonicalDir cleans p and resolves symlinks when it can, so two paths reaching
-// the same .git compare equal regardless of how they were reached.
+// the same .git compare equal regardless of how they were reached. On
+// case-insensitive filesystems (macOS APFS/HFS+) it also asks the kernel for
+// the on-disk case, because EvalSymlinks alone preserves whatever case the
+// caller typed — so `git worktree add` recording an uppercase gitdir and a
+// later `cd lowercase` produce two paths to the same .git that don't compare
+// equal as strings.
 func canonicalDir(p string) string {
 	p = filepath.Clean(p)
 	if resolved, err := filepath.EvalSymlinks(p); err == nil {
-		return resolved
+		p = resolved
 	}
-	return p
+	return canonicalCase(p)
 }
 
 // scopeLabel is the short header line under the title that shows whether the

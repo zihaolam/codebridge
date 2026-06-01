@@ -3,6 +3,8 @@ package tui
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"codebridge/internal/ipc"
@@ -130,6 +132,33 @@ func TestDeriveScopeWorktreeUsesMainRoot(t *testing.T) {
 	// Both launch points display as the main repo, not the worktree folder.
 	if folderBase(rootMain) != "main" || folderBase(rootWt) != "main" {
 		t.Errorf("display root: main=%q wt=%q, want both basename \"main\"", rootMain, rootWt)
+	}
+}
+
+// TestInScopeCaseInsensitiveFS guards the bug where a dashboard launched at a
+// lowercased path (e.g. zsh tab-completing into /Users/zihaolam/projects/tcg
+// rather than the on-disk /Users/zihaolam/Projects/tcg) failed to match worktree
+// sessions whose .git pointed back to the canonical-cased main repo, even
+// though both refer to the same inode on APFS/HFS+.
+func TestInScopeCaseInsensitiveFS(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("case-insensitive filesystem assumption only holds on darwin/windows")
+	}
+	main, wt := repoLayout(t)
+	lowerMain := strings.ToLower(main)
+	if lowerMain == main {
+		t.Skip("temp dir already lowercase; case-mismatch not exercised")
+	}
+	// Launching from the lowercased main path should still pick up the worktree
+	// session whose cwd carries the canonical case.
+	common, root := deriveScope(lowerMain)
+	m := &dashboardModel{scopeCommon: common, scopeRoot: root, repoCache: map[string]string{}}
+	got := m.visibleSessions([]ipc.SessionInfo{
+		{ID: "wt", Cwd: wt},
+		{ID: "outside", Cwd: t.TempDir()},
+	})
+	if len(got) != 1 || got[0].ID != "wt" {
+		t.Fatalf("visibleSessions from lowercased main = %v, want only [wt]", ids(got))
 	}
 }
 
