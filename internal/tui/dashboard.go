@@ -227,7 +227,7 @@ func Dashboard(selectID, cwd string, showAll bool) (DashAction, error) {
 		wantSelect:    selectID,
 		currentScope:  currentScope,
 		expanded:      map[string]bool{currentScope: true},
-		accordionMode: true,
+		accordionMode: false,
 		repoCache:     map[string]string{},
 		worktreeCache: map[string]bool{},
 		ch:            make(chan previewMsg, 64),
@@ -804,13 +804,14 @@ func tick() tea.Cmd {
 	return tea.Tick(dashRefreshInterval, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
-// spawnCmd starts a new session running bin (e.g. "claude" or "codex") in the
-// dashboard's working directory. The session is spawned at the current screen
-// pane size so the child paints itself once at the right width — otherwise it
-// would paint at the daemon's default size and then repaint after the attach
-// resize, leaving overlapping/garbled output (e.g. "Claude CodClaude Code"). On
-// success it reports the new session's id so the dashboard can select and focus it.
-func (m *dashboardModel) spawnCmd(bin string) tea.Cmd {
+// spawnCmd starts a new session running bin (e.g. "claude" or "codex") in cwd.
+// An empty cwd falls back to the cb process's working directory. The session is
+// spawned at the current screen pane size so the child paints itself once at
+// the right width — otherwise it would paint at the daemon's default size and
+// then repaint after the attach resize, leaving overlapping/garbled output
+// (e.g. "Claude CodClaude Code"). On success it reports the new session's id
+// so the dashboard can select and focus it.
+func (m *dashboardModel) spawnCmd(bin, cwd string) tea.Cmd {
 	// Check the binary up-front: the daemon would silently fail to start a child
 	// that isn't on PATH (no error surfaces over IPC), so the user would just see
 	// the list refresh with no new session and no explanation. The client's PATH
@@ -820,7 +821,9 @@ func (m *dashboardModel) spawnCmd(bin string) tea.Cmd {
 	}
 	rows, cols := m.paneH, m.paneW
 	return func() tea.Msg {
-		cwd, _ := os.Getwd()
+		if cwd == "" {
+			cwd, _ = os.Getwd()
+		}
 		req := ipc.Request{Type: "spawn", Argv: []string{bin}, Cwd: cwd}
 		if rows > 0 && cols > 0 {
 			req.Rows, req.Cols = rows, cols
@@ -831,6 +834,19 @@ func (m *dashboardModel) spawnCmd(bin string) tea.Cmd {
 		}
 		return spawnedMsg{id: resp.ID}
 	}
+}
+
+// activeSessionCwd returns the cwd of the session currently shown in the
+// screen pane (the one prefix+n / prefix+c should inherit from). Empty when
+// no session is being viewed.
+func (m *dashboardModel) activeSessionCwd() string {
+	if m.streamID == "" {
+		return ""
+	}
+	if s := m.sessionByID(m.streamID); s != nil {
+		return s.Cwd
+	}
+	return ""
 }
 
 func killCmd(id string) tea.Cmd {
@@ -1316,19 +1332,17 @@ func (m *dashboardModel) runAction(action string) (tea.Model, tea.Cmd) {
 				m.expanded = map[string]bool{}
 			}
 			m.expanded[m.currentScope] = true
-			m.pushToast("⊚ accordion mode: all workspaces", "starting")
 		} else {
 			// Flat mode mutes notifications from other workspaces — drop any
 			// sticky toasts already showing for sessions that are about to
 			// fall out of scope so they don't linger over the new view.
 			m.dropOutOfScopeToasts()
-			m.pushToast("⊙ flat mode: this workspace only", "working")
 		}
 		m.rebuildRows()
 	case "new_claude":
-		return m, m.spawnCmd("claude")
+		return m, m.spawnCmd("claude", m.activeSessionCwd())
 	case "new_codex":
-		return m, m.spawnCmd("codex")
+		return m, m.spawnCmd("codex", m.activeSessionCwd())
 	case "quit":
 		m.action = DashQuit
 		return m, tea.Quit
