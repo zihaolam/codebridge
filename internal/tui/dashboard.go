@@ -1859,12 +1859,17 @@ func (m *dashboardModel) renderSidebar() string {
 
 	// The list is a window that scrolls to keep the cursor visible. It gets
 	// whatever height is left after the header, a blank spacer on each side,
-	// and the global status-tally row.
+	// and the global status-tally row. The list is padded with blank lines
+	// to fill its slot so the counts strip stays pinned to the bottom edge.
 	maxRows := maxInt(m.paneH-headerH-3, 1)
 	top := clampTop(m.cursor, m.sidebarTop, len(rows), maxRows)
 	m.sidebarTop = top
 	end := minInt(top+maxRows, len(rows))
-	list := strings.Join(rows[top:end], "\n")
+	listRows := rows[top:end]
+	for len(listRows) < maxRows {
+		listRows = append(listRows, "")
+	}
+	list := strings.Join(listRows, "\n")
 	counts := m.renderStatusCounts()
 	content := firstLines(lipgloss.JoinVertical(lipgloss.Left, header, "", list, "", counts), maxInt(m.paneH, 1))
 	return lipgloss.NewStyle().Width(sidebarWidth).Height(maxInt(m.paneH, 1)).Render(content)
@@ -1894,31 +1899,33 @@ func (m *dashboardModel) expectedRowCount() int {
 	return n
 }
 
-// renderScopeRow is one accordion header: cursor gutter, collapse glyph,
-// scope display name, and a right-justified session count. Layout is
-// computed in display columns (not bytes) so the count stays flush to the
-// right edge regardless of ANSI styling in the name.
+// renderScopeRow is one accordion header: cursor gutter, scope display
+// name, a session count, and a far-right chevron that flips between
+// collapsed (›) and expanded (⌄). Layout is computed in display columns
+// (not bytes) so the chevron stays flush to the right edge regardless of
+// ANSI styling in the name.
 func (m *dashboardModel) renderScopeRow(gutter string, r visRow) string {
-	glyph := "▶"
+	glyph := "›"
 	if r.expanded {
-		glyph = "▼"
+		glyph = "⌄"
 	}
 	countStr := fmt.Sprintf("%d", r.scopeCount)
-	// Budget: gutter(1) + glyph(1) + " "(1) + name + " "(>=1) + count
-	nameMax := sidebarWidth - 3 - len(countStr) - 1
+	// Budget: gutter(1) + name + pad(>=1) + count + " "(1) + glyph(1)
+	nameMax := sidebarWidth - 1 - len(countStr) - 3
 	if nameMax < 1 {
 		nameMax = 1
 	}
 	name := truncate(scopeDisplayName(r.scopeKey), nameMax)
-	used := 1 + 1 + 1 + ansi.StringWidth(name) // gutter + glyph + space + name
-	pad := sidebarWidth - used - len(countStr)
+	used := 1 + ansi.StringWidth(name) // gutter + name
+	pad := sidebarWidth - used - len(countStr) - 2
 	if pad < 1 {
 		pad = 1
 	}
-	return gutter + helpStyle.Render(glyph) + " " +
+	return gutter +
 		scopeNameStyle.Render(name) +
 		strings.Repeat(" ", pad) +
-		helpStyle.Render(countStr)
+		helpStyle.Render(countStr) + " " +
+		helpStyle.Render(glyph)
 }
 
 // renderSessionRow is one child of an expanded scope: indented by one cell
@@ -1940,8 +1947,8 @@ func (m *dashboardModel) renderSessionRow(gutter string, s ipc.SessionInfo) stri
 // the bottom strip is always a "what's happening across every agent"
 // indicator. Order is scan-priority: progressing → needs approval → turn
 // complete → idle. Glyphs match the per-row indicators; "working" uses a
-// static ⟳ instead of the animated spinner so a row of "0 working" doesn't
-// flicker an irrelevant animation.
+// static braille frame (same shape as the animated spinner) so a row of
+// "0 working" doesn't flicker an irrelevant animation.
 func (m *dashboardModel) renderStatusCounts() string {
 	var working, approval, waiting, idle int
 	for _, s := range m.sessions {
@@ -1959,7 +1966,7 @@ func (m *dashboardModel) renderStatusCounts() string {
 	cell := func(status, glyph string, n int) string {
 		return statusStyle[status].Render(glyph) + helpStyle.Render(fmt.Sprintf(" %d", n))
 	}
-	return " " + cell("working", "⟳", working) +
+	return " " + cell("working", spinnerFrames[0], working) +
 		" " + cell("needs_approval", "⚑", approval) +
 		" " + cell("waiting_user", "●", waiting) +
 		" " + cell("idle", "●", idle)
