@@ -544,6 +544,46 @@ func (m *dashboardModel) currentRow() *visRow {
 	return &m.visRows[m.cursor]
 }
 
+// neighborInScope returns the id of the session row that should inherit the
+// cursor when the session with the given id is removed: the previous sibling
+// in the same scope group, or the next sibling if there is none before it.
+// Returns "" when the target isn't present, has no siblings in the same scope,
+// or accordion mode is off (the flat view collapses to a single group, so the
+// natural index clamp in rebuildRows already does the right thing).
+func (m *dashboardModel) neighborInScope(id string) string {
+	if !m.accordionMode {
+		return ""
+	}
+	idx := -1
+	for i, r := range m.visRows {
+		if !r.isScope && r.session.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return ""
+	}
+	scope := m.visRows[idx].scopeKey
+	for i := idx - 1; i >= 0; i-- {
+		r := m.visRows[i]
+		if r.isScope {
+			break
+		}
+		if r.scopeKey == scope {
+			return r.session.ID
+		}
+	}
+	for i := idx + 1; i < len(m.visRows); i++ {
+		r := m.visRows[i]
+		if r.isScope || r.scopeKey != scope {
+			break
+		}
+		return r.session.ID
+	}
+	return ""
+}
+
 // toggleScope flips a scope group's expanded flag and rebuilds the row list.
 // The cursor stays on the same scope header (rebuildRows finds it by scopeKey).
 func (m *dashboardModel) toggleScope(key string) {
@@ -1375,6 +1415,16 @@ func (m *dashboardModel) runAction(action string) (tea.Model, tea.Cmd) {
 		if m.streamID != "" {
 			id := m.streamID
 			m.focus = focusSidebar
+			// Pre-stamp the cursor target so the post-kill rebuild lands on
+			// the previous sibling session in the same scope group rather
+			// than falling through to the scope header (rebuildRows' default
+			// when selSession can't be found). Prefer previous sibling, then
+			// next sibling; if the killed session was the only one in its
+			// group, leave the targets alone so the cursor sticks to the
+			// header (the current behavior for that case).
+			if nb := m.neighborInScope(id); nb != "" {
+				m.selSession = nb
+			}
 			return m, killCmd(id)
 		}
 	case "rename":
@@ -1688,7 +1738,7 @@ func (m *dashboardModel) detectTransitions(next []ipc.SessionInfo) {
 				m.pushStickyToast("⚑ "+s.ID[:8]+" — "+txt, "needs_approval", s.ID, "needs_approval")
 			case "waiting_user":
 				if old != "" { // don't toast the very first observation
-					m.pushStickyToast("● "+s.ID[:8]+" — ready for input", "waiting_user", s.ID, "waiting_user")
+					m.pushStickyToast("● "+s.ID[:8]+" — turn completed", "waiting_user", s.ID, "waiting_user")
 				}
 			}
 		}
