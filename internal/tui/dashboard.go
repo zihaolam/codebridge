@@ -90,6 +90,13 @@ type dashboardModel struct {
 	currentScope string
 	expanded     map[string]bool
 
+	// launchCwd is the directory cb was invoked in. Worktrees share a scope
+	// with the main checkout (so their sessions group together) but live in
+	// different directories; new sessions spawned from the dashboard should
+	// land in the worktree the user is actually working in, not whichever
+	// in-scope session happens to be streamed. See spawnTargetCwd.
+	launchCwd string
+
 	// accordionMode controls whether the sidebar shows the multi-workspace
 	// accordion (true, default) or a flat list of just the current scope's
 	// sessions (false — the pre-accordion behavior). Toggled via prefix+a.
@@ -226,6 +233,7 @@ func Dashboard(selectID, cwd string, showAll bool) (DashAction, error) {
 		prev:          map[string]string{},
 		wantSelect:    selectID,
 		currentScope:  currentScope,
+		launchCwd:     cwd,
 		expanded:      map[string]bool{currentScope: true},
 		accordionMode: false,
 		repoCache:     map[string]string{},
@@ -837,8 +845,7 @@ func (m *dashboardModel) spawnCmd(bin, cwd string) tea.Cmd {
 }
 
 // activeSessionCwd returns the cwd of the session currently shown in the
-// screen pane (the one prefix+n / prefix+c should inherit from). Empty when
-// no session is being viewed.
+// screen pane. Empty when no session is being viewed.
 func (m *dashboardModel) activeSessionCwd() string {
 	if m.streamID == "" {
 		return ""
@@ -847,6 +854,24 @@ func (m *dashboardModel) activeSessionCwd() string {
 		return s.Cwd
 	}
 	return ""
+}
+
+// spawnTargetCwd picks the cwd a new session created via prefix+n / prefix+c
+// should land in. Worktrees share a scope with their main checkout, so the
+// streamed session's cwd is often a sibling directory rather than where the
+// user actually launched cb; prefer the launch cwd whenever it lives in the
+// same scope (covers main↔worktree and worktree↔worktree). Only when the
+// active session has been navigated into a different scope do we fall back
+// to its cwd — there, the user has explicitly moved off their launch repo
+// and "spawn next to the session I'm looking at" is the better default.
+func (m *dashboardModel) spawnTargetCwd() string {
+	active := m.activeSessionCwd()
+	if m.launchCwd != "" {
+		if active == "" || m.scopeKeyOf(active) == m.scopeKeyOf(m.launchCwd) {
+			return m.launchCwd
+		}
+	}
+	return active
 }
 
 func killCmd(id string) tea.Cmd {
@@ -1340,9 +1365,9 @@ func (m *dashboardModel) runAction(action string) (tea.Model, tea.Cmd) {
 		}
 		m.rebuildRows()
 	case "new_claude":
-		return m, m.spawnCmd("claude", m.activeSessionCwd())
+		return m, m.spawnCmd("claude", m.spawnTargetCwd())
 	case "new_codex":
-		return m, m.spawnCmd("codex", m.activeSessionCwd())
+		return m, m.spawnCmd("codex", m.spawnTargetCwd())
 	case "quit":
 		m.action = DashQuit
 		return m, tea.Quit
