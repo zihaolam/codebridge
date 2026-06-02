@@ -346,6 +346,22 @@ func (m *dashboardModel) commonDirCached(cwd string) string {
 	return v
 }
 
+// scopeLabel is the short header line under the title that says what the
+// sidebar is currently showing: every workspace ("scope: all") in accordion
+// mode, or just the launch repo's name in flat mode. Mirrors the toast that
+// fires on toggle so the header reinforces the current mode at rest.
+func (m *dashboardModel) scopeLabel() string {
+	txt := "scope: all"
+	if !m.accordionMode {
+		name := scopeDisplayName(m.currentScope)
+		if name == "" {
+			name = "this workspace"
+		}
+		txt = "scope: " + name
+	}
+	return helpStyle.Render(truncate(txt, sidebarWidth-1))
+}
+
 // scopeDisplayName turns a scope key (a .git path, a worktree gitdir, or a
 // bare cwd) into a one-word label for the accordion header. We use the
 // basename of the repo root (parent of .git) when the key points into a
@@ -1302,6 +1318,10 @@ func (m *dashboardModel) runAction(action string) (tea.Model, tea.Cmd) {
 			m.expanded[m.currentScope] = true
 			m.pushToast("⊚ accordion mode: all workspaces", "starting")
 		} else {
+			// Flat mode mutes notifications from other workspaces — drop any
+			// sticky toasts already showing for sessions that are about to
+			// fall out of scope so they don't linger over the new view.
+			m.dropOutOfScopeToasts()
 			m.pushToast("⊙ flat mode: this workspace only", "working")
 		}
 		m.rebuildRows()
@@ -1579,10 +1599,7 @@ var (
 	}
 )
 
-// Half-circle rotation — vertically centered in the cell, unlike braille
-// spinners which render in the upper half and look misaligned next to
-// baseline-centered glyphs like ● or ⚑.
-var spinnerFrames = []string{"◐", "◓", "◑", "◒"}
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 // indicator returns a short, colored glyph that conveys status at a glance: a
 // spinner while working, a flag when approval is needed, a colored circle for
@@ -1612,12 +1629,17 @@ func (m *dashboardModel) indicator(status string) string {
 // finishes its turn. The toasts persist (no TTL) and are anchored to the
 // session — expireToasts clears them once the agent is past the prompt or
 // the user focuses its screen pane.
+//
+// In flat (workspace-scoped) mode, only sessions whose scope matches the
+// launch scope produce toasts; out-of-scope statuses still update m.prev
+// so toggling back to global mode doesn't replay stale transitions as a
+// fresh burst of notifications.
 func (m *dashboardModel) detectTransitions(next []ipc.SessionInfo) {
 	seen := make(map[string]bool, len(next))
 	for _, s := range next {
 		seen[s.ID] = true
 		old := m.prev[s.ID]
-		if s.Status != old {
+		if s.Status != old && m.toastsAllowed(s) {
 			switch s.Status {
 			case "needs_approval":
 				txt := s.LastMessage
@@ -1638,6 +1660,16 @@ func (m *dashboardModel) detectTransitions(next []ipc.SessionInfo) {
 			delete(m.prev, id)
 		}
 	}
+}
+
+// toastsAllowed reports whether a session is currently eligible to raise
+// per-session sticky toasts. Accordion (global) mode lets every session
+// through; flat mode only allows sessions in the launch scope.
+func (m *dashboardModel) toastsAllowed(s ipc.SessionInfo) bool {
+	if m.accordionMode {
+		return true
+	}
+	return m.scopeKeyOf(s.Cwd) == m.currentScope
 }
 
 // latestPending returns how many sessions need approval and the id of the one
@@ -1696,6 +1728,25 @@ func (m *dashboardModel) pushToast(text, level string) {
 	if len(m.toasts) > 5 {
 		m.toasts = m.toasts[len(m.toasts)-5:]
 	}
+}
+
+// dropOutOfScopeToasts removes sticky session-anchored toasts whose session
+// is no longer eligible to raise toasts (i.e. it's out of scope under the
+// current accordionMode). Ephemeral toasts (no sessionID) are untouched.
+func (m *dashboardModel) dropOutOfScopeToasts() {
+	if len(m.toasts) == 0 {
+		return
+	}
+	kept := m.toasts[:0]
+	for _, t := range m.toasts {
+		if t.sessionID != "" {
+			if s := m.sessionByID(t.sessionID); s != nil && !m.toastsAllowed(*s) {
+				continue
+			}
+		}
+		kept = append(kept, t)
+	}
+	m.toasts = kept
 }
 
 // pushStickyToast adds a notification anchored to a specific session. It
@@ -1874,11 +1925,6 @@ func (m *dashboardModel) renderSidebar() string {
 	// spacers, so clampTop can still keep the cursor on-screen.
 	cursorRow := 0
 	for i, r := range m.visRows {
-		// One-line gap between accordion groups: insert a blank before every
-		// scope header that isn't the first row.
-		if r.isScope && len(rows) > 0 {
-			rows = append(rows, "")
-		}
 		gutter := " "
 		if i == m.cursor {
 			cursorRow = len(rows)
@@ -1892,6 +1938,13 @@ func (m *dashboardModel) renderSidebar() string {
 			rows = append(rows, m.renderScopeRow(gutter, r))
 		} else {
 			rows = append(rows, m.renderSessionRow(gutter, r.session))
+		}
+		// The inter-group gap belongs to the *expanded* group above it:
+		// after the last child of an expanded scope, insert one blank line
+		// before the next scope header. With every group collapsed this
+		// emits nothing, so the headers stack flush.
+		if !r.isScope && i+1 < len(m.visRows) && m.visRows[i+1].isScope {
+			rows = append(rows, "")
 		}
 	}
 
@@ -1910,7 +1963,7 @@ func (m *dashboardModel) renderSidebar() string {
 	// The sidebar carries the app title at the top, then the accordion, then
 	// the global status-tally row at the bottom. errMsg (a daemon problem)
 	// rides under the title.
-	header := titleStyle.Render("codebridge")
+	header := titleStyle.Render("codebridge") + "\n" + m.scopeLabel()
 	if m.errMsg != "" {
 		header += "\n" + statusStyle["needs_approval"].Render(truncate("daemon: "+m.errMsg, sidebarWidth-1))
 	}
@@ -2037,7 +2090,7 @@ func (m *dashboardModel) renderStatusCounts() string {
 	cell := func(status, glyph string, n int) string {
 		return statusStyle[status].Render(glyph) + helpStyle.Render(fmt.Sprintf(" %d", n))
 	}
-	return " " + cell("working", spinnerFrames[0], working) +
+	return " " + cell("working", "⠴", working) +
 		" " + cell("needs_approval", "⚑", approval) +
 		" " + cell("waiting_user", "●", waiting) +
 		" " + cell("idle", "●", idle)
