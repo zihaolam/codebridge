@@ -331,8 +331,9 @@ func TestStickyToastClearsWhenSessionFocused(t *testing.T) {
 // child rows, and currentScope sorts to the top.
 func TestRebuildRowsGroupsByScope(t *testing.T) {
 	m := &dashboardModel{
-		currentScope: "/repo/.git",
-		expanded:     map[string]bool{"/repo/.git": true},
+		currentScope:  "/repo/.git",
+		expanded:      map[string]bool{"/repo/.git": true},
+		accordionMode: true,
 		repoCache: map[string]string{
 			"/repo":       "/repo/.git",
 			"/repo/sub":   "/repo/.git",
@@ -371,10 +372,11 @@ func TestRebuildRowsGroupsByScope(t *testing.T) {
 // just disappeared.
 func TestToggleScopeKeepsCursorOnHeader(t *testing.T) {
 	m := &dashboardModel{
-		currentScope: "/repo/.git",
-		expanded:     map[string]bool{"/repo/.git": true},
-		repoCache:    map[string]string{"/repo": "/repo/.git"},
-		sessions:     []ipc.SessionInfo{{ID: "a", Cwd: "/repo"}},
+		currentScope:  "/repo/.git",
+		expanded:      map[string]bool{"/repo/.git": true},
+		accordionMode: true,
+		repoCache:     map[string]string{"/repo": "/repo/.git"},
+		sessions:      []ipc.SessionInfo{{ID: "a", Cwd: "/repo"}},
 	}
 	m.rebuildRows()
 	// Cursor on the child session row.

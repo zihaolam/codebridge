@@ -90,6 +90,11 @@ type dashboardModel struct {
 	currentScope string
 	expanded     map[string]bool
 
+	// accordionMode controls whether the sidebar shows the multi-workspace
+	// accordion (true, default) or a flat list of just the current scope's
+	// sessions (false — the pre-accordion behavior). Toggled via prefix+a.
+	accordionMode bool
+
 	// selSession / selScope carry selection identity across refreshes so the
 	// cursor lands on the same logical row when visRows rebuilds. On a session
 	// row both are set (sessionID + its parent scope); on a scope row,
@@ -222,6 +227,7 @@ func Dashboard(selectID, cwd string, showAll bool) (DashAction, error) {
 		wantSelect:    selectID,
 		currentScope:  currentScope,
 		expanded:      map[string]bool{currentScope: true},
+		accordionMode: true,
 		repoCache:     map[string]string{},
 		worktreeCache: map[string]bool{},
 		ch:            make(chan previewMsg, 64),
@@ -433,17 +439,25 @@ func (m *dashboardModel) rebuildRows() {
 	})
 
 	rows := make([]visRow, 0, len(m.sessions)+len(keys))
-	for _, k := range keys {
-		rows = append(rows, visRow{
-			isScope:    true,
-			scopeKey:   k,
-			scopeCount: len(groups[k]),
-			expanded:   m.expanded[k],
-		})
-		if m.expanded[k] {
-			for _, s := range groups[k] {
-				rows = append(rows, visRow{scopeKey: k, session: s})
+	if m.accordionMode {
+		for _, k := range keys {
+			rows = append(rows, visRow{
+				isScope:    true,
+				scopeKey:   k,
+				scopeCount: len(groups[k]),
+				expanded:   m.expanded[k],
+			})
+			if m.expanded[k] {
+				for _, s := range groups[k] {
+					rows = append(rows, visRow{scopeKey: k, session: s})
+				}
 			}
+		}
+	} else {
+		// Flat single-workspace view: just the current scope's sessions, no
+		// headers — matches the pre-accordion sidebar.
+		for _, s := range groups[m.currentScope] {
+			rows = append(rows, visRow{scopeKey: m.currentScope, session: s})
 		}
 	}
 	m.visRows = rows
@@ -1273,27 +1287,22 @@ func (m *dashboardModel) runAction(action string) (tea.Model, tea.Cmd) {
 			m.sendPaste("\n")
 		}
 	case "scope_toggle":
-		// Repurposed from the old scope filter (the sidebar is always global
-		// now): toggle between "every group collapsed except the launch
-		// scope" — a quick focus mode — and "every group expanded" so a user
-		// drowning in groups can fold them away with one keystroke.
-		anyOtherExpanded := false
-		for k, v := range m.expanded {
-			if v && k != m.currentScope {
-				anyOtherExpanded = true
-				break
+		// Toggle workspace-accordion mode. When on (default), the sidebar
+		// shows every workspace as a collapsible accordion. When off, it
+		// shrinks to just this-repo's sessions as a flat list — the
+		// pre-accordion behavior.
+		m.accordionMode = !m.accordionMode
+		if m.accordionMode {
+			// Returning to the accordion view: re-open the launch scope so
+			// the sessions we were just looking at don't vanish behind a
+			// collapsed header.
+			if m.expanded == nil {
+				m.expanded = map[string]bool{}
 			}
-		}
-		if anyOtherExpanded {
-			m.expanded = map[string]bool{m.currentScope: true}
-			m.pushToast("⊙ collapsed all but current", "working")
+			m.expanded[m.currentScope] = true
+			m.pushToast("⊚ accordion mode: all workspaces", "starting")
 		} else {
-			for _, r := range m.visRows {
-				if r.isScope {
-					m.expanded[r.scopeKey] = true
-				}
-			}
-			m.pushToast("⊚ expanded all scopes", "starting")
+			m.pushToast("⊙ flat mode: this workspace only", "working")
 		}
 		m.rebuildRows()
 	case "new_claude":
@@ -1324,8 +1333,13 @@ func (m *dashboardModel) runAction(action string) (tea.Model, tea.Cmd) {
 			m.renameBuf = displayName(*target)
 		}
 	case "jump_pending":
-		if _, latest := pendingSummary(m.sessions, ""); latest != "" {
-			// Make sure the pending session's group is open before pointing
+		// Jump to whichever session has the freshest sticky toast: a
+		// needs_approval flag if any exists (those are most urgent), else
+		// the most recent turn-complete (waiting_user). Matches what the
+		// user sees in the notification stack.
+		latest := latestAttention(m.sessions)
+		if latest != "" {
+			// Make sure the target session's group is open before pointing
 			// the cursor at it; selScope/selSession let rebuildRows land
 			// the cursor on the right row.
 			for _, s := range m.sessions {
@@ -1333,6 +1347,12 @@ func (m *dashboardModel) runAction(action string) (tea.Model, tea.Cmd) {
 					continue
 				}
 				key := m.scopeKeyOf(s.Cwd)
+				// Flat (single-workspace) mode can't show sessions from
+				// other scopes — flip back into accordion mode when the
+				// jump target lives outside the launch workspace.
+				if !m.accordionMode && key != m.currentScope {
+					m.accordionMode = true
+				}
 				if !m.expanded[key] {
 					m.setScopeExpanded(key, true)
 				}
@@ -1559,7 +1579,10 @@ var (
 	}
 )
 
-var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+// Half-circle rotation — vertically centered in the cell, unlike braille
+// spinners which render in the upper half and look misaligned next to
+// baseline-centered glyphs like ● or ⚑.
+var spinnerFrames = []string{"◐", "◓", "◑", "◒"}
 
 // indicator returns a short, colored glyph that conveys status at a glance: a
 // spinner while working, a flag when approval is needed, a colored circle for
@@ -1621,6 +1644,32 @@ func (m *dashboardModel) detectTransitions(next []ipc.SessionInfo) {
 // that entered needs_approval most recently (the "latest" to jump to).
 func latestPending(sessions []ipc.SessionInfo) (count int, latestID string) {
 	return pendingSummary(sessions, "")
+}
+
+// latestAttention picks the session jump_pending should land on: the
+// most recently flagged needs_approval session, or — if none need approval —
+// the freshest waiting_user (turn complete). Returns "" when nothing needs
+// the user's eyes. Mirrors the priority of the sticky-toast stack so
+// "prefix g" jumps to whatever's currently buzzing.
+func latestAttention(sessions []ipc.SessionInfo) string {
+	var pickID string
+	var pickSince int64 = -1
+	for _, s := range sessions {
+		if s.Status == "needs_approval" && s.StatusSince > pickSince {
+			pickSince = s.StatusSince
+			pickID = s.ID
+		}
+	}
+	if pickID != "" {
+		return pickID
+	}
+	for _, s := range sessions {
+		if s.Status == "waiting_user" && s.StatusSince > pickSince {
+			pickSince = s.StatusSince
+			pickID = s.ID
+		}
+	}
+	return pickID
 }
 
 // pendingSummary is latestPending with an exclusion: the session you're already
@@ -1820,9 +1869,19 @@ func (m *dashboardModel) renderSidebar() string {
 	}
 
 	var rows []string
+	// cursorRow is the index of the highlighted row inside `rows`. It
+	// differs from m.cursor (an index into m.visRows) once we interleave
+	// spacers, so clampTop can still keep the cursor on-screen.
+	cursorRow := 0
 	for i, r := range m.visRows {
+		// One-line gap between accordion groups: insert a blank before every
+		// scope header that isn't the first row.
+		if r.isScope && len(rows) > 0 {
+			rows = append(rows, "")
+		}
 		gutter := " "
 		if i == m.cursor {
+			cursorRow = len(rows)
 			if m.focus == focusSidebar {
 				gutter = selBarStyle.Render("▌")
 			} else {
@@ -1862,7 +1921,7 @@ func (m *dashboardModel) renderSidebar() string {
 	// and the global status-tally row. The list is padded with blank lines
 	// to fill its slot so the counts strip stays pinned to the bottom edge.
 	maxRows := maxInt(m.paneH-headerH-3, 1)
-	top := clampTop(m.cursor, m.sidebarTop, len(rows), maxRows)
+	top := clampTop(cursorRow, m.sidebarTop, len(rows), maxRows)
 	m.sidebarTop = top
 	end := minInt(top+maxRows, len(rows))
 	listRows := rows[top:end]
@@ -1881,6 +1940,15 @@ func (m *dashboardModel) renderSidebar() string {
 // rows still match — and so tests that poke m.sessions directly still pick
 // up a fresh accordion without going through the sessionsMsg handler.
 func (m *dashboardModel) expectedRowCount() int {
+	if !m.accordionMode {
+		n := 0
+		for _, s := range m.sessions {
+			if m.scopeKeyOf(s.Cwd) == m.currentScope {
+				n++
+			}
+		}
+		return n
+	}
 	seen := map[string]bool{}
 	n := 0
 	for _, s := range m.sessions {
@@ -1905,9 +1973,12 @@ func (m *dashboardModel) expectedRowCount() int {
 // (not bytes) so the chevron stays flush to the right edge regardless of
 // ANSI styling in the name.
 func (m *dashboardModel) renderScopeRow(gutter string, r visRow) string {
-	glyph := "›"
+	// ▸/▾ are baseline-centered small triangles. The arrowhead glyphs
+	// (›/⌄) render in the upper half of the cell and look pushed up next
+	// to the count beside them.
+	glyph := "▸"
 	if r.expanded {
-		glyph = "⌄"
+		glyph = "▾"
 	}
 	countStr := fmt.Sprintf("%d", r.scopeCount)
 	// Budget: gutter(1) + name + pad(>=1) + count + " "(1) + glyph(1)
@@ -2155,7 +2226,7 @@ func (m *dashboardModel) renderPrefixPanel(width int) string {
 		{kbd("h"), "focus sidebar"},
 		{b("focus_screen"), "focus screen"},
 		{b("scroll"), "scrollback"},
-		{b("scope_toggle"), "fold scopes"},
+		{b("scope_toggle"), "all/this workspace"},
 		{b("jump_pending"), "jump pending"},
 		{b("newline"), "newline"},
 		{b("yank"), "yank selection"},
