@@ -195,10 +195,11 @@ func TestDetectTransitions(t *testing.T) {
 		t.Fatalf("expected no toast on first working observation, got %d", len(m.toasts))
 	}
 
-	// Crossing into needs_approval: one toast carrying the message.
+	// Crossing into needs_approval: one sticky toast carrying the message,
+	// anchored to the session.
 	m.detectTransitions([]ipc.SessionInfo{sess("a", "needs_approval", "run rm -rf?")})
-	if len(m.toasts) != 1 || m.toasts[0].level != "needs_approval" {
-		t.Fatalf("expected needs_approval toast, got %+v", m.toasts)
+	if len(m.toasts) != 1 || m.toasts[0].level != "needs_approval" || m.toasts[0].sessionID == "" {
+		t.Fatalf("expected sticky needs_approval toast, got %+v", m.toasts)
 	}
 
 	// Still needs_approval: no duplicate toast.
@@ -207,10 +208,12 @@ func TestDetectTransitions(t *testing.T) {
 		t.Fatalf("expected no duplicate toast, got %d", len(m.toasts))
 	}
 
-	// Turn finished: a waiting_user toast.
+	// Turn finished: the sticky for this session is replaced in place by the
+	// waiting_user toast (one sticky per session by design — they don't pile
+	// up as the agent transitions through prompt states).
 	m.detectTransitions([]ipc.SessionInfo{sess("a", "waiting_user", "")})
-	if len(m.toasts) != 2 || m.toasts[1].level != "waiting_user" {
-		t.Fatalf("expected waiting_user toast, got %+v", m.toasts)
+	if len(m.toasts) != 1 || m.toasts[0].level != "waiting_user" {
+		t.Fatalf("expected sticky to update to waiting_user, got %+v", m.toasts)
 	}
 }
 
@@ -259,6 +262,8 @@ func TestPendingSummaryExcludesSelf(t *testing.T) {
 }
 
 func TestSidebarViewRenders(t *testing.T) {
+	// Sessions with empty Cwd group under scope key "" — expand it so the
+	// child session rows actually paint and the assertions can find them.
 	m := &dashboardModel{
 		w: 100, h: 30,
 		paneW: 60, paneH: 24,
@@ -266,6 +271,7 @@ func TestSidebarViewRenders(t *testing.T) {
 			{ID: "aaaaaaaa11", Name: "api-fix", Status: "needs_approval", LastMessage: "run rm -rf?"},
 			{ID: "bbbbbbbb22", Status: "working"},
 		},
+		expanded: map[string]bool{"": true},
 		streamID: "aaaaaaaa11",
 		screen:   "hello from the session",
 	}
@@ -274,6 +280,109 @@ func TestSidebarViewRenders(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("view missing %q", want)
 		}
+	}
+}
+
+// TestStickyToastClearsWhenStatusResolves drives the toast lifecycle: a
+// sticky toast appears on the prompt transition, survives a TTL window
+// (ephemeral toasts would have expired), then drops when the session leaves
+// the prompting state.
+func TestStickyToastClearsWhenStatusResolves(t *testing.T) {
+	m := &dashboardModel{prev: map[string]string{}}
+	m.sessions = []ipc.SessionInfo{sess("a", "needs_approval", "rm -rf?")}
+	m.detectTransitions(m.sessions)
+	if len(m.toasts) != 1 || m.toasts[0].sessionID == "" {
+		t.Fatalf("expected one sticky toast, got %+v", m.toasts)
+	}
+	// Pretend a long time passed — sticky toasts ignore the TTL.
+	m.toasts[0].born = m.toasts[0].born.Add(-2 * toastTTL)
+	m.expireToasts()
+	if len(m.toasts) != 1 {
+		t.Fatalf("sticky toast disappeared past TTL; want it to persist (got %d)", len(m.toasts))
+	}
+	// Status moves on — the sticky toast clears.
+	m.sessions = []ipc.SessionInfo{sess("a", "working", "")}
+	m.expireToasts()
+	if len(m.toasts) != 0 {
+		t.Fatalf("sticky toast survived status change; want it cleared (got %+v)", m.toasts)
+	}
+}
+
+// TestStickyToastClearsWhenSessionFocused confirms that focusing a session's
+// screen pane resolves the sticky toast even while the underlying status is
+// still pending.
+func TestStickyToastClearsWhenSessionFocused(t *testing.T) {
+	m := &dashboardModel{prev: map[string]string{}}
+	m.sessions = []ipc.SessionInfo{sess("a", "needs_approval", "rm -rf?")}
+	m.detectTransitions(m.sessions)
+	if len(m.toasts) != 1 {
+		t.Fatalf("expected sticky toast, got %+v", m.toasts)
+	}
+	m.streamID = m.toasts[0].sessionID
+	m.focus = focusScreen
+	m.expireToasts()
+	if len(m.toasts) != 0 {
+		t.Fatalf("sticky toast survived screen-pane focus; want it cleared (got %+v)", m.toasts)
+	}
+}
+
+// TestRebuildRowsGroupsByScope checks the accordion's core grouping: sessions
+// sharing a scope key land under the same scope header, expanded scopes show
+// child rows, and currentScope sorts to the top.
+func TestRebuildRowsGroupsByScope(t *testing.T) {
+	m := &dashboardModel{
+		currentScope: "/repo/.git",
+		expanded:     map[string]bool{"/repo/.git": true},
+		repoCache: map[string]string{
+			"/repo":       "/repo/.git",
+			"/repo/sub":   "/repo/.git",
+			"/other":      "",
+			"/other/deep": "",
+		},
+		sessions: []ipc.SessionInfo{
+			{ID: "x", Cwd: "/other"},
+			{ID: "a", Cwd: "/repo"},
+			{ID: "b", Cwd: "/repo/sub"},
+		},
+	}
+	m.rebuildRows()
+	// 2 scope rows + 2 expanded session rows = 4 visible rows. The /other
+	// group stays collapsed (no children visible) because it isn't in
+	// m.expanded.
+	if len(m.visRows) != 4 {
+		t.Fatalf("visRows = %d (want 4): %+v", len(m.visRows), m.visRows)
+	}
+	if !m.visRows[0].isScope || m.visRows[0].scopeKey != "/repo/.git" {
+		t.Errorf("row 0 should be the current scope header, got %+v", m.visRows[0])
+	}
+	if m.visRows[1].isScope || m.visRows[2].isScope {
+		t.Errorf("rows 1+2 should be sessions under the expanded scope, got %+v %+v", m.visRows[1], m.visRows[2])
+	}
+	if !m.visRows[3].isScope || m.visRows[3].scopeKey != "/other" {
+		t.Errorf("row 3 should be the /other scope header, got %+v", m.visRows[3])
+	}
+	if m.visRows[3].scopeCount != 1 {
+		t.Errorf("/other scope count = %d, want 1", m.visRows[3].scopeCount)
+	}
+}
+
+// TestToggleScopeKeepsCursorOnHeader verifies the cursor stays on the
+// header row through a collapse, even when it was on a child session that
+// just disappeared.
+func TestToggleScopeKeepsCursorOnHeader(t *testing.T) {
+	m := &dashboardModel{
+		currentScope: "/repo/.git",
+		expanded:     map[string]bool{"/repo/.git": true},
+		repoCache:    map[string]string{"/repo": "/repo/.git"},
+		sessions:     []ipc.SessionInfo{{ID: "a", Cwd: "/repo"}},
+	}
+	m.rebuildRows()
+	// Cursor on the child session row.
+	m.cursor = 1
+	m.syncSelFromCursor()
+	m.toggleScope("/repo/.git")
+	if r := m.currentRow(); r == nil || !r.isScope || r.scopeKey != "/repo/.git" {
+		t.Fatalf("cursor did not anchor to scope header after collapse, got %+v", r)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -58,31 +59,46 @@ type toast struct {
 	text  string
 	level string // status key for coloring
 	born  time.Time
+	// sessionID, when non-empty, makes the toast sticky: it ignores TTL and
+	// stays painted until the session's status moves out of `status`, the
+	// session ends, or the user focuses its screen pane. status is the
+	// triggering state ("needs_approval" / "waiting_user") so expireToasts
+	// can tell when the prompt has been resolved.
+	sessionID string
+	status    string
 }
 
 const toastTTL = 6 * time.Second
 
 type dashboardModel struct {
-	// allSessions is the full list from the daemon; sessions is the visible
-	// subset after scope filtering (the working set the rest of the UI uses).
-	allSessions []ipc.SessionInfo
-	sessions    []ipc.SessionInfo
-	cursor      int
-	errMsg      string
-	w, h        int
+	// sessions is the full session list from the daemon — the sidebar is
+	// globally scoped, so this is the master list every render and counter
+	// reads from. visRows is the flat list the accordion actually renders
+	// (scope headers interleaved with their child sessions when expanded) and
+	// is the source of truth for cursor indexing.
+	sessions []ipc.SessionInfo
+	visRows  []visRow
+	cursor   int // index into visRows
+	errMsg   string
+	w, h     int
 
-	// Scope: unless showAll, the list is filtered to the repo cb was launched in.
-	// scopeCommon is the git "common directory" (the shared .git) — identical for
-	// a repo's main checkout and every linked worktree, so they share one scope;
-	// a session matches when its cwd resolves to the same common dir. When cb
-	// isn't in a git repo, scopeCommon is "" and scopeRoot's subtree is used
-	// instead. scopeRoot is the main worktree root (shown in the header) or the
-	// launch dir when not in a repo, or "" when the cwd couldn't be determined.
-	// repoCache memoizes cwd -> common dir so polling doesn't re-resolve sessions.
-	scopeCommon string
-	scopeRoot   string
-	showAll     bool
-	repoCache   map[string]string
+	// currentScope is the scope key (git common dir, or cwd for non-repo) of
+	// the directory cb was launched in. expanded[currentScope] is seeded true,
+	// so the user's repo opens by default; every other scope starts collapsed
+	// and stays that way until explicitly opened, so new scopes appearing in
+	// later polls don't quietly steal sidebar real estate.
+	currentScope string
+	expanded     map[string]bool
+
+	// selSession / selScope carry selection identity across refreshes so the
+	// cursor lands on the same logical row when visRows rebuilds. On a session
+	// row both are set (sessionID + its parent scope); on a scope row,
+	// selSession is "" and selScope names the row.
+	selSession string
+	selScope   string
+
+	repoCache     map[string]string
+	worktreeCache map[string]bool // cwd -> "is a linked worktree" (cached for the same reason as repoCache)
 
 	prev   map[string]string // last seen status per session id (for transition detection)
 	toasts []toast
@@ -156,6 +172,18 @@ type dashboardModel struct {
 // (scrollback + visible grid), col is a display column on that line.
 type selPos struct{ line, col int }
 
+// visRow is one rendered row of the sidebar accordion. Scope rows are
+// expand/collapse headers (count = number of sessions in the group); session
+// rows carry the underlying SessionInfo and only appear when their parent
+// scope is expanded.
+type visRow struct {
+	isScope    bool
+	scopeKey   string
+	scopeCount int             // populated only when isScope
+	expanded   bool            // populated only when isScope
+	session    ipc.SessionInfo // populated only when !isScope
+}
+
 // previewMsg carries a frame from the screen-pane attach stream. id tags which
 // session it came from so frames from a just-closed connection are ignored.
 type previewMsg struct {
@@ -171,26 +199,33 @@ type previewMsg struct {
 // Dashboard runs the unified two-zone view: a session list on the left and the
 // selected session's live screen on the right. selectID, if non-empty, is the
 // session to highlight on entry. cwd is the directory cb was launched in; the
-// session list is scoped to its git repo (including linked worktrees), or its
-// subtree when not a repo. showAll, when true, starts unscoped. It returns the
-// action the caller should take.
+// sidebar is always globally scoped and groups sessions by their cwd-derived
+// scope key (git common dir, else cwd) — the group containing cwd opens by
+// default, every other group starts collapsed. showAll is accepted but no
+// longer carries meaning (the sidebar is unconditionally global now); the
+// param is kept so callers that pass --all still link cleanly.
 func Dashboard(selectID, cwd string, showAll bool) (DashAction, error) {
+	_ = showAll // sidebar is always global now; flag is a historical no-op
 	common, root := deriveScope(cwd)
+	currentScope := common
+	if currentScope == "" {
+		currentScope = root // launch dir when not in a git repo
+	}
 	cfg := config.Load()
 	// Apply the on-disk prefix to the package-level var that prefixLabel /
 	// handleKey read. SetPrefix is a no-op when CB_PREFIX is set, so the env
 	// override still wins for users who haven't migrated to the config file.
 	SetPrefix(cfg.Prefix)
 	m := &dashboardModel{
-		hooksOK:     hook.Installed(),
-		prev:        map[string]string{},
-		wantSelect:  selectID,
-		scopeCommon: common,
-		scopeRoot:   root,
-		showAll:     showAll,
-		repoCache:   map[string]string{},
-		ch:          make(chan previewMsg, 64),
-		cfg:         cfg,
+		hooksOK:       hook.Installed(),
+		prev:          map[string]string{},
+		wantSelect:    selectID,
+		currentScope:  currentScope,
+		expanded:      map[string]bool{currentScope: true},
+		repoCache:     map[string]string{},
+		worktreeCache: map[string]bool{},
+		ch:            make(chan previewMsg, 64),
+		cfg:           cfg,
 	}
 	// Mouse wheel is captured (see View's MouseMode) so scrolling the screen pane
 	// browses scrollback rather than the terminal turning the wheel into arrow
@@ -231,10 +266,12 @@ func (m *dashboardModel) waitFrame() tea.Cmd {
 	return func() tea.Msg { return <-m.ch }
 }
 
-// selectedID is the id of the session under the cursor, or "" if none.
+// selectedID is the id of the session under the cursor — only meaningful
+// when the cursor is on a session row. On a scope header (or with no rows
+// at all), it returns "" so callers know there's no session to act on.
 func (m *dashboardModel) selectedID() string {
-	if m.cursor >= 0 && m.cursor < len(m.sessions) {
-		return m.sessions[m.cursor].ID
+	if r := m.currentRow(); r != nil && !r.isScope {
+		return r.session.ID
 	}
 	return ""
 }
@@ -277,30 +314,16 @@ func (m *dashboardModel) sessionByID(id string) *ipc.SessionInfo {
 	return nil
 }
 
-// visibleSessions filters the daemon's full list down to the ones in scope.
-// With showAll set (or no scope root), every session passes through.
-func (m *dashboardModel) visibleSessions(all []ipc.SessionInfo) []ipc.SessionInfo {
-	if m.showAll || m.scopeRoot == "" {
-		return all
+// scopeKeyOf is the accordion's group key for a session's cwd: the git common
+// directory when the session sits in a repo (so the main checkout and every
+// linked worktree of one repo collapse into one group), and the literal cwd
+// otherwise (each non-repo directory becomes its own group). Resolution is
+// memoized via repoCache so the 500ms poll doesn't re-walk the filesystem.
+func (m *dashboardModel) scopeKeyOf(cwd string) string {
+	if c := m.commonDirCached(cwd); c != "" {
+		return c
 	}
-	out := make([]ipc.SessionInfo, 0, len(all))
-	for _, s := range all {
-		if m.inScope(s.Cwd) {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-// inScope reports whether a session started in cwd belongs to the current
-// scope. In a git repo, membership is by shared common dir, so the main checkout
-// and all linked worktrees count as one repo; otherwise it falls back to the
-// launch-dir subtree.
-func (m *dashboardModel) inScope(cwd string) bool {
-	if m.scopeCommon != "" {
-		return m.commonDirCached(cwd) == m.scopeCommon
-	}
-	return pathWithin(m.scopeRoot, cwd)
+	return cwd
 }
 
 // commonDirCached resolves cwd to its git common dir, memoizing the (stable)
@@ -317,28 +340,199 @@ func (m *dashboardModel) commonDirCached(cwd string) string {
 	return v
 }
 
-// applyScope recomputes the visible list from the full one after the scope
-// toggle flips, keeping the same session selected when it's still visible and
-// re-attaching the screen pane to whatever ends up under the cursor. Current
-// statuses are recorded as already-seen so the next poll doesn't toast sessions
-// that merely came into view as fresh transitions.
-func (m *dashboardModel) applyScope() {
-	selID := m.selectedID()
-	m.sessions = m.visibleSessions(m.allSessions)
-	m.cursor = 0
-	for i, s := range m.sessions {
-		if s.ID == selID {
-			m.cursor = i
-			break
+// scopeDisplayName turns a scope key (a .git path, a worktree gitdir, or a
+// bare cwd) into a one-word label for the accordion header. We use the
+// basename of the repo root (parent of .git) when the key points into a
+// gitdir; otherwise the basename of the cwd. Empty keys fall back to a
+// placeholder so an unset cwd doesn't render a blank row.
+func scopeDisplayName(key string) string {
+	if key == "" {
+		return "(unknown)"
+	}
+	if filepath.Base(key) == ".git" {
+		if n := folderBase(filepath.Dir(key)); n != "" {
+			return n
 		}
 	}
+	if n := folderBase(key); n != "" {
+		return n
+	}
+	return key
+}
+
+// isWorktreeCached reports whether cwd is inside a linked git worktree (as
+// opposed to the main checkout). A linked worktree's nearest .git is a file
+// pointing at a gitdir; the main checkout's nearest .git is a directory.
+// Memoized so the 500ms list poll doesn't re-stat.
+func (m *dashboardModel) isWorktreeCached(cwd string) bool {
+	if m.worktreeCache == nil {
+		m.worktreeCache = map[string]bool{}
+	}
+	if v, ok := m.worktreeCache[cwd]; ok {
+		return v
+	}
+	v := isLinkedWorktree(cwd)
+	m.worktreeCache[cwd] = v
+	return v
+}
+
+// isLinkedWorktree walks up from dir to the nearest .git and reports whether
+// it's a file (linked worktree) rather than a directory (main checkout or bare
+// repo). Returns false when dir isn't in a git repo at all.
+func isLinkedWorktree(dir string) bool {
+	dir = filepath.Clean(dir)
+	for cur := dir; ; {
+		p := filepath.Join(cur, ".git")
+		if info, err := os.Lstat(p); err == nil {
+			return !info.IsDir()
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return false
+		}
+		cur = parent
+	}
+}
+
+// rebuildRows recomputes the accordion's flat row list from m.sessions and
+// the current expansion state, then restores the cursor to the same logical
+// row it was on before (preferring the same session, falling back to the same
+// scope header, then clamping). It's the single chokepoint every code path
+// hits when the underlying data or the open/closed state changes: the daemon
+// poll, scope toggles, and the explicit "expand current" jumps.
+//
+// Groups are ordered with currentScope pinned first (so the user's repo sits
+// at the top regardless of session arrival order); other scopes sort by
+// display name to keep ordering stable as new sessions appear.
+func (m *dashboardModel) rebuildRows() {
+	groups := map[string][]ipc.SessionInfo{}
+	var keys []string
 	for _, s := range m.sessions {
-		m.prev[s.ID] = s.Status
+		k := m.scopeKeyOf(s.Cwd)
+		if _, ok := groups[k]; !ok {
+			keys = append(keys, k)
+		}
+		groups[k] = append(groups[k], s)
 	}
-	if m.cursor >= len(m.sessions) {
-		m.cursor = max(0, len(m.sessions)-1)
+	// currentScope is always shown — even when it has no sessions yet — so the
+	// user can see "their" group as a closed header rather than wondering
+	// whether the panel is empty.
+	if _, ok := groups[m.currentScope]; !ok && m.currentScope != "" {
+		groups[m.currentScope] = nil
+		keys = append(keys, m.currentScope)
 	}
-	m.syncStream()
+	cur := m.currentScope
+	sort.SliceStable(keys, func(i, j int) bool {
+		if keys[i] == cur {
+			return true
+		}
+		if keys[j] == cur {
+			return false
+		}
+		return scopeDisplayName(keys[i]) < scopeDisplayName(keys[j])
+	})
+
+	rows := make([]visRow, 0, len(m.sessions)+len(keys))
+	for _, k := range keys {
+		rows = append(rows, visRow{
+			isScope:    true,
+			scopeKey:   k,
+			scopeCount: len(groups[k]),
+			expanded:   m.expanded[k],
+		})
+		if m.expanded[k] {
+			for _, s := range groups[k] {
+				rows = append(rows, visRow{scopeKey: k, session: s})
+			}
+		}
+	}
+	m.visRows = rows
+
+	// Restore the cursor onto the same logical row (session if known, else
+	// its parent scope). If neither survives, clamp to a valid index and
+	// re-derive selection from whatever's now under the cursor.
+	idx := -1
+	if m.selSession != "" {
+		for i, r := range rows {
+			if !r.isScope && r.session.ID == m.selSession {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx < 0 && m.selScope != "" {
+		for i, r := range rows {
+			if r.isScope && r.scopeKey == m.selScope {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx < 0 {
+		idx = m.cursor
+	}
+	if idx >= len(rows) {
+		idx = len(rows) - 1
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	m.cursor = idx
+	m.syncSelFromCursor()
+}
+
+// syncSelFromCursor copies the cursor's row identity into selSession/selScope
+// so subsequent rebuilds can restore the same row. Called after every cursor
+// move (keyboard, click, programmatic).
+func (m *dashboardModel) syncSelFromCursor() {
+	if m.cursor < 0 || m.cursor >= len(m.visRows) {
+		m.selSession, m.selScope = "", ""
+		return
+	}
+	r := m.visRows[m.cursor]
+	m.selScope = r.scopeKey
+	if r.isScope {
+		m.selSession = ""
+	} else {
+		m.selSession = r.session.ID
+	}
+}
+
+// currentRow returns the row under the cursor, or nil when there are no rows.
+func (m *dashboardModel) currentRow() *visRow {
+	if m.cursor < 0 || m.cursor >= len(m.visRows) {
+		return nil
+	}
+	return &m.visRows[m.cursor]
+}
+
+// toggleScope flips a scope group's expanded flag and rebuilds the row list.
+// The cursor stays on the same scope header (rebuildRows finds it by scopeKey).
+func (m *dashboardModel) toggleScope(key string) {
+	if m.expanded == nil {
+		m.expanded = map[string]bool{}
+	}
+	m.expanded[key] = !m.expanded[key]
+	// Cursor needs to anchor to the scope row through the rebuild, even if
+	// it was on a child session that's about to disappear.
+	m.selSession = ""
+	m.selScope = key
+	m.rebuildRows()
+}
+
+// setScopeExpanded forces a scope's expanded state. Used by left/right arrow
+// affordances that should set, not toggle.
+func (m *dashboardModel) setScopeExpanded(key string, expanded bool) {
+	if m.expanded == nil {
+		m.expanded = map[string]bool{}
+	}
+	if m.expanded[key] == expanded {
+		return
+	}
+	m.expanded[key] = expanded
+	m.selSession = ""
+	m.selScope = key
+	m.rebuildRows()
 }
 
 // pathWithin reports whether path is root itself or lives beneath it. Both
@@ -454,20 +648,6 @@ func canonicalDir(p string) string {
 	return canonicalCase(p)
 }
 
-// scopeLabel is the short header line under the title that shows whether the
-// list is scoped to a directory or showing every session.
-func (m *dashboardModel) scopeLabel() string {
-	txt := "scope: all"
-	if !m.showAll && m.scopeRoot != "" {
-		name := folderBase(m.scopeRoot)
-		if name == "" {
-			name = m.scopeRoot
-		}
-		txt = "scope: " + name
-	}
-	return helpStyle.Render(truncate(txt, sidebarWidth-1))
-}
-
 // syncStream ensures the screen pane is attached to the currently selected
 // session: if the selection changed, it tears down the old stream and opens a
 // new one. The session is resized to the pane so its render fits. The old
@@ -475,6 +655,13 @@ func (m *dashboardModel) scopeLabel() string {
 // session arrives, so switching sessions doesn't flash a blank pane.
 func (m *dashboardModel) syncStream() {
 	id := m.selectedID()
+	// Cursor parked on a scope header? Keep streaming the last attached
+	// session so scrolling through accordion headers doesn't kill the live
+	// screen pane. Only an explicit move onto a *different* session row
+	// (or a session ending) should swap the stream.
+	if id == "" && m.streamID != "" {
+		return
+	}
 	if id == m.streamID && (id == "" || m.conn != nil) {
 		return
 	}
@@ -646,7 +833,7 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Select the just-created session and drop straight into it so you can
 		// start typing; the refresh picks it up and syncStream attaches.
 		m.wantSelect = msg.id
-		m.focus = focusScreen
+		m.focusScreenPane()
 		return m, refreshCmd
 
 	case spawnMissingMsg:
@@ -695,24 +882,31 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errMsg = msg.err.Error()
 		} else {
 			m.errMsg = ""
-			m.allSessions = msg.sessions
-			m.sessions = m.visibleSessions(msg.sessions)
-			// Toasts follow the visible set: when scoped, only notify about
-			// sessions in this repo (matching what the header advertises).
+			m.sessions = msg.sessions
+			// Sidebar is globally scoped — toasts fire across every session
+			// the daemon knows about, not just the visible accordion rows
+			// (collapsing a group shouldn't silence notifications from it).
 			m.detectTransitions(m.sessions)
 		}
+		// On the first poll that includes wantSelect, ensure its parent scope
+		// is open and stamp the selection so rebuildRows lands the cursor on
+		// the requested session row.
 		if m.wantSelect != "" {
-			for i, s := range m.sessions {
+			for _, s := range m.sessions {
 				if s.ID == m.wantSelect {
-					m.cursor = i
+					key := m.scopeKeyOf(s.Cwd)
+					if m.expanded == nil {
+						m.expanded = map[string]bool{}
+					}
+					m.expanded[key] = true
+					m.selScope = key
+					m.selSession = s.ID
 					break
 				}
 			}
 			m.wantSelect = ""
 		}
-		if m.cursor >= len(m.sessions) {
-			m.cursor = max(0, len(m.sessions)-1)
-		}
+		m.rebuildRows()
 		m.syncStream()
 		return m, nil
 
@@ -844,14 +1038,19 @@ func selTick() tea.Cmd {
 	return tea.Tick(selTickInterval, func(time.Time) tea.Msg { return selTickMsg{} })
 }
 
-// handleMouseClick begins an in-app drag selection on a plain left click inside
-// the screen pane. Any click anywhere clears a previous (finalized) selection
-// first — so a sidebar click, a release-without-drag, or just starting a new
-// drag all dismiss the prior highlight. Other buttons / modifiers are left to
-// the host terminal.
+// handleMouseClick routes a plain left click. Sticky toasts (rendered at the
+// bottom-left as their own rows) are clickable hit targets — a click in one
+// jumps straight to its session — and take priority over the drag-selection
+// path so a toast resting over the screen-pane area doesn't get hijacked.
+// Clicks inside the screen pane otherwise start an in-app drag selection;
+// other buttons / modifiers are left to the host terminal.
 func (m *dashboardModel) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 	e := msg.Mouse()
 	if e.Button != tea.MouseLeft || e.Mod != 0 {
+		return m, nil
+	}
+	if id := m.toastSessionAt(e.X, e.Y); id != "" {
+		m.focusSession(id)
 		return m, nil
 	}
 	m.selStart, m.selEnd = selPos{}, selPos{}
@@ -860,8 +1059,9 @@ func (m *dashboardModel) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea
 		return m, nil
 	}
 	// A click inside the screen pane focuses it, so subsequent keystrokes flow
-	// to the session without needing the prefix chord.
-	m.focus = focusScreen
+	// to the session without needing the prefix chord. focusScreenPane also
+	// drops the sticky toast (if any) for the now-visible session.
+	m.focusScreenPane()
 	pos := selPos{line: m.vLine(row), col: col}
 	m.selecting = true
 	m.selStart, m.selEnd = pos, pos
@@ -1010,7 +1210,7 @@ func (m *dashboardModel) handlePrefix(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 	case "right":
 		m.menu = false
 		if m.streamID != "" && !m.gone {
-			m.focus = focusScreen
+			m.focusScreenPane()
 		}
 		return m, nil
 	}
@@ -1057,7 +1257,7 @@ func (m *dashboardModel) runAction(action string) (tea.Model, tea.Cmd) {
 	switch action {
 	case "focus_screen":
 		if m.streamID != "" && !m.gone {
-			m.focus = focusScreen
+			m.focusScreenPane()
 		}
 	case "scroll":
 		if m.scrollMode {
@@ -1073,13 +1273,29 @@ func (m *dashboardModel) runAction(action string) (tea.Model, tea.Cmd) {
 			m.sendPaste("\n")
 		}
 	case "scope_toggle":
-		m.showAll = !m.showAll
-		m.applyScope()
-		if m.showAll {
-			m.pushToast("⊚ showing all sessions", "starting")
-		} else {
-			m.pushToast("⊙ scoped to "+folderBase(m.scopeRoot), "working")
+		// Repurposed from the old scope filter (the sidebar is always global
+		// now): toggle between "every group collapsed except the launch
+		// scope" — a quick focus mode — and "every group expanded" so a user
+		// drowning in groups can fold them away with one keystroke.
+		anyOtherExpanded := false
+		for k, v := range m.expanded {
+			if v && k != m.currentScope {
+				anyOtherExpanded = true
+				break
+			}
 		}
+		if anyOtherExpanded {
+			m.expanded = map[string]bool{m.currentScope: true}
+			m.pushToast("⊙ collapsed all but current", "working")
+		} else {
+			for _, r := range m.visRows {
+				if r.isScope {
+					m.expanded[r.scopeKey] = true
+				}
+			}
+			m.pushToast("⊚ expanded all scopes", "starting")
+		}
+		m.rebuildRows()
 	case "new_claude":
 		return m, m.spawnCmd("claude")
 	case "new_codex":
@@ -1094,22 +1310,39 @@ func (m *dashboardModel) runAction(action string) (tea.Model, tea.Cmd) {
 			return m, killCmd(id)
 		}
 	case "rename":
-		if len(m.sessions) > 0 {
-			s := m.sessions[m.cursor]
+		// Prefer the session under the cursor; fall back to whatever the
+		// screen pane is showing when the cursor is parked on a scope row.
+		var target *ipc.SessionInfo
+		if r := m.currentRow(); r != nil && !r.isScope {
+			target = m.sessionByID(r.session.ID)
+		} else if m.streamID != "" {
+			target = m.sessionByID(m.streamID)
+		}
+		if target != nil {
 			m.renaming = true
-			m.renameID = s.ID
-			m.renameBuf = displayName(s)
+			m.renameID = target.ID
+			m.renameBuf = displayName(*target)
 		}
 	case "jump_pending":
 		if _, latest := pendingSummary(m.sessions, ""); latest != "" {
-			for i, s := range m.sessions {
-				if s.ID == latest {
-					m.cursor = i
-					break
+			// Make sure the pending session's group is open before pointing
+			// the cursor at it; selScope/selSession let rebuildRows land
+			// the cursor on the right row.
+			for _, s := range m.sessions {
+				if s.ID != latest {
+					continue
 				}
+				key := m.scopeKeyOf(s.Cwd)
+				if !m.expanded[key] {
+					m.setScopeExpanded(key, true)
+				}
+				m.selScope = key
+				m.selSession = latest
+				m.rebuildRows()
+				m.syncStream()
+				m.focusScreenPane()
+				break
 			}
-			m.syncStream()
-			m.focus = focusScreen
 		}
 	case "yank":
 		// Hand the held drag selection to the daemon for extraction. Clipboard
@@ -1179,11 +1412,13 @@ func (m *dashboardModel) handleWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd)
 		case tea.MouseWheelUp:
 			if m.cursor > 0 {
 				m.cursor--
+				m.syncSelFromCursor()
 				m.syncStream()
 			}
 		case tea.MouseWheelDown:
-			if m.cursor < len(m.sessions)-1 {
+			if m.cursor < len(m.visRows)-1 {
 				m.cursor++
+				m.syncSelFromCursor()
 				m.syncStream()
 			}
 		}
@@ -1229,8 +1464,11 @@ func (m *dashboardModel) handleScrollKey(msg tea.KeyPressMsg) (tea.Model, tea.Cm
 	return m, nil
 }
 
-// handleSidebarKey handles navigation and dashboard commands while the sidebar
-// has focus.
+// handleSidebarKey handles navigation and dashboard commands while the
+// sidebar has focus. The cursor walks the accordion's visRows (mix of scope
+// headers and session children) — enter on a scope row toggles its
+// collapse; enter on a session row focuses the screen pane. Right and left
+// give vim-ish expand/collapse affordances.
 func (m *dashboardModel) handleSidebarKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
@@ -1239,16 +1477,46 @@ func (m *dashboardModel) handleSidebarKey(msg tea.KeyPressMsg) (tea.Model, tea.C
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
+			m.syncSelFromCursor()
 			m.syncStream()
 		}
 	case "down", "j":
-		if m.cursor < len(m.sessions)-1 {
+		if m.cursor < len(m.visRows)-1 {
 			m.cursor++
+			m.syncSelFromCursor()
 			m.syncStream()
 		}
-	case "enter", "right", "l":
-		if m.streamID != "" && !m.gone {
-			m.focus = focusScreen
+	case "enter", " ", "space":
+		if r := m.currentRow(); r != nil && r.isScope {
+			m.toggleScope(r.scopeKey)
+		} else if m.streamID != "" && !m.gone {
+			m.focusScreenPane()
+		}
+	case "right", "l":
+		if r := m.currentRow(); r != nil && r.isScope {
+			// First press expands a collapsed group; once it's already
+			// open, right behaves like "step into" by moving the cursor
+			// to the first child session and re-streaming it.
+			if !r.expanded {
+				m.setScopeExpanded(r.scopeKey, true)
+			} else if m.cursor+1 < len(m.visRows) && !m.visRows[m.cursor+1].isScope {
+				m.cursor++
+				m.syncSelFromCursor()
+				m.syncStream()
+			}
+		} else if m.streamID != "" && !m.gone {
+			m.focusScreenPane()
+		}
+	case "left", "h":
+		// On a session row, collapse the parent group and park the cursor
+		// on the header. On an already-collapsed header, no-op (matches
+		// how tree views feel).
+		if r := m.currentRow(); r != nil {
+			if !r.isScope {
+				m.setScopeExpanded(r.scopeKey, false)
+			} else if r.expanded {
+				m.setScopeExpanded(r.scopeKey, false)
+			}
 		}
 	}
 	return m, nil
@@ -1316,8 +1584,11 @@ func (m *dashboardModel) indicator(status string) string {
 	}
 }
 
-// detectTransitions compares incoming statuses to the last-seen ones and raises
-// a toast when a session crosses into needs_approval or finishes its turn.
+// detectTransitions compares incoming statuses to the last-seen ones and
+// raises sticky toasts when a session crosses into needs_approval or
+// finishes its turn. The toasts persist (no TTL) and are anchored to the
+// session — expireToasts clears them once the agent is past the prompt or
+// the user focuses its screen pane.
 func (m *dashboardModel) detectTransitions(next []ipc.SessionInfo) {
 	seen := make(map[string]bool, len(next))
 	for _, s := range next {
@@ -1330,10 +1601,10 @@ func (m *dashboardModel) detectTransitions(next []ipc.SessionInfo) {
 				if txt == "" {
 					txt = "needs your approval"
 				}
-				m.pushToast("⚑ "+s.ID[:8]+" — "+txt, "needs_approval")
+				m.pushStickyToast("⚑ "+s.ID[:8]+" — "+txt, "needs_approval", s.ID, "needs_approval")
 			case "waiting_user":
 				if old != "" { // don't toast the very first observation
-					m.pushToast("● "+s.ID[:8]+" — ready for input", "waiting_user")
+					m.pushStickyToast("● "+s.ID[:8]+" — ready for input", "waiting_user", s.ID, "waiting_user")
 				}
 			}
 		}
@@ -1378,9 +1649,60 @@ func (m *dashboardModel) pushToast(text, level string) {
 	}
 }
 
-func (m *dashboardModel) expireToasts() {
+// pushStickyToast adds a notification anchored to a specific session. It
+// persists past TTL — only expireToasts clears it, when the session's status
+// moves out of `status`, the session ends, or its screen pane is focused.
+// Replaces any prior sticky toast for the same session so consecutive
+// status transitions don't pile up multiple lines for one agent.
+func (m *dashboardModel) pushStickyToast(text, level, sessionID, status string) {
+	if sessionID == "" {
+		m.pushToast(text, level)
+		return
+	}
+	// Drop any existing sticky for this session — keeps the strip tidy and
+	// ensures only the latest message wins.
 	kept := m.toasts[:0]
 	for _, t := range m.toasts {
+		if t.sessionID == sessionID {
+			continue
+		}
+		kept = append(kept, t)
+	}
+	m.toasts = kept
+	m.toasts = append(m.toasts, toast{
+		text: text, level: level, born: time.Now(),
+		sessionID: sessionID, status: status,
+	})
+	if len(m.toasts) > 5 {
+		m.toasts = m.toasts[len(m.toasts)-5:]
+	}
+}
+
+// expireToasts drops ephemeral toasts past TTL and clears sticky toasts
+// whose triggering condition no longer applies: the session ended, its
+// status moved out of the prompting state, or the user focused its screen
+// pane. Runs on every tick (and any time the model changes focus).
+func (m *dashboardModel) expireToasts() {
+	cur := map[string]string{}
+	for _, s := range m.sessions {
+		cur[s.ID] = s.Status
+	}
+	kept := m.toasts[:0]
+	for _, t := range m.toasts {
+		if t.sessionID != "" {
+			status, alive := cur[t.sessionID]
+			if !alive {
+				continue
+			}
+			if t.status != "" && status != t.status {
+				continue
+			}
+			if m.streamID == t.sessionID && m.focus == focusScreen {
+				continue
+			}
+			kept = append(kept, t)
+			continue
+		}
 		if time.Since(t.born) < toastTTL {
 			kept = append(kept, t)
 		}
@@ -1398,6 +1720,9 @@ var (
 	rowStyle                = lipgloss.NewStyle().Width(sidebarWidth)
 	selBarStyle             = lipgloss.NewStyle().Foreground(lipgloss.Color("11")) // yellow
 	selBarDimStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))  // grey
+	// scopeNameStyle is the accordion header text style — bold so a group
+	// label is clearly distinct from the indented session rows beneath it.
+	scopeNameStyle = lipgloss.NewStyle().Bold(true)
 )
 
 func (m *dashboardModel) View() tea.View {
@@ -1481,15 +1806,21 @@ func clampLines(s string, w int) string {
 	return strings.Join(lines, "\n")
 }
 
-// renderSidebar draws the narrow left column: one row per session (status glyph
-// + name), the cursor row highlighted, and a count footer. The highlight is
-// reversed when the sidebar has focus, dimmer when the screen pane does.
+// renderSidebar draws the narrow left column as an accordion: one row per
+// scope group (collapse glyph + name + right-justified count) followed by
+// indented session rows whenever the scope is expanded. The cursor lands on
+// whichever row the user navigated to (either kind). The highlight bar is
+// bright yellow when the sidebar has focus, grey when the screen pane does.
 func (m *dashboardModel) renderSidebar() string {
+	// Rebuild on every render so tests that mutate m.sessions directly still
+	// see a coherent accordion. In normal flow rebuildRows already ran from
+	// the sessionsMsg / toggle path, so this is cheap (linear in counts).
+	if len(m.visRows) != m.expectedRowCount() {
+		m.rebuildRows()
+	}
+
 	var rows []string
-	for i, s := range m.sessions {
-		// Mark the selected row with a colored left bar instead of a full-row
-		// highlight: bright yellow when the sidebar has focus, grey when the
-		// screen pane does (selection still visible, but clearly not active).
+	for i, r := range m.visRows {
 		gutter := " "
 		if i == m.cursor {
 			if m.focus == focusSidebar {
@@ -1498,9 +1829,13 @@ func (m *dashboardModel) renderSidebar() string {
 				gutter = selBarDimStyle.Render("▌")
 			}
 		}
-		row := gutter + m.indicator(s.Status) + " " + truncate(displayName(s), sidebarWidth-3)
-		rows = append(rows, rowStyle.Render(row))
+		if r.isScope {
+			rows = append(rows, m.renderScopeRow(gutter, r))
+		} else {
+			rows = append(rows, m.renderSessionRow(gutter, r.session))
+		}
 	}
+
 	if len(rows) == 0 {
 		// Pull the actual bindings so rebound keys read correctly in the hint.
 		newClaude := m.keyForAction("new_claude")
@@ -1513,29 +1848,121 @@ func (m *dashboardModel) renderSidebar() string {
 		)
 	}
 
-	// The sidebar carries the app title at the top, then a scope line, then the
-	// session list, then a footer at the bottom. errMsg (a daemon problem) rides
-	// under the title.
-	header := titleStyle.Render("codebridge") + "\n" + m.scopeLabel()
+	// The sidebar carries the app title at the top, then the accordion, then
+	// the global status-tally row at the bottom. errMsg (a daemon problem)
+	// rides under the title.
+	header := titleStyle.Render("codebridge")
 	if m.errMsg != "" {
 		header += "\n" + statusStyle["needs_approval"].Render(truncate("daemon: "+m.errMsg, sidebarWidth-1))
 	}
 	headerH := strings.Count(header, "\n") + 1
 
 	// The list is a window that scrolls to keep the cursor visible. It gets
-	// whatever height is left after the header, a blank spacer on each side, and
-	// the footer row.
+	// whatever height is left after the header, a blank spacer on each side,
+	// and the global status-tally row.
 	maxRows := maxInt(m.paneH-headerH-3, 1)
 	top := clampTop(m.cursor, m.sidebarTop, len(rows), maxRows)
 	m.sidebarTop = top
 	end := minInt(top+maxRows, len(rows))
 	list := strings.Join(rows[top:end], "\n")
-	footer := helpStyle.Render(fmt.Sprintf(" %d session(s)", len(m.sessions)))
-	if len(m.sessions) > maxRows {
-		footer = helpStyle.Render(fmt.Sprintf(" %d-%d of %d", top+1, end, len(m.sessions)))
-	}
-	content := firstLines(lipgloss.JoinVertical(lipgloss.Left, header, "", list, "", footer), maxInt(m.paneH, 1))
+	counts := m.renderStatusCounts()
+	content := firstLines(lipgloss.JoinVertical(lipgloss.Left, header, "", list, "", counts), maxInt(m.paneH, 1))
 	return lipgloss.NewStyle().Width(sidebarWidth).Height(maxInt(m.paneH, 1)).Render(content)
+}
+
+// expectedRowCount is what len(visRows) would be after a fresh rebuildRows
+// over the current m.sessions and m.expanded. Used as a cheap "is visRows
+// out of date?" check so render-time rebuilds skip the work when the cached
+// rows still match — and so tests that poke m.sessions directly still pick
+// up a fresh accordion without going through the sessionsMsg handler.
+func (m *dashboardModel) expectedRowCount() int {
+	seen := map[string]bool{}
+	n := 0
+	for _, s := range m.sessions {
+		k := m.scopeKeyOf(s.Cwd)
+		if !seen[k] {
+			seen[k] = true
+			n++ // scope header
+		}
+		if m.expanded[k] {
+			n++ // session row under an expanded header
+		}
+	}
+	if m.currentScope != "" && !seen[m.currentScope] {
+		n++ // synthetic empty header for the launch-cwd group
+	}
+	return n
+}
+
+// renderScopeRow is one accordion header: cursor gutter, collapse glyph,
+// scope display name, and a right-justified session count. Layout is
+// computed in display columns (not bytes) so the count stays flush to the
+// right edge regardless of ANSI styling in the name.
+func (m *dashboardModel) renderScopeRow(gutter string, r visRow) string {
+	glyph := "▶"
+	if r.expanded {
+		glyph = "▼"
+	}
+	countStr := fmt.Sprintf("%d", r.scopeCount)
+	// Budget: gutter(1) + glyph(1) + " "(1) + name + " "(>=1) + count
+	nameMax := sidebarWidth - 3 - len(countStr) - 1
+	if nameMax < 1 {
+		nameMax = 1
+	}
+	name := truncate(scopeDisplayName(r.scopeKey), nameMax)
+	used := 1 + 1 + 1 + ansi.StringWidth(name) // gutter + glyph + space + name
+	pad := sidebarWidth - used - len(countStr)
+	if pad < 1 {
+		pad = 1
+	}
+	return gutter + helpStyle.Render(glyph) + " " +
+		scopeNameStyle.Render(name) +
+		strings.Repeat(" ", pad) +
+		helpStyle.Render(countStr)
+}
+
+// renderSessionRow is one child of an expanded scope: indented by one cell
+// to make the hierarchy obvious, then the same status-glyph + name layout
+// the original flat sidebar used.
+func (m *dashboardModel) renderSessionRow(gutter string, s ipc.SessionInfo) string {
+	nameMax := sidebarWidth - 4 // gutter + indent + indicator + space
+	suffix := ""
+	if m.isWorktreeCached(s.Cwd) {
+		suffix = " " + helpStyle.Render("⎇")
+		nameMax -= 2
+	}
+	row := gutter + " " + m.indicator(s.Status) + " " + truncate(displayName(s), nameMax) + suffix
+	return rowStyle.Render(row)
+}
+
+// renderStatusCounts is a one-row tally of sessions by status, counted across
+// every session the daemon knows about — the sidebar is globally scoped, so
+// the bottom strip is always a "what's happening across every agent"
+// indicator. Order is scan-priority: progressing → needs approval → turn
+// complete → idle. Glyphs match the per-row indicators; "working" uses a
+// static ⟳ instead of the animated spinner so a row of "0 working" doesn't
+// flicker an irrelevant animation.
+func (m *dashboardModel) renderStatusCounts() string {
+	var working, approval, waiting, idle int
+	for _, s := range m.sessions {
+		switch s.Status {
+		case "working":
+			working++
+		case "needs_approval":
+			approval++
+		case "waiting_user":
+			waiting++
+		case "idle":
+			idle++
+		}
+	}
+	cell := func(status, glyph string, n int) string {
+		return statusStyle[status].Render(glyph) + helpStyle.Render(fmt.Sprintf(" %d", n))
+	}
+	return " " + cell("working", "⟳", working) +
+		" " + cell("needs_approval", "⚑", approval) +
+		" " + cell("waiting_user", "●", waiting) +
+		" " + cell("idle", "●", idle)
 }
 
 // selectionBG is the 256-color background applied to selected cells. We use a
@@ -1721,7 +2148,7 @@ func (m *dashboardModel) renderPrefixPanel(width int) string {
 		{kbd("h"), "focus sidebar"},
 		{b("focus_screen"), "focus screen"},
 		{b("scroll"), "scrollback"},
-		{b("scope_toggle"), "toggle scope"},
+		{b("scope_toggle"), "fold scopes"},
 		{b("jump_pending"), "jump pending"},
 		{b("newline"), "newline"},
 		{b("yank"), "yank selection"},
@@ -1763,14 +2190,16 @@ func padDisplayWidth(s string, n int) string {
 	return s + strings.Repeat(" ", n-w)
 }
 
-// chromeLines collects the ephemeral status rows (toast, hooks banner, rename
-// input) in top-to-bottom order. Returns nil when nothing's active so the
-// caller can skip the overlay entirely.
+// chromeLines collects the ephemeral status rows (one toast per line, then
+// hooks banner, then rename input) in top-to-bottom order. Returns nil when
+// nothing's active so the caller can skip the overlay entirely.
+//
+// Toasts come first and one-per-line on purpose: each row is independently
+// hit-testable in handleMouseClick so the user can click a sticky toast to
+// jump straight to the session that raised it.
 func (m *dashboardModel) chromeLines() []string {
 	var lines []string
-	if t := m.toastLine(); t != "" {
-		lines = append(lines, t)
-	}
+	lines = append(lines, m.toastLines()...)
 	if !m.hooksOK {
 		lines = append(lines, statusStyle["waiting_user"].Render("⚠ hooks not installed — run: cb install-hooks"))
 	}
@@ -1864,20 +2293,91 @@ func overlayBottom(body, panel string, colMin, colMax int) string {
 	return strings.Join(bl, "\n")
 }
 
-// toastLine renders any active toasts as a single compact line beneath the body.
-func (m *dashboardModel) toastLine() string {
+// toastLines renders each active toast as its own row (oldest at the top).
+// Sticky toasts get a subtle ›-prefix and underline so they read as actionable
+// (clickable) rather than passive notifications. Ephemeral toasts render
+// plainly so they don't pretend to be interactive.
+func (m *dashboardModel) toastLines() []string {
 	if len(m.toasts) == 0 {
-		return ""
+		return nil
 	}
-	parts := make([]string, 0, len(m.toasts))
-	for _, t := range m.toasts {
+	out := make([]string, len(m.toasts))
+	for i, t := range m.toasts {
 		style := helpStyle
 		if s, ok := statusStyle[t.level]; ok {
 			style = s
 		}
-		parts = append(parts, style.Render(t.text))
+		if t.sessionID != "" {
+			out[i] = style.Underline(true).Render("› "+t.text) + helpStyle.Render(" (click)")
+		} else {
+			out[i] = style.Render(t.text)
+		}
 	}
-	return strings.Join(parts, helpStyle.Render("  ·  "))
+	return out
+}
+
+// toastSessionAt returns the sessionID anchored to the sticky toast under
+// the click point (x,y in terminal coordinates), or "" when the click misses.
+// Toasts are the first len(m.toasts) entries of chromeLines and are overlaid
+// at the bottom of the body, so the math is: chromeTop = m.h - len(chrome);
+// toast i lives at chromeTop+i and spans its rendered display width.
+func (m *dashboardModel) toastSessionAt(x, y int) string {
+	if len(m.toasts) == 0 {
+		return ""
+	}
+	chrome := m.chromeLines()
+	if len(chrome) == 0 {
+		return ""
+	}
+	chromeTop := m.h - len(chrome)
+	if y < chromeTop {
+		return ""
+	}
+	i := y - chromeTop
+	if i < 0 || i >= len(m.toasts) {
+		return ""
+	}
+	t := m.toasts[i]
+	if t.sessionID == "" {
+		return ""
+	}
+	// Ensure the click landed within the toast's horizontal extent — clicks
+	// past the text drop through to whatever's behind it.
+	width := ansi.StringWidth(chrome[i])
+	if x < 0 || x >= width {
+		return ""
+	}
+	return t.sessionID
+}
+
+// focusScreenPane moves focus to the screen pane and immediately drops any
+// sticky toast whose session is now under view. The 500ms tick would do this
+// anyway, but doing it inline keeps a toast from lingering after a keystroke
+// or click that obviously dismisses it.
+func (m *dashboardModel) focusScreenPane() {
+	m.focus = focusScreen
+	m.expireToasts()
+}
+
+// focusSession selects the named session and focuses the screen pane on it,
+// opening its scope group along the way. Used by sticky-toast clicks so the
+// user can act on a prompt without leaving the mouse.
+func (m *dashboardModel) focusSession(id string) {
+	for _, s := range m.sessions {
+		if s.ID != id {
+			continue
+		}
+		key := m.scopeKeyOf(s.Cwd)
+		if !m.expanded[key] {
+			m.setScopeExpanded(key, true)
+		}
+		m.selScope = key
+		m.selSession = id
+		m.rebuildRows()
+		m.syncStream()
+		m.focusScreenPane()
+		return
+	}
 }
 
 // truncate shortens s to at most n runes, adding an ellipsis when cut. It

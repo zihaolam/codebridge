@@ -3,11 +3,7 @@ package tui
 import (
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
 	"testing"
-
-	"codebridge/internal/ipc"
 )
 
 func TestPathWithin(t *testing.T) {
@@ -30,39 +26,6 @@ func TestPathWithin(t *testing.T) {
 			t.Errorf("pathWithin(%q, %q) = %v, want %v", c.root, c.path, got, c.want)
 		}
 	}
-}
-
-func TestVisibleSessions(t *testing.T) {
-	all := []ipc.SessionInfo{
-		{ID: "1", Cwd: "/repo"},
-		{ID: "2", Cwd: "/repo/internal"},
-		{ID: "3", Cwd: "/other"},
-		{ID: "4", Cwd: "/repo-extra"}, // name-prefix sibling, must not leak in
-	}
-
-	scoped := &dashboardModel{scopeRoot: "/repo"}
-	got := scoped.visibleSessions(all)
-	if len(got) != 2 || got[0].ID != "1" || got[1].ID != "2" {
-		t.Errorf("scoped visibleSessions = %v, want sessions 1 and 2", ids(got))
-	}
-
-	showingAll := &dashboardModel{scopeRoot: "/repo", showAll: true}
-	if got := showingAll.visibleSessions(all); len(got) != len(all) {
-		t.Errorf("showAll visibleSessions = %v, want all %d", ids(got), len(all))
-	}
-
-	noScope := &dashboardModel{scopeRoot: ""}
-	if got := noScope.visibleSessions(all); len(got) != len(all) {
-		t.Errorf("empty-scope visibleSessions = %v, want all %d", ids(got), len(all))
-	}
-}
-
-func ids(ss []ipc.SessionInfo) []string {
-	out := make([]string, len(ss))
-	for i, s := range ss {
-		out[i] = s.ID
-	}
-	return out
 }
 
 // repoLayout builds a fake repo under a temp dir: a main checkout with a real
@@ -135,51 +98,3 @@ func TestDeriveScopeWorktreeUsesMainRoot(t *testing.T) {
 	}
 }
 
-// TestInScopeCaseInsensitiveFS guards the bug where a dashboard launched at a
-// lowercased path (e.g. zsh tab-completing into /Users/zihaolam/projects/tcg
-// rather than the on-disk /Users/zihaolam/Projects/tcg) failed to match worktree
-// sessions whose .git pointed back to the canonical-cased main repo, even
-// though both refer to the same inode on APFS/HFS+.
-func TestInScopeCaseInsensitiveFS(t *testing.T) {
-	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
-		t.Skip("case-insensitive filesystem assumption only holds on darwin/windows")
-	}
-	main, wt := repoLayout(t)
-	lowerMain := strings.ToLower(main)
-	if lowerMain == main {
-		t.Skip("temp dir already lowercase; case-mismatch not exercised")
-	}
-	// Launching from the lowercased main path should still pick up the worktree
-	// session whose cwd carries the canonical case.
-	common, root := deriveScope(lowerMain)
-	m := &dashboardModel{scopeCommon: common, scopeRoot: root, repoCache: map[string]string{}}
-	got := m.visibleSessions([]ipc.SessionInfo{
-		{ID: "wt", Cwd: wt},
-		{ID: "outside", Cwd: t.TempDir()},
-	})
-	if len(got) != 1 || got[0].ID != "wt" {
-		t.Fatalf("visibleSessions from lowercased main = %v, want only [wt]", ids(got))
-	}
-}
-
-func TestInScopeMatchesWorktreeSessions(t *testing.T) {
-	main, wt := repoLayout(t)
-	common, root := deriveScope(main)
-	m := &dashboardModel{scopeCommon: common, scopeRoot: root, repoCache: map[string]string{}}
-
-	all := []ipc.SessionInfo{
-		{ID: "main", Cwd: main},
-		{ID: "wt", Cwd: wt},
-		{ID: "wtsub", Cwd: filepath.Join(wt, "internal")},
-		{ID: "outside", Cwd: t.TempDir()},
-	}
-	got := m.visibleSessions(all)
-	if len(got) != 3 {
-		t.Fatalf("visibleSessions = %v, want main, wt, wtsub", ids(got))
-	}
-	for _, s := range got {
-		if s.ID == "outside" {
-			t.Errorf("out-of-repo session leaked into scope: %v", ids(got))
-		}
-	}
-}

@@ -46,7 +46,7 @@ var Actions = []Action{
 	{Key: "rename", Label: "rename session", Default: "r"},
 	{Key: "jump_pending", Label: "jump to pending approval", Default: "g"},
 	{Key: "yank", Label: "yank selection", Default: "y"},
-	{Key: "scope_toggle", Label: "toggle this-repo / all", Default: "a"},
+	{Key: "scope_toggle", Label: "fold/unfold all scopes", Default: "a"},
 	{Key: "focus_screen", Label: "focus screen pane", Default: "l"},
 	{Key: "scroll", Label: "enter scroll mode", Default: "["},
 	{Key: "newline", Label: "insert newline in session", Default: "enter"},

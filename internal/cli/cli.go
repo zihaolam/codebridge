@@ -23,8 +23,9 @@ func Run(args []string) error {
 	}
 	switch args[0] {
 	case "--all", "-a":
-		// Launch the dashboard unscoped: show sessions from every directory
-		// rather than just the current repo. (Toggle in-app with prefix a.)
+		// Historically launched the dashboard unscoped. The sidebar is now
+		// always globally scoped (every session, grouped by cwd) so this
+		// flag is a no-op kept for backward compatibility.
 		return runDashboard(true)
 	case "demo":
 		return runDemo(args[1:])
@@ -104,12 +105,10 @@ func runCtl(args []string) error {
 }
 
 // runDashboard runs the unified sidebar + live-screen view until the user
-// quits. It auto-starts the daemon if it isn't already running. Unless `all` is
-// set, the session list is scoped to the git repo containing the current
-// directory — including any of its linked worktrees, which share one scope.
-// Sessions started elsewhere are hidden until you toggle with prefix a. The
-// launch cwd is always passed so the in-app toggle works even with --all; the
-// TUI derives the scope from it.
+// quits. It auto-starts the daemon if it isn't already running. The sidebar
+// is always globally scoped (every session, grouped by cwd-derived scope key
+// in an accordion); the launch cwd is passed so the TUI can expand the
+// matching group by default. The `all` flag is a backward-compat no-op.
 func runDashboard(all bool) error {
 	if err := ensureDaemon(); err != nil {
 		return err
