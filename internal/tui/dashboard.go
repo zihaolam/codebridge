@@ -958,15 +958,19 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus = focusSidebar // can't type into a dead session
 				m.scrollMode = false
 			} else {
-				// Lock the view while a selection is held: every new line the
-				// session emits grows scrollMax by one, which on a live view
-				// (scrollOff == 0) would push the selected lines up off the
-				// pane within milliseconds for an actively streaming Claude.
-				// Bumping scrollOff by the same delta keeps the highlighted
-				// content pinned where the user dragged it; the user resumes
-				// live by clearing the selection (any new click clears it)
-				// and then scrolling down or pressing G in scroll mode.
-				if m.selStart != m.selEnd && msg.max > m.scrollMax {
+				// Lock the view while a selection is held or the user is
+				// browsing scrollback: every new line the session emits grows
+				// scrollMax by one, which would drift the rendered window up
+				// toward the new bottom within milliseconds for an actively
+				// streaming Claude. Bumping scrollOff by the same delta keeps
+				// the content pinned where the user parked it. From a selection
+				// the user resumes live by clearing the selection (any new
+				// click clears it) and then scrolling down or pressing G in
+				// scroll mode; from scroll mode they resume live by pressing G
+				// (which sets scrollOff to 0 so this branch stops pinning) or
+				// exiting scroll mode entirely.
+				pin := m.selStart != m.selEnd || (m.scrollMode && m.scrollOff > 0)
+				if pin && msg.max > m.scrollMax {
 					m.scrollOff += msg.max - m.scrollMax
 					if m.scrollOff > msg.max {
 						m.scrollOff = msg.max
