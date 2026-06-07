@@ -11,6 +11,31 @@ It is a single self-contained Go binary (`cb`). It owns each session's pseudo-te
 directly — **no tmux dependency** — and a long-lived daemon keeps your sessions alive even
 when the UI is closed.
 
+![codebridge dashboard](docs/dashboard.png)
+
+## Why codebridge
+
+The reason I built this: I wanted to run **many agents at once** without losing track of
+which one needs me.
+
+- **One view, every session, live status.** Each session in the sidebar shows whether it's
+  *working*, *waiting on you*, *needs approval*, or *ended* — sourced from Claude Code and
+  Codex hooks, not from scraping the terminal. Approval prompts surface as toasts the
+  moment the agent fires the hook, so a `claude` in another repo asking for permission
+  doesn't sit silently while you're typing into a different one. `Ctrl-a g` jumps straight
+  to the most-recently-pending session.
+- **No more juggling tabs/windows.** Running five `claude` sessions used to mean five
+  terminal tabs, each one out of sight until you `Cmd-tab` to it. Codebridge collapses
+  that into one tab: a sidebar of sessions on the left, the selected session's live
+  interactive screen on the right. You spawn, switch, and kill sessions from inside cb;
+  the host terminal stays at one window.
+- **Sessions outlive your terminal.** A long-lived daemon owns each PTY, so closing the
+  terminal window, killing the cb client, or quitting your terminal emulator does **not**
+  kill your `claude` / `codex` processes — the daemon, not your shell, is the session's
+  parent. They keep working in the background; opening cb in any new tab or window
+  re-attaches to exactly the same live screens. Spawn a session in one tab, close that
+  tab, and pick it up from another tab later — the work just keeps running.
+
 ## How it works
 
 ```
