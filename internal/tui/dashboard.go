@@ -980,13 +980,23 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.scrollMode = true
 					}
 				}
-				m.screen = msg.screen
-				m.cursorX = msg.cx
-				m.cursorY = msg.cy
 				m.scrollMax = msg.max
 				if m.scrollOff > m.scrollMax {
 					m.scrollOff = m.scrollMax
 					m.sendScroll()
+				}
+				// Only apply the frame when it was rendered at our current
+				// scroll position. Right after a pin bump (or any user-driven
+				// scroll) the daemon's in-flight frames carry the *old*
+				// offset; rendering them would shift the pane by the delta and
+				// snap back on the next frame — that's the flicker. Skipping
+				// them keeps the previously-rendered pinned frame on display
+				// until the daemon catches up and emits a frame at the new
+				// offset (one ~33ms tick later).
+				if msg.offset == m.scrollOff {
+					m.screen = msg.screen
+					m.cursorX = msg.cx
+					m.cursorY = msg.cy
 				}
 			}
 		}
