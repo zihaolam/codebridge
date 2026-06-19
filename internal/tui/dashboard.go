@@ -1600,7 +1600,7 @@ func (m *dashboardModel) handleScrollKey(msg tea.KeyPressMsg) (tea.Model, tea.Cm
 	case "g", "home":
 		m.scrollBy(m.scrollMax) // oldest
 	case "G", "end":
-		m.scrollBy(-m.scrollMax) // back to live
+		m.exitScroll() // back to live
 	case "esc", "q", "ctrl+c":
 		m.exitScroll()
 	}

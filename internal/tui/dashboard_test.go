@@ -496,6 +496,22 @@ func TestWheelScrollsPaneAndExitsAtBottom(t *testing.T) {
 	}
 }
 
+func TestShiftGExitsScrollMode(t *testing.T) {
+	m := &dashboardModel{
+		streamID:   "live",
+		scrollMode: true,
+		scrollOff:  12,
+		scrollMax:  20,
+	}
+	m.handleScrollKey(tea.KeyPressMsg{Code: 'G', Text: "G"})
+	if m.scrollOff != 0 {
+		t.Fatalf("scrollOff = %d, want 0 after Shift+G", m.scrollOff)
+	}
+	if m.scrollMode {
+		t.Fatal("expected Shift+G to leave scroll mode")
+	}
+}
+
 func TestPushToastCap(t *testing.T) {
 	m := &dashboardModel{}
 	for i := 0; i < 9; i++ {
