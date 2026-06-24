@@ -15,7 +15,7 @@ import (
 // ProtocolVersion is bumped whenever the daemon/client wire protocol changes.
 // The client checks it on connect so a stale daemon (e.g. left running across a
 // rebuild) fails loudly instead of silently dropping attach/input messages.
-const ProtocolVersion = 6
+const ProtocolVersion = 7
 
 // Dir is the per-user state directory for cb.
 func Dir() string {
@@ -89,7 +89,7 @@ type SessionInfo struct {
 
 // StreamUp is a client→daemon message sent on an attached connection.
 type StreamUp struct {
-	Type string `json:"type"`           // "input" | "paste" | "resize" | "detach" | "scroll"
+	Type string `json:"type"`           // "input" | "paste" | "resize" | "detach" | "scroll" | "interrupt"
 	Data string `json:"data,omitempty"` // base64-encoded input/paste bytes
 	Rows int    `json:"rows,omitempty"`
 	Cols int    `json:"cols,omitempty"`

@@ -785,6 +785,15 @@ func (m *dashboardModel) sendInput(b []byte) {
 	}
 }
 
+// sendInterrupt records user-driven turn cancellation. Claude Code and Codex do
+// not always emit a Stop/Notification hook when Esc or Ctrl-C interrupts a turn,
+// so the daemon needs a client-side signal to clear the working spinner.
+func (m *dashboardModel) sendInterrupt() {
+	if m.conn != nil {
+		_ = ipc.WriteJSON(m.conn, ipc.StreamUp{Type: "interrupt"})
+	}
+}
+
 // sendPaste forwards pasted text as a single paste event so the daemon can
 // deliver it to the session as one bracketed paste.
 func (m *dashboardModel) sendPaste(text string) {
@@ -1304,10 +1313,17 @@ func (m *dashboardModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		// so here we only forward genuine key presses as raw bytes.
 		if b := keyToBytes(msg); b != nil {
 			m.sendInput(b)
+			if isInterruptKey(msg) {
+				m.sendInterrupt()
+			}
 		}
 		return m, nil
 	}
 	return m.handleSidebarKey(msg)
+}
+
+func isInterruptKey(msg tea.KeyPressMsg) bool {
+	return msg.Code == tea.KeyEscape || (msg.Code == 'c' && msg.Mod&tea.ModCtrl != 0)
 }
 
 // handlePrefix handles the key following the prefix chord. System keys

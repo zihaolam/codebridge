@@ -110,6 +110,10 @@ func (d *Daemon) attach(conn net.Conn, sc *bufio.Scanner, req ipc.Request) {
 			}
 		case "scroll":
 			scrollOff.Store(int64(up.Offset))
+		case "interrupt":
+			if st, ok := statusForClientInterrupt(s.Status()); ok {
+				s.SetStatus(st, "")
+			}
 		case "detach":
 			closeStop()
 			return

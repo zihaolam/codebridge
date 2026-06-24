@@ -29,3 +29,23 @@ func TestStatusForEvent_NotificationSplit(t *testing.T) {
 		})
 	}
 }
+
+func TestStatusForClientInterrupt(t *testing.T) {
+	cases := []struct {
+		current session.Status
+		want    session.Status
+		changed bool
+	}{
+		{session.StatusWorking, session.StatusWaitingUser, true},
+		{session.StatusNeedsApproval, session.StatusWaitingUser, true},
+		{session.StatusWaitingUser, session.StatusWaitingUser, false},
+		{session.StatusIdle, session.StatusIdle, false},
+		{session.StatusEnded, session.StatusEnded, false},
+	}
+	for _, c := range cases {
+		got, changed := statusForClientInterrupt(c.current)
+		if got != c.want || changed != c.changed {
+			t.Fatalf("statusForClientInterrupt(%s) = (%s, %v), want (%s, %v)", c.current, got, changed, c.want, c.changed)
+		}
+	}
+}

@@ -301,6 +301,15 @@ func statusForEvent(event string, p ipc.HookPayload) (session.Status, string) {
 	}
 }
 
+func statusForClientInterrupt(current session.Status) (session.Status, bool) {
+	switch current {
+	case session.StatusWorking, session.StatusNeedsApproval:
+		return session.StatusWaitingUser, true
+	default:
+		return current, false
+	}
+}
+
 // isApprovalMessage reports whether a Notification message is asking the user to
 // approve/permit an action (as opposed to the generic idle "waiting for input"
 // nudge). Claude Code's permission prompts read like "Claude needs your
