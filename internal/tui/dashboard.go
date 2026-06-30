@@ -3,8 +3,11 @@ package tui
 import (
 	"bufio"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -165,6 +168,16 @@ type dashboardModel struct {
 	scrollOff  int
 	scrollMax  int
 	sidebarTop int
+
+	// sidebarCache memoizes the rendered sidebar between frames. The screen pane
+	// streams at up to 30fps, but the sidebar only changes on the 500ms list
+	// poll, the spinner tick, or a cursor/focus/scope move — so we hash the
+	// inputs that affect it (sidebarSignature) and reuse the last string when
+	// they're unchanged, instead of re-styling every accordion row on every
+	// screen frame.
+	sidebarCache string
+	sidebarSig   uint64
+	sidebarValid bool
 
 	// In-app drag selection over the screen pane. Anchored in virtual-line space
 	// (scrollback index + visible-grid index) so the selection stays bound to its
@@ -2038,6 +2051,16 @@ func (m *dashboardModel) renderSidebar() string {
 		m.rebuildRows()
 	}
 
+	// Skip the (relatively expensive) per-row styling when nothing the sidebar
+	// depends on has changed since the last render — the screen pane streams far
+	// faster than the sidebar's inputs move. sidebarTop is deliberately not in
+	// the signature: clampTop is idempotent, so it only changes when the cursor,
+	// session set, or pane height does, all of which already invalidate the hash.
+	sig := m.sidebarSignature()
+	if m.sidebarValid && sig == m.sidebarSig {
+		return m.sidebarCache
+	}
+
 	var rows []string
 	// cursorRow is the index of the highlighted row inside `rows`. It
 	// differs from m.cursor (an index into m.visRows) once we interleave
@@ -2103,7 +2126,63 @@ func (m *dashboardModel) renderSidebar() string {
 	list := strings.Join(listRows, "\n")
 	counts := m.renderStatusCounts()
 	content := firstLines(lipgloss.JoinVertical(lipgloss.Left, header, "", list, "", counts), maxInt(m.paneH, 1))
-	return lipgloss.NewStyle().Width(sidebarWidth).Height(maxInt(m.paneH, 1)).Render(content)
+	out := lipgloss.NewStyle().Width(sidebarWidth).Height(maxInt(m.paneH, 1)).Render(content)
+	m.sidebarSig, m.sidebarValid, m.sidebarCache = sig, true, out
+	return out
+}
+
+// sidebarSignature hashes everything renderSidebar reads, so an unchanged hash
+// means the cached string is still correct and re-styling can be skipped. It
+// covers every session's id/status/name/cwd (rows + the bottom status tally +
+// the worktree glyph), the accordion's per-scope expansion and counts, and the
+// scalar inputs (focus, cursor, pane height, mode, scope, daemon error). The
+// spinner frame (m.spin) is folded in only when a session is actually working —
+// otherwise an idle sidebar would needlessly miss the cache on every 500ms tick.
+func (m *dashboardModel) sidebarSignature() uint64 {
+	h := fnv.New64a()
+	var b [8]byte
+	wu := func(x uint64) { binary.LittleEndian.PutUint64(b[:], x); h.Write(b[:]) }
+	wi := func(x int) { wu(uint64(int64(x))) }
+	ws := func(s string) { io.WriteString(h, s); h.Write([]byte{0}) }
+	wb := func(v bool) {
+		if v {
+			wu(1)
+		} else {
+			wu(0)
+		}
+	}
+
+	wi(int(m.focus))
+	wi(m.cursor)
+	wi(m.paneH)
+	wb(m.accordionMode)
+	ws(m.currentScope)
+	ws(m.errMsg)
+
+	working := false
+	for i := range m.sessions {
+		s := &m.sessions[i]
+		ws(s.ID)
+		ws(s.Status)
+		ws(s.Name)
+		ws(s.Cwd)
+		if s.Status == "working" {
+			working = true
+		}
+	}
+	// visRows carries the accordion's expansion + ordering (which scopes are
+	// open, header counts) on top of the raw session set above.
+	for _, r := range m.visRows {
+		if r.isScope {
+			ws(r.scopeKey)
+			wb(r.expanded)
+			wi(r.scopeCount)
+		}
+	}
+	if working {
+		wi(m.spin)
+	}
+	return h.Sum64()
 }
 
 // expectedRowCount is what len(visRows) would be after a fresh rebuildRows

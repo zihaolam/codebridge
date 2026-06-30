@@ -45,6 +45,21 @@ const emuPad = 1
 // closing it can't permanently freeze the view.
 const syncWatchdog = 150 * time.Millisecond
 
+// liveFrame memoizes the live (offset-0) render so every client attached to a
+// session — and the 30fps frame ticker driving each — shares one render instead
+// of each re-rendering the same screen every tick. It's keyed by gen (below):
+// an unchanged gen means the cached frame is still current and no work happens.
+type liveFrame struct {
+	mu      sync.Mutex
+	gen     uint64
+	valid   bool
+	screen  string
+	cursorX int
+	cursorY int
+	maxOff  int
+	alt     bool
+}
+
 // Session couples a PTY-backed child process with its emulator and status.
 type Session struct {
 	ID   string
@@ -54,6 +69,15 @@ type Session struct {
 	ptmx *os.File
 	cmd  *exec.Cmd
 	emu  *vt.SafeEmulator
+
+	// gen advances on every screen-changing write (PTY output, resize). It's the
+	// cheap dirty signal that gates rendering: the frame ticker compares it
+	// against the cached frame's gen and skips the (expensive) render entirely
+	// when nothing has changed since the last one. Conservatively bumped — a
+	// write that doesn't visibly change the screen still bumps it, which only
+	// costs one redundant render that the per-client dedup then drops.
+	gen atomic.Uint64
+	fc  liveFrame
 
 	// syncStartNanos is the unix-nano timestamp when the child entered DEC 2026
 	// (Synchronized Output Mode), or 0 when it isn't in a sync block. Set from
@@ -163,6 +187,7 @@ func (s *Session) readLoop() {
 		n, err := s.ptmx.Read(buf)
 		if n > 0 {
 			_, _ = s.emu.Write(buf[:n])
+			s.gen.Add(1) // mark the screen dirty so the next tick re-renders
 		}
 		if err != nil {
 			return // EOF / closed: child has gone away
@@ -219,6 +244,7 @@ func (s *Session) Resize(rows, cols int) error {
 		return err
 	}
 	s.emu.Resize(cols+emuPad, rows)
+	s.gen.Add(1) // the grid changed shape — invalidate the cached frame
 	s.mu.Lock()
 	s.rows, s.cols = rows, cols
 	s.mu.Unlock()
@@ -302,6 +328,34 @@ func (s *Session) RenderScroll(offset int) (screen string, clamped int, maxOffse
 		}
 	}
 	return strings.Join(lines, "\n"), offset, maxOffset
+}
+
+// LiveFrame returns the live (offset-0) screen, cursor, scrollback length and
+// alt-screen flag, rendering only when the session changed since the last call.
+// The result is memoized by gen — the dirty counter bumped on every
+// screen-changing write — so N clients attached to one session, each ticking at
+// 30fps, share a single render instead of each re-rendering an idle screen every
+// tick. Clients browsing scrollback (offset > 0) bypass this and call
+// RenderScroll directly, since their window depends on a per-client offset.
+func (s *Session) LiveFrame() (screen string, cursorX, cursorY, maxOffset int, alt bool) {
+	g := s.gen.Load()
+	s.fc.mu.Lock()
+	defer s.fc.mu.Unlock()
+	if s.fc.valid && s.fc.gen == g {
+		return s.fc.screen, s.fc.cursorX, s.fc.cursorY, s.fc.maxOff, s.fc.alt
+	}
+	screen, _, maxOffset = s.RenderScroll(0)
+	cursorX, cursorY = s.Cursor()
+	alt = s.IsAltScreen()
+	// Assign fields individually — replacing the whole struct would copy over
+	// the held mutex. gen is read before rendering, so a write landing mid-render
+	// just leaves gen ahead of fc.gen and forces a re-render next tick (never a
+	// missed update).
+	s.fc.gen, s.fc.valid = g, true
+	s.fc.screen = screen
+	s.fc.cursorX, s.fc.cursorY = cursorX, cursorY
+	s.fc.maxOff, s.fc.alt = maxOffset, alt
+	return
 }
 
 // ExtractText returns plain text for the virtual-buffer range

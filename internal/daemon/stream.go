@@ -67,8 +67,25 @@ func (d *Daemon) attach(conn net.Conn, sc *bufio.Scanner, req ipc.Request) {
 				if s.IsSyncBlock() {
 					continue
 				}
-				screen, off, maxOff := s.RenderScroll(int(scrollOff.Load()))
-				cx, cy := s.Cursor()
+				// Offset 0 (live, the common case) goes through LiveFrame, which
+				// renders at most once per change and shares that render across
+				// every client attached to this session. Only a client actively
+				// browsing scrollback (offset > 0) needs a bespoke render of its
+				// own window.
+				var (
+					screen string
+					off    int
+					maxOff int
+					cx, cy int
+					alt    bool
+				)
+				if so := int(scrollOff.Load()); so == 0 {
+					screen, cx, cy, maxOff, alt = s.LiveFrame()
+				} else {
+					screen, off, maxOff = s.RenderScroll(so)
+					cx, cy = s.Cursor()
+					alt = s.IsAltScreen()
+				}
 				if screen != last || off != lastOff || maxOff != lastMax || cx != lastCx || cy != lastCy {
 					last, lastOff, lastMax = screen, off, maxOff
 					lastCx, lastCy = cx, cy
@@ -77,7 +94,7 @@ func (d *Daemon) attach(conn net.Conn, sc *bufio.Scanner, req ipc.Request) {
 						Screen:    screen,
 						CursorX:   cx,
 						CursorY:   cy,
-						Alt:       s.IsAltScreen(),
+						Alt:       alt,
 						Offset:    off,
 						MaxOffset: maxOff,
 					})

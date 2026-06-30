@@ -32,6 +32,47 @@ func TestTrimColsStyledRule(t *testing.T) {
 	}
 }
 
+// TestLiveFrameCachesUntilDirty verifies the render cache is gated on the gen
+// dirty counter: a second call with no gen bump must return the same frame even
+// if the emulator's buffer has secretly changed (proving the render was skipped,
+// not just deduped), and a gen bump must surface the new content. This is what
+// lets many clients attached to one session share a single render per change
+// instead of each re-rendering an idle screen 30× a second.
+func TestLiveFrameCachesUntilDirty(t *testing.T) {
+	const cols, rows = 20, 4
+	s := &Session{
+		emu:  vt.NewSafeEmulator(cols+emuPad, rows),
+		rows: rows,
+		cols: cols,
+	}
+
+	// First write + dirty bump — exactly what readLoop does.
+	if _, err := s.emu.Write([]byte("hello")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	s.gen.Add(1)
+
+	screen1, _, _, _, _ := s.LiveFrame()
+	if !strings.Contains(screen1, "hello") {
+		t.Fatalf("first frame missing content: %q", screen1)
+	}
+
+	// Mutate the emulator WITHOUT bumping gen. LiveFrame must hand back the
+	// cached frame, proving it never re-rendered.
+	if _, err := s.emu.Write([]byte(" world")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if screen2, _, _, _, _ := s.LiveFrame(); screen2 != screen1 {
+		t.Errorf("LiveFrame re-rendered despite unchanged gen:\n got %q\nwant %q", screen2, screen1)
+	}
+
+	// Bump gen as readLoop would; the new content must now surface.
+	s.gen.Add(1)
+	if screen3, _, _, _, _ := s.LiveFrame(); !strings.Contains(screen3, "hello world") {
+		t.Errorf("LiveFrame did not refresh after dirty bump: %q", screen3)
+	}
+}
+
 // TestTrimColsDropsOverflowGlyph checks the original emuPad purpose still holds:
 // a glyph that lands in the spare overflow column is clipped back off so it
 // never widens the rendered line past the PTY width.

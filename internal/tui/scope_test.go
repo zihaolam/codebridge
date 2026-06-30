@@ -97,4 +97,3 @@ func TestDeriveScopeWorktreeUsesMainRoot(t *testing.T) {
 		t.Errorf("display root: main=%q wt=%q, want both basename \"main\"", rootMain, rootWt)
 	}
 }
-
