@@ -7,6 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"strings"
 	"time"
 
 	"codebridge/internal/daemon"
@@ -15,6 +18,21 @@ import (
 	"codebridge/internal/session"
 	"codebridge/internal/tui"
 )
+
+// build holds the version metadata stamped into the binary at release time.
+// main.SetBuild populates it from the goreleaser-injected -X ldflags before Run
+// dispatches; a plain `go build` leaves it empty and versionString falls back
+// to the VCS info Go embeds via runtime/debug.
+var build struct {
+	version string
+	commit  string
+	date    string
+}
+
+// SetBuild records the release build metadata. Called once from main().
+func SetBuild(version, commit, date string) {
+	build.version, build.commit, build.date = version, commit, date
+}
 
 // Run dispatches the given args (os.Args[1:]) to a subcommand.
 func Run(args []string) error {
@@ -49,12 +67,68 @@ func Run(args []string) error {
 		return hook.Install(args[1:])
 	case "install-codex":
 		return hook.InstallCodex(args[1:])
+	case "version", "--version", "-v":
+		fmt.Println(versionString())
+		return nil
 	case "-h", "--help", "help":
-		fmt.Println("usage: cb [--all|daemon|ctl|hook|install-hooks|install-codex|stop] ...")
+		fmt.Println("usage: cb [--all|daemon|ctl|hook|install-hooks|install-codex|stop|version] ...")
 		return nil
 	default:
 		return fmt.Errorf("unknown subcommand %q", args[0])
 	}
+}
+
+// versionString reports the build version for `cb version` / `cb --version`.
+// Release binaries are stamped by goreleaser (-X main.version=...); a plain
+// `go build` leaves that as "dev", so we fall back to the module version and
+// VCS revision/time that Go embeds in the binary. The IPC protocol version is
+// included because a cb whose daemon is stale fails on a protocol mismatch —
+// having it next to the version makes that easy to diagnose.
+func versionString() string {
+	v, commit, date := build.version, build.commit, build.date
+	dirty := false
+	if v == "" || v == "dev" {
+		if info, ok := debug.ReadBuildInfo(); ok {
+			if mv := info.Main.Version; mv != "" && mv != "(devel)" {
+				v = mv
+			}
+			for _, s := range info.Settings {
+				switch s.Key {
+				case "vcs.revision":
+					if commit == "" {
+						commit = s.Value
+					}
+				case "vcs.time":
+					if date == "" {
+						date = s.Value
+					}
+				case "vcs.modified":
+					dirty = dirty || s.Value == "true"
+				}
+			}
+		}
+		if v == "" {
+			v = "dev"
+		}
+	}
+	if len(commit) > 12 {
+		commit = commit[:12]
+	}
+	// Go already stamps "+dirty" into Main.Version for a modified worktree, so
+	// only annotate the commit when the version itself doesn't already say so.
+	if dirty && commit != "" && !strings.Contains(v, "dirty") {
+		commit += "-dirty"
+	}
+
+	parts := []string{"cb " + v}
+	if commit != "" {
+		parts = append(parts, "commit "+commit)
+	}
+	if date != "" {
+		parts = append(parts, "built "+date)
+	}
+	parts = append(parts, runtime.Version(), fmt.Sprintf("protocol v%d", ipc.ProtocolVersion))
+	return strings.Join(parts, ", ")
 }
 
 // runCtl is a debug client for driving the daemon: list / spawn / kill.
