@@ -42,6 +42,7 @@ type Action struct {
 var Actions = []Action{
 	{Key: "new_claude", Label: "new claude session", Default: "n"},
 	{Key: "new_codex", Label: "new codex session", Default: "c"},
+	{Key: "new_worktree", Label: "new session in worktree", Default: "w"},
 	{Key: "kill", Label: "kill session", Default: "x"},
 	{Key: "rename", Label: "rename session", Default: "r"},
 	{Key: "jump_pending", Label: "jump to pending approval", Default: "g"},

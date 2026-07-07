@@ -148,6 +148,17 @@ type dashboardModel struct {
 	configCapture bool
 	configErr     string
 
+	// Worktree/agent picker (prefix+w). A two-stage modal that owns the whole
+	// viewport while open: pick a git worktree, then pick which agent binary to
+	// launch in it. See worktree.go.
+	wtOpen        bool
+	wtStage       wtStage
+	wtList        []worktreeInfo
+	wtCursor      int
+	wtChosenPath  string        // worktree carried from stage one into stage two
+	wtAgents      []agentChoice // installed agents, computed when the picker opens
+	wtAgentCursor int
+
 	// live screen of the selected session (right pane). When focus==focusScreen,
 	// keystrokes are forwarded to this session over the same connection.
 	streamID string   // session currently streamed into the right pane
@@ -1295,6 +1306,11 @@ func (m *dashboardModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.configOpen {
 		return m.handleConfigKey(msg)
 	}
+	// The worktree/agent picker is a full-viewport modal too: it owns every
+	// keystroke while open, ahead of the prefix layer and screen forwarding.
+	if m.wtOpen {
+		return m.handleWorktreeKey(msg)
+	}
 	if m.renaming {
 		return m.updateRename(msg)
 	}
@@ -1451,6 +1467,10 @@ func (m *dashboardModel) runAction(action string) (tea.Model, tea.Cmd) {
 		return m, m.spawnCmd("claude", m.spawnTargetCwd())
 	case "new_codex":
 		return m, m.spawnCmd("codex", m.spawnTargetCwd())
+	case "new_worktree":
+		// Two-stage picker: choose a git worktree, then the agent to launch in
+		// it. Opening is synchronous (a fast local `git worktree list`).
+		m.openWorktreePicker()
 	case "quit":
 		m.action = DashQuit
 		return m, tea.Quit
@@ -1542,10 +1562,16 @@ func (m *dashboardModel) enterScroll() {
 	m.scrollMode = true
 }
 
-// exitScroll returns the screen pane to following the live bottom.
+// exitScroll returns the screen pane to following the live bottom. It also
+// drops any held text selection: the selection is a pin trigger (see the
+// previewMsg handler), so leaving it set would let the next typed/pasted line
+// re-bump scrollOff and yank the view back up — defeating the jump-to-live the
+// caller just asked for.
 func (m *dashboardModel) exitScroll() {
 	m.scrollMode = false
 	m.scrollOff = 0
+	m.selecting = false
+	m.selStart, m.selEnd = selPos{}, selPos{}
 	m.sendScroll()
 }
 
@@ -1973,6 +1999,7 @@ func (m *dashboardModel) View() tea.View {
 func (m *dashboardModel) shouldShowSessionCursor() bool {
 	return m.focus == focusScreen &&
 		!m.configOpen &&
+		!m.wtOpen &&
 		!m.renaming &&
 		!m.prefix &&
 		!m.menu &&
@@ -1993,6 +2020,11 @@ func (m *dashboardModel) renderLive() string {
 	// again as soon as the menu closes.
 	if m.configOpen {
 		return clampLines(centerOnScreen(m.renderConfigMenu(), m.w, m.h), m.w)
+	}
+	// The worktree/agent picker likewise takes over the whole viewport while
+	// the user is choosing where and what to launch.
+	if m.wtOpen {
+		return clampLines(centerOnScreen(m.renderWorktreePicker(), m.w, m.h), m.w)
 	}
 	// The title lives at the top of the sidebar (renderSidebar), so the screen
 	// pane spans the full height beside it — no full-width header band.
@@ -2472,6 +2504,7 @@ func (m *dashboardModel) renderPrefixPanel(width int) string {
 	items := []item{
 		{b("new_claude"), "new claude"},
 		{b("new_codex"), "new codex"},
+		{b("new_worktree"), "worktree +agent"},
 		{b("kill"), "kill session"},
 		{b("rename"), "rename"},
 		{kbd("h"), "focus sidebar"},

@@ -51,7 +51,11 @@ under a PTY (see the Python `pty` harnesses used during development) or test by 
   that browses the screen pane's scrollback via daemon-rendered frames. The mouse is left
   uncaptured on purpose so the terminal's native text selection keeps working. `keys.go`
   maps Bubble Tea keys → raw bytes for forwarding; the `ctrl+a` prefix (configurable via
-  `CB_PREFIX`) switches focus / quits.
+  `CB_PREFIX`) switches focus / quits. `prefix w` opens the `worktree.go` two-stage
+  picker: `git worktree list --porcelain` on the fly → pick a worktree, then pick which
+  agent (claude / codex / opencode, filtered to binaries on `PATH`) to spawn there —
+  the agent is chosen every time, never remembered. `prefix n` / `prefix c` still spawn
+  claude / codex instantly in the launch scope's cwd (see `spawnTargetCwd`).
 - **`internal/cli`** — subcommand router + `ensureDaemon` (auto-start with a readiness wait
   and protocol-version check).
 
