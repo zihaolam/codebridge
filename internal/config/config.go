@@ -51,6 +51,7 @@ var Actions = []Action{
 	{Key: "focus_screen", Label: "focus screen pane", Default: "l"},
 	{Key: "scroll", Label: "enter scroll mode", Default: "["},
 	{Key: "newline", Label: "insert newline in session", Default: "enter"},
+	{Key: "task_backlog", Label: "task backlog", Default: "t"},
 	{Key: "config", Label: "open config menu", Default: "o"},
 	{Key: "quit", Label: "quit cb", Default: "q"},
 }

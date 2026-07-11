@@ -6,6 +6,7 @@ package session
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -79,6 +80,13 @@ type Session struct {
 	gen atomic.Uint64
 	fc  liveFrame
 
+	// prefill is text to paste into the child's input once the agent UI is up:
+	// delivered on the first hook event (Claude Code's readiness signal) or by
+	// a short fallback timer for agents that never fire hooks (codex/opencode).
+	// prefillOnce guards against double delivery when both paths race.
+	prefill     string
+	prefillOnce sync.Once
+
 	// syncStartNanos is the unix-nano timestamp when the child entered DEC 2026
 	// (Synchronized Output Mode), or 0 when it isn't in a sync block. Set from
 	// the emulator's mode callbacks (called inside Write, so atomic-only — no
@@ -86,16 +94,16 @@ type Session struct {
 	// reads this to skip rendering mid-batch; see IsSyncBlock.
 	syncStartNanos atomic.Int64
 
-	mu              sync.RWMutex
-	name            string
-	status          Status
-	statusSince     time.Time
-	lastMessage     string
-	claudeSessionID string
-	startedAt       time.Time
-	exited          bool
-	exitErr         error
-	rows, cols      int
+	mu               sync.RWMutex
+	name             string
+	status           Status
+	statusSince      time.Time
+	lastMessage      string
+	harnessSessionID string
+	startedAt        time.Time
+	exited           bool
+	exitErr          error
+	rows, cols       int
 }
 
 // New spawns argv under a new PTY of the given size and starts draining it.
@@ -103,7 +111,7 @@ type Session struct {
 // hooks (which run as descendants) can correlate themselves back to this
 // session. pty.StartWithSize puts the child in its own session with the PTY as
 // controlling terminal, so signals like Ctrl-C target the child, not us.
-func New(id string, argv []string, cwd string, rows, cols int) (*Session, error) {
+func New(id string, argv []string, cwd string, rows, cols int, prefill string) (*Session, error) {
 	c := exec.Command(argv[0], argv[1:]...)
 	if cwd != "" {
 		c.Dir = cwd
@@ -125,6 +133,7 @@ func New(id string, argv []string, cwd string, rows, cols int) (*Session, error)
 		ptmx:        ptmx,
 		cmd:         c,
 		emu:         vt.NewSafeEmulator(cols+emuPad, rows),
+		prefill:     prefill,
 		status:      StatusStarting,
 		statusSince: time.Now(),
 		startedAt:   time.Now(),
@@ -160,7 +169,43 @@ func New(id string, argv []string, cwd string, rows, cols int) (*Session, error)
 	go s.readLoop()
 	go s.replyLoop()
 	go s.wait()
+	if prefill != "" {
+		// Claude fires hooks, and the first hook (SessionStart) is the real
+		// readiness signal — pasting earlier races the UI drawing its input box
+		// and the prefill can be swallowed. So for claude the timer is only a
+		// long safety net for setups without hooks installed; for agents that
+		// never fire hooks (codex/opencode) a short timer is the only signal.
+		delay := prefillFallback
+		if filepath.Base(argv[0]) == "claude" {
+			delay = prefillClaudeFallback
+		}
+		time.AfterFunc(delay, s.DeliverPrefill)
+	}
 	return s, nil
+}
+
+// prefillFallback is how long a hookless agent (codex/opencode) gets to draw
+// its input box before the prefill is pasted. prefillClaudeFallback is the
+// hooks-not-installed safety net for claude, whose normal delivery path is the
+// first hook event.
+const (
+	prefillFallback       = 2 * time.Second
+	prefillClaudeFallback = 15 * time.Second
+)
+
+// DeliverPrefill pastes the pending prefill text into the child exactly once
+// (bracketed paste, so it lands in the agent's input unsubmitted). Safe to call
+// repeatedly — the first caller (hook event or fallback timer) wins.
+func (s *Session) DeliverPrefill() {
+	if s.prefill == "" {
+		return
+	}
+	s.prefillOnce.Do(func() {
+		if s.Exited() {
+			return
+		}
+		s.Paste(s.prefill)
+	})
 }
 
 // IsSyncBlock reports whether the child is currently inside a DEC 2026
@@ -249,6 +294,14 @@ func (s *Session) Resize(rows, cols int) error {
 	s.rows, s.cols = rows, cols
 	s.mu.Unlock()
 	return nil
+}
+
+// Size reports the PTY grid dimensions. Clients use this to render frames at
+// the session's true width instead of guessing from content.
+func (s *Session) Size() (rows, cols int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rows, s.cols
 }
 
 // Render returns a string snapshot of the current screen, trimmed to the PTY
@@ -498,12 +551,22 @@ func (s *Session) LastMessage() string {
 	return s.lastMessage
 }
 
-// SetClaudeSessionID records the upstream Claude Code session id once a hook
-// reports it, for cross-referencing transcripts.
-func (s *Session) SetClaudeSessionID(id string) {
+// SetHarnessSessionID records the upstream agent session id — reported by a
+// hook for claude, harvested from the rollout journal for codex — for
+// cross-referencing transcripts and exact-id resume.
+func (s *Session) SetHarnessSessionID(id string) {
 	s.mu.Lock()
-	s.claudeSessionID = id
+	s.harnessSessionID = id
 	s.mu.Unlock()
+}
+
+// HarnessSessionID returns the upstream agent session id (see
+// SetHarnessSessionID), or "" when none has been seen (opencode never reports
+// one).
+func (s *Session) HarnessSessionID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.harnessSessionID
 }
 
 // Exited reports whether the child process has terminated.

@@ -1,0 +1,398 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  /* No rubber-band bounce at the page edges (iOS/macOS): inner panes scroll,
+     the page itself never does. */
+  overscroll-behavior: none;
+  overflow: hidden;
+}
+
+body {
+  background: #0d1117;
+  color: #c9d1d9;
+  font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.app {
+  display: flex;
+  height: 100vh;
+  height: 100dvh; /* track the real visible height under mobile browser chrome */
+}
+
+button {
+  touch-action: manipulation; /* no 350ms double-tap-zoom delay */
+}
+
+aside {
+  width: 260px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid #21262d;
+  background: #010409;
+}
+
+aside header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid #21262d;
+}
+
+.brand {
+  font-weight: 700;
+  color: #58a6ff;
+}
+
+/* Connection indicator: green = online, yellow = connecting, red = down. */
+.conn-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #f85149;
+}
+.conn-dot.conn-open {
+  background: #3fb950;
+}
+.conn-dot.conn-connecting {
+  background: #d29922;
+}
+
+/* Borderless icon buttons (+ / x / ‹). */
+.icon-btn {
+  background: none;
+  border: none;
+  padding: 2px;
+  border-radius: 4px;
+  color: #8b949e;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.icon-btn:hover {
+  color: #c9d1d9;
+  background: #21262d;
+}
+
+.session-list {
+  list-style: none;
+  padding: 4px 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  flex: 1;
+}
+
+.session-list ul {
+  list-style: none;
+  padding: 0;
+}
+
+.scope-header {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 7px 10px 3px;
+  cursor: pointer;
+  color: #8b949e;
+  font-size: 12px;
+  user-select: none;
+}
+.scope-header:hover {
+  color: #c9d1d9;
+}
+.scope-header .scope-name {
+  font-weight: 700;
+}
+.scope-header .scope-count {
+  color: #484f58;
+}
+.scope-add {
+  margin-left: auto;
+  color: #484f58;
+}
+.chevron {
+  width: 1em;
+  flex: none;
+}
+
+.session-row {
+  display: flex;
+  gap: 8px;
+  padding: 6px 12px 6px 24px;
+  cursor: pointer;
+  align-items: center;
+}
+
+.session-row.selected {
+  background: #161b22;
+}
+
+/* Kill icon appears on row hover (pointer devices); phones use the topbar x. */
+.session-row .row-x {
+  margin-left: auto;
+  visibility: hidden;
+}
+.session-row .row-x:hover {
+  color: #f85149;
+}
+@media (hover: hover) {
+  .session-row:hover .row-x {
+    visibility: visible;
+  }
+}
+
+.session-list .name {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.glyph {
+  flex: none;
+  width: 1em;
+}
+.st-starting {
+  color: #39c5cf;
+}
+.st-working {
+  color: #3fb950;
+}
+.st-idle {
+  color: #d29922;
+}
+.st-waiting {
+  color: #3fb950;
+}
+.st-approval {
+  color: #f85149;
+}
+.st-ended {
+  color: #484f58;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+}
+
+main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.term-holder {
+  flex: 1;
+  min-height: 0;
+  /* The grid is font-scaled to exactly span the pane width (Term.tsx), so
+     there is never anything to scroll horizontally. */
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  touch-action: pan-x; /* vertical drags become daemon-side scrollback */
+  padding: 6px;
+  background: #0d1117;
+}
+
+/* Top bar above the terminal: workspace · agent, kill on the right; the back
+   chevron only exists on phones. */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #21262d;
+  background: #010409;
+}
+.topbar-label {
+  font-size: 12px;
+  color: #8b949e;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.topbar-x {
+  margin-left: auto;
+}
+.topbar-x:hover {
+  color: #f85149;
+}
+.topbar .back {
+  display: none;
+}
+
+/* Mobile key strip: keys a phone keyboard doesn't have. Hidden on desktop. */
+.keybar {
+  display: none;
+  gap: 6px;
+  padding: 6px 10px calc(6px + env(safe-area-inset-bottom));
+  border-top: 1px solid #21262d;
+  background: #010409;
+  overflow-x: auto;
+  overscroll-behavior: contain;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.keybar .key {
+  flex: none;
+  background: #161b22;
+  color: #c9d1d9;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+}
+.keybar .key:active {
+  background: #30363d;
+}
+.keybar .key-live {
+  margin-left: auto;
+  color: #8b949e;
+}
+
+/* Worktree/agent spawn picker. */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(1, 4, 9, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+.picker {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  width: min(420px, calc(100% - 32px));
+  max-height: 70%;
+  overflow-y: auto;
+  padding: 6px;
+}
+.picker-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: #8b949e;
+}
+.picker-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  padding: 10px;
+  color: #c9d1d9;
+}
+.picker-row:hover {
+  background: #21262d;
+}
+.picker-tag {
+  font-size: 11px;
+  color: #8b949e;
+}
+
+@media (max-width: 768px) {
+  aside {
+    width: 100%;
+    border-right: none;
+  }
+  aside header {
+    padding-top: calc(10px + env(safe-area-inset-top));
+  }
+  .view-term aside {
+    display: none;
+  }
+  .view-list main {
+    display: none;
+  }
+  .topbar {
+    padding: 8px 10px;
+    padding-top: calc(8px + env(safe-area-inset-top));
+  }
+  .topbar .back {
+    display: inline-flex;
+  }
+  .term-holder {
+    padding-bottom: 6px; /* the key bar below owns the safe-area inset */
+  }
+  .keybar {
+    display: flex;
+  }
+  .overlay {
+    align-items: flex-end; /* bottom sheet on phones */
+  }
+  .picker {
+    width: 100%;
+    border-radius: 12px 12px 0 0;
+    padding-bottom: calc(6px + env(safe-area-inset-bottom));
+  }
+}
+
+.banner {
+  padding: 6px 12px;
+  background: #1f2937;
+  color: #d29922;
+  font-size: 12px;
+}
+.banner.err {
+  color: #f85149;
+  cursor: pointer;
+}
+
+.empty {
+  color: #8b949e;
+  padding: 24px;
+  text-align: center;
+}
+
+.gate {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+}
+
+.gate input {
+  background: #010409;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  color: #c9d1d9;
+  padding: 8px 10px;
+  width: 320px;
+  font: inherit;
+}
+
+.gate form {
+  display: flex;
+  gap: 8px;
+}
+
+.gate button {
+  background: #21262d;
+  color: #c9d1d9;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.gate button:hover {
+  background: #30363d;
+}

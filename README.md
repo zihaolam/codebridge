@@ -223,10 +223,67 @@ native selection instead.
 | `G` | jump back to the live bottom |
 | `esc` or `q` | leave scroll mode (back to the live screen) |
 
+## Phone access (`cb web`)
+
+`cb web` serves a mobile web app — the same sidebar + live screen, from your phone: watch
+sessions, approve permissions, send prompts, spawn new agents per worktree. It's a
+separate bridge process that talks to the daemon like any other client; the daemon
+doesn't know the web exists.
+
+```sh
+cb web                 # serves http://127.0.0.1:8899 (embedded UI, WebSocket at /ws)
+```
+
+### Expose it on your tailnet
+
+The bridge binds `127.0.0.1` only — remote access is designed to go through
+[Tailscale](https://tailscale.com), which gives you encryption, device identity, and a
+real HTTPS cert with zero public exposure:
+
+1. Install Tailscale on the Mac and on your phone; log both into the same tailnet.
+2. Publish the bridge, tailnet-only, with HTTPS:
+
+   ```sh
+   tailscale serve --bg 8899
+   ```
+
+   This fronts `127.0.0.1:8899` at `https://<your-machine>.<tailnet>.ts.net` with a
+   valid certificate (needed for the PWA install and clipboard access). `tailscale
+   serve status` shows the URL; `tailscale serve --https=443 off` undoes it.
+3. Pair the phone. The web app authenticates with a bearer token (the tailnet
+   authenticates the *device*; the token authenticates the *client* — it's what stops a
+   random webpage on any tailnet machine from reaching your daemon):
+
+   ```sh
+   cb web qr --url https://<your-machine>.<tailnet>.ts.net
+   ```
+
+   Scan the QR code from the phone — the token rides in the URL fragment and is stored
+   locally on first open. `cb web token` prints it; `cb web token rotate` revokes it
+   (existing phones must re-pair).
+
+### Install as an app (iOS)
+
+Open the `ts.net` URL in Safari → Share → **Add to Home Screen**. It launches
+full-screen with its own icon like a native app. If the phone can't connect later,
+check that the Tailscale VPN toggle is on (Settings → enable Tailscale's on-demand /
+always-on VPN to make it self-heal).
+
+On the phone, the sidebar and terminal are two screens (back button in the top bar), a
+key strip provides the keys the phone keyboard doesn't have (esc, tab, shift+tab,
+arrows, ctrl-C, and a jump-back-to-live for scrollback), touch-drag on the terminal
+browses scrollback, and the `+` on a workspace opens the same worktree → agent picker
+as `Ctrl-a w`.
+
+Keep in mind the phone claims the session's terminal size when it attaches (so the
+screen fills) — if the desktop TUI is watching the same session, whoever attached last
+wins the size, tmux-style.
+
 ## State & files
 
 - `~/.cb/daemon.sock` — daemon control socket
 - `~/.cb/daemon.log` — daemon log
+- `~/.cb/web.json` — `cb web` bearer token (`cb web token [rotate]`)
 - `~/.config/cb/config.json` (or `$XDG_CONFIG_HOME/cb/config.json`) — prefix and key bindings (managed by the in-app config menu)
 
 ## Status

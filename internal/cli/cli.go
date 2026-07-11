@@ -63,6 +63,8 @@ func Run(args []string) error {
 		return hook.Run(args[1:])
 	case "ctl":
 		return runCtl(args[1:])
+	case "web":
+		return runWeb(args[1:])
 	case "install-hooks":
 		return hook.Install(args[1:])
 	case "install-codex":
@@ -71,7 +73,7 @@ func Run(args []string) error {
 		fmt.Println(versionString())
 		return nil
 	case "-h", "--help", "help":
-		fmt.Println("usage: cb [--all|daemon|ctl|hook|install-hooks|install-codex|stop|version] ...")
+		fmt.Println("usage: cb [--all|daemon|ctl|web|hook|install-hooks|install-codex|stop|version] ...")
 		return nil
 	default:
 		return fmt.Errorf("unknown subcommand %q", args[0])
@@ -241,7 +243,7 @@ func runDemo(argv []string) error {
 		argv = []string{"bash", "-c", "seq 1 200000; echo DONE-BURST"}
 	}
 	cwd, _ := os.Getwd()
-	s, err := session.New("demo", argv, cwd, 24, 80)
+	s, err := session.New("demo", argv, cwd, 24, 80, "")
 	if err != nil {
 		return err
 	}

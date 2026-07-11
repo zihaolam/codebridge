@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -29,6 +30,17 @@ type Daemon struct {
 	sessions map[string]*session.Session
 	order    []string // insertion order for stable listing
 	ln       net.Listener
+
+	// watchers are wakeup channels for `watch` push streams (see watch.go),
+	// lazily initialized by subscribeChanges.
+	watchMu  sync.Mutex
+	watchers map[chan struct{}]struct{}
+
+	// codexTaken tracks rollout ids already attributed to a session, so two
+	// concurrent codex spawns in the same cwd can't harvest the same id (see
+	// codex.go). Lazily initialized by claimCodexID.
+	codexMu    sync.Mutex
+	codexTaken map[string]bool
 }
 
 // Run starts the daemon, listening on ipc.SocketPath until the process exits.
@@ -112,6 +124,11 @@ func (d *Daemon) handle(conn net.Conn) {
 			d.attach(conn, sc, req)
 			return
 		}
+		if req.Type == "watch" {
+			// watch takes over the connection as a session-list push stream.
+			d.watch(conn, sc)
+			return
+		}
 		_ = ipc.WriteJSON(conn, d.dispatch(req))
 	}
 }
@@ -161,7 +178,8 @@ func (d *Daemon) spawn(req ipc.Request) ipc.Response {
 		cols = 80
 	}
 	id := uuid.NewString()
-	s, err := session.New(id, argv, req.Cwd, rows, cols)
+	spawnedAt := time.Now()
+	s, err := session.New(id, argv, req.Cwd, rows, cols, req.Prefill)
 	if err != nil {
 		return ipc.Response{Error: err.Error()}
 	}
@@ -170,6 +188,12 @@ func (d *Daemon) spawn(req ipc.Request) ipc.Response {
 	d.order = append(d.order, id)
 	d.mu.Unlock()
 	log.Printf("spawned session %s: %v", id, argv)
+	// Codex has no hooks to report its session id; attribute it from the
+	// rollout journal it writes on startup instead.
+	if filepath.Base(argv[0]) == "codex" {
+		go d.harvestCodexSession(s, spawnedAt)
+	}
+	d.notifyChange()
 	return ipc.Response{OK: true, ID: id}
 }
 
@@ -193,6 +217,7 @@ func (d *Daemon) kill(id string) ipc.Response {
 		return ipc.Response{Error: err.Error()}
 	}
 	log.Printf("killed session %s", id)
+	d.notifyChange()
 	return ipc.Response{OK: true}
 }
 
@@ -214,6 +239,7 @@ func (d *Daemon) rename(id, name string) ipc.Response {
 	}
 	s.SetName(name)
 	log.Printf("renamed session %s -> %q", id, name)
+	d.notifyChange()
 	return ipc.Response{OK: true}
 }
 
@@ -229,16 +255,22 @@ func (d *Daemon) hook(req ipc.Request) ipc.Response {
 		return ipc.Response{OK: true}
 	}
 
+	// Any hook event proves the agent's UI is up and accepting input — deliver
+	// the pending prefill now rather than waiting out the fallback timer.
+	// Idempotent, so later events are no-ops.
+	s.DeliverPrefill()
+
 	var p ipc.HookPayload
 	_ = json.Unmarshal(req.Payload, &p)
 	if p.SessionID != "" {
-		s.SetClaudeSessionID(p.SessionID)
+		s.SetHarnessSessionID(p.SessionID)
 	}
 
 	prev := s.Status()
 	status, msg := statusForEvent(req.Event, p)
 	s.SetStatus(status, msg)
 	log.Printf("hook %s -> session %s status=%s", req.Event, req.Session, status)
+	d.notifyChange()
 
 	// Fire a desktop notification on the edge into needs_approval, so you're
 	// alerted even when cb isn't focused (or no client is attached).
@@ -350,14 +382,15 @@ func (d *Daemon) snapshot() []ipc.SessionInfo {
 			continue
 		}
 		out = append(out, ipc.SessionInfo{
-			ID:          s.ID,
-			Name:        s.Name(),
-			Argv:        s.Argv,
-			Cwd:         s.Cwd,
-			Status:      string(s.Status()),
-			LastMessage: s.LastMessage(),
-			Exited:      s.Exited(),
-			StatusSince: s.StatusSince(),
+			ID:               s.ID,
+			Name:             s.Name(),
+			Argv:             s.Argv,
+			Cwd:              s.Cwd,
+			Status:           string(s.Status()),
+			LastMessage:      s.LastMessage(),
+			HarnessSessionID: s.HarnessSessionID(),
+			Exited:           s.Exited(),
+			StatusSince:      s.StatusSince(),
 		})
 	}
 	return out

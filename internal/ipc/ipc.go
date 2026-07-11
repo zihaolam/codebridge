@@ -15,7 +15,7 @@ import (
 // ProtocolVersion is bumped whenever the daemon/client wire protocol changes.
 // The client checks it on connect so a stale daemon (e.g. left running across a
 // rebuild) fails loudly instead of silently dropping attach/input messages.
-const ProtocolVersion = 7
+const ProtocolVersion = 8
 
 // Dir is the per-user state directory for cb.
 func Dir() string {
@@ -36,13 +36,21 @@ func SocketPath() string {
 
 // Request is a message from a client (or hook) to the daemon.
 type Request struct {
-	Type string `json:"type"` // "spawn" | "list" | "kill" | "hook" | "extract"
+	// Type also admits the stream-mode requests "attach" (bidirectional
+	// screen/input stream) and "watch" (server pushes a Response{OK,Sessions}
+	// line whenever the session list or a status changes), both of which take
+	// over the connection instead of replying once.
+	Type string `json:"type"` // "spawn" | "list" | "kill" | "hook" | "extract" | "attach" | "watch"
 
 	// spawn
 	Argv []string `json:"argv,omitempty"`
 	Cwd  string   `json:"cwd,omitempty"`
 	Rows int      `json:"rows,omitempty"`
 	Cols int      `json:"cols,omitempty"`
+	// Prefill is text pasted (bracketed, so it arrives unsubmitted) into the
+	// child's input once it's ready: on the first hook event, or a short
+	// fallback timer for agents that never fire hooks.
+	Prefill string `json:"prefill,omitempty"`
 
 	// kill / rename / extract
 	ID string `json:"id,omitempty"`
@@ -76,15 +84,15 @@ type Response struct {
 
 // SessionInfo is a snapshot of a session's metadata for the client.
 type SessionInfo struct {
-	ID              string   `json:"id"`
-	Name            string   `json:"name,omitempty"`
-	Argv            []string `json:"argv"`
-	Cwd             string   `json:"cwd"`
-	Status          string   `json:"status"`
-	LastMessage     string   `json:"last_message,omitempty"`
-	ClaudeSessionID string   `json:"claude_session_id,omitempty"`
-	Exited          bool     `json:"exited"`
-	StatusSince     int64    `json:"status_since,omitempty"` // unix nanos the status was entered
+	ID               string   `json:"id"`
+	Name             string   `json:"name,omitempty"`
+	Argv             []string `json:"argv"`
+	Cwd              string   `json:"cwd"`
+	Status           string   `json:"status"`
+	LastMessage      string   `json:"last_message,omitempty"`
+	HarnessSessionID string   `json:"harness_session_id,omitempty"`
+	Exited           bool     `json:"exited"`
+	StatusSince      int64    `json:"status_since,omitempty"` // unix nanos the status was entered
 }
 
 // StreamUp is a client→daemon message sent on an attached connection.
@@ -104,6 +112,10 @@ type StreamDown struct {
 	CursorX int    `json:"cursor_x,omitempty"`
 	CursorY int    `json:"cursor_y,omitempty"`
 	Alt     bool   `json:"alt,omitempty"`
+	// Rows/Cols are the session's PTY grid size, so clients can render at the
+	// true width instead of inferring it from frame content.
+	Rows int `json:"rows,omitempty"`
+	Cols int `json:"cols,omitempty"`
 	// Offset is the scroll position this frame was rendered at (lines up from
 	// the live bottom); MaxOffset is how far up the scrollback allows.
 	Offset    int `json:"offset,omitempty"`

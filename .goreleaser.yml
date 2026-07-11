@@ -5,6 +5,8 @@ project_name: cb
 before:
   hooks:
     - go mod tidy
+    # Build the cb-web PWA so //go:embed (internal/web/dist) ships real assets.
+    - sh -c "cd web && npm ci && npm run build"
 
 builds:
   - id: cb

@@ -89,12 +89,15 @@ func (d *Daemon) attach(conn net.Conn, sc *bufio.Scanner, req ipc.Request) {
 				if screen != last || off != lastOff || maxOff != lastMax || cx != lastCx || cy != lastCy {
 					last, lastOff, lastMax = screen, off, maxOff
 					lastCx, lastCy = cx, cy
+					rows, cols := s.Size()
 					_ = write(ipc.StreamDown{
 						Type:      "frame",
 						Screen:    screen,
 						CursorX:   cx,
 						CursorY:   cy,
 						Alt:       alt,
+						Rows:      rows,
+						Cols:      cols,
 						Offset:    off,
 						MaxOffset: maxOff,
 					})

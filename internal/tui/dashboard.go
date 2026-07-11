@@ -23,6 +23,7 @@ import (
 	"codebridge/internal/config"
 	"codebridge/internal/hook"
 	"codebridge/internal/ipc"
+	"codebridge/internal/task"
 )
 
 // DashAction is what the dashboard asks the caller to do after it exits.
@@ -159,6 +160,24 @@ type dashboardModel struct {
 	wtAgents      []agentChoice // installed agents, computed when the picker opens
 	wtAgentCursor int
 
+	// Task backlog dialog (prefix+t). A modal listing the current workspace's
+	// queued work; tasks can start agent sessions with their text prefilled and
+	// then track that session live. See task.go.
+	taskOpen        bool
+	taskStage       taskStage
+	taskStore       *task.Store
+	taskRows        []taskRow // flattened section headers + tasks + notes
+	taskCursor      int       // index into taskRows, always on a task row
+	taskTitleBuf    string    // new-task title being typed
+	taskDetailID    string    // task being edited in the detail stage
+	taskEditTitle   bool      // detail stage: true = title field active, false = description
+	taskTitleEdit   string
+	taskDescEdit    string
+	taskAgents      []agentChoice // installed agents, computed when the agent stage opens
+	taskAgentCursor int
+	taskStartID     string // task carried from the list into the agent stage
+	taskPrefix      bool   // local prefix chord state while the dialog is open
+
 	// live screen of the selected session (right pane). When focus==focusScreen,
 	// keystrokes are forwarded to this session over the same connection.
 	streamID string   // session currently streamed into the right pane
@@ -264,6 +283,7 @@ func Dashboard(selectID, cwd string, showAll bool) (DashAction, error) {
 		worktreeCache: map[string]bool{},
 		ch:            make(chan previewMsg, 64),
 		cfg:           cfg,
+		taskStore:     task.Load(),
 	}
 	// Mouse wheel is captured (see View's MouseMode) so scrolling the screen pane
 	// browses scrollback rather than the terminal turning the wheel into arrow
@@ -984,6 +1004,26 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pushToast(fmt.Sprintf("✗ %s not installed — check your PATH", msg.bin), "needs_approval")
 		return m, nil
 
+	case taskSpawnedMsg:
+		// A task's agent session just spawned: link the task to it, then select
+		// and focus the new session like spawnedMsg does.
+		if m.taskStore != nil {
+			if t := m.taskStore.Get(msg.taskID); t != nil {
+				t.Status = task.StatusInProgress
+				t.CBSessionID = msg.sessionID
+				t.Agent = msg.agent
+				t.Cwd = msg.cwd
+				t.UpdatedAt = time.Now()
+				m.saveTasks()
+				if m.taskOpen {
+					m.rebuildTaskRows()
+				}
+			}
+		}
+		m.wantSelect = msg.sessionID
+		m.focusScreenPane()
+		return m, refreshCmd
+
 	case previewMsg:
 		if msg.id == m.streamID {
 			if msg.gone {
@@ -1045,6 +1085,9 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// the daemon knows about, not just the visible accordion rows
 			// (collapsing a group shouldn't silence notifications from it).
 			m.detectTransitions(m.sessions)
+			// Reconcile the task backlog: pause tasks whose session ended and
+			// harvest claude session ids for later resume.
+			m.syncTasks(m.sessions)
 		}
 		// On the first poll that includes wantSelect, ensure its parent scope
 		// is open and stamp the selection so rebuildRows lands the cursor on
@@ -1311,6 +1354,10 @@ func (m *dashboardModel) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.wtOpen {
 		return m.handleWorktreeKey(msg)
 	}
+	// So is the task backlog dialog (it runs its own local prefix layer).
+	if m.taskOpen {
+		return m.handleTaskKey(msg)
+	}
 	if m.renaming {
 		return m.updateRename(msg)
 	}
@@ -1471,6 +1518,8 @@ func (m *dashboardModel) runAction(action string) (tea.Model, tea.Cmd) {
 		// Two-stage picker: choose a git worktree, then the agent to launch in
 		// it. Opening is synchronous (a fast local `git worktree list`).
 		m.openWorktreePicker()
+	case "task_backlog":
+		m.openTaskBacklog()
 	case "quit":
 		m.action = DashQuit
 		return m, tea.Quit
@@ -2000,6 +2049,7 @@ func (m *dashboardModel) shouldShowSessionCursor() bool {
 	return m.focus == focusScreen &&
 		!m.configOpen &&
 		!m.wtOpen &&
+		!m.taskOpen &&
 		!m.renaming &&
 		!m.prefix &&
 		!m.menu &&
@@ -2025,6 +2075,10 @@ func (m *dashboardModel) renderLive() string {
 	// the user is choosing where and what to launch.
 	if m.wtOpen {
 		return clampLines(centerOnScreen(m.renderWorktreePicker(), m.w, m.h), m.w)
+	}
+	// And the task backlog dialog.
+	if m.taskOpen {
+		return clampLines(centerOnScreen(m.renderTaskBacklog(), m.w, m.h), m.w)
 	}
 	// The title lives at the top of the sidebar (renderSidebar), so the screen
 	// pane spans the full height beside it — no full-width header band.
@@ -2505,6 +2559,7 @@ func (m *dashboardModel) renderPrefixPanel(width int) string {
 		{b("new_claude"), "new claude"},
 		{b("new_codex"), "new codex"},
 		{b("new_worktree"), "worktree +agent"},
+		{b("task_backlog"), "task backlog"},
 		{b("kill"), "kill session"},
 		{b("rename"), "rename"},
 		{kbd("h"), "focus sidebar"},

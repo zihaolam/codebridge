@@ -10,8 +10,16 @@ live, interactive screen. No tmux dependency.
 ```sh
 go build -o ./dist/cb .    # single binary (dist/ is gitignored)
 go vet ./...
-go test ./...              # unit tests live in internal/tui and internal/hook
+go test ./...              # unit tests live in internal/tui, internal/hook, internal/web
 gofmt -w internal/
+```
+
+The `cb web` PWA is embedded via `//go:embed internal/web/dist`; that dir is
+gitignored (a `.gitkeep` keeps the embed valid), so build the frontend first
+whenever you touch `web/` or want the web UI in the binary:
+
+```sh
+cd web && npm install && npm run build   # emits into internal/web/dist
 ```
 
 Requires Go 1.24+ (the `charmbracelet/x/vt` emulator pulls the toolchain to 1.25).
@@ -58,6 +66,20 @@ under a PTY (see the Python `pty` harnesses used during development) or test by 
   claude / codex instantly in the launch scope's cwd (see `spawnTargetCwd`).
 - **`internal/cli`** — subcommand router + `ensureDaemon` (auto-start with a readiness wait
   and protocol-version check).
+- **`internal/web`** — the `cb web` bridge: a separate process that is just another daemon
+  client (unix socket, same ipc protocol) and serves the mobile PWA + a `/ws` WebSocket on
+  `127.0.0.1` (expose via `tailscale serve`). One multiplexed WS per browser: token auth as
+  the first message (token in `~/.cb/web.json`; `cb web token|qr`), then session-list
+  snapshots and frame passthrough for the attached session. The list is push-based: the
+  bridge holds one daemon `watch` stream (`daemon/watch.go` — a snapshot line on every
+  spawn/kill/rename/hook change, 1s safety ticker for child exits) shared by all browsers,
+  falling back to 500ms `list` polling only against a pre-watch daemon. Snapshots are
+  enriched bridge-side with a per-cwd scope key (`web/scope.go`) mirroring the TUI
+  accordion's repo-common-dir grouping. Attaches without rows/cols on purpose so a phone
+  never resizes a session under the desktop TUI. The daemon stays web-agnostic — the watch
+  stream is generic (the TUI could adopt it); web-facing features belong here, not in
+  `internal/daemon`. Frontend source lives in `web/` (Vite + React + xterm.js); frames are
+  written straight into xterm.js outside React state.
 
 ## Status model
 

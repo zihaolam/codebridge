@@ -1,3 +1,8 @@
 # build artifacts
 /dist/
 /cb
+
+# web frontend
+web/node_modules/
+internal/web/dist/*
+!internal/web/dist/.gitkeep
