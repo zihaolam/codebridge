@@ -15,7 +15,7 @@ import (
 // ProtocolVersion is bumped whenever the daemon/client wire protocol changes.
 // The client checks it on connect so a stale daemon (e.g. left running across a
 // rebuild) fails loudly instead of silently dropping attach/input messages.
-const ProtocolVersion = 10
+const ProtocolVersion = 11
 
 // Dir is the per-user state directory for cb.
 func Dir() string {
@@ -41,7 +41,8 @@ type Request struct {
 	// Tasks} line whenever the session list or backlog changes), both of which
 	// take over the connection instead of replying once. The daemon owns the
 	// task backlog: "task_list" | "task_add" | "task_edit" | "task_status" |
-	// "task_delete" | "task_start" mutate it and reply with the fresh Tasks.
+	// "task_delete" | "task_start" | "task_resume" mutate it and reply with
+	// the fresh Tasks.
 	Type string `json:"type"` // "spawn" | "list" | "kill" | "hook" | "extract" | "attach" | "watch"
 
 	// spawn
@@ -81,6 +82,7 @@ type Request struct {
 	Desc   string `json:"desc,omitempty"`
 	Status string `json:"task_status,omitempty"`
 	Agent  string `json:"agent,omitempty"`
+	RunID  string `json:"run_id,omitempty"` // task_resume target
 }
 
 // Response is the daemon's reply.

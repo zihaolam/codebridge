@@ -47,13 +47,13 @@ func TestTaskDispatchLifecycle(t *testing.T) {
 		t.Fatalf("edited task: %+v", got)
 	}
 
-	// status → completed clears the live link
-	d.taskStore.Get(id).CBSessionID = "sess-1"
+	// status → completed preserves run history (including a live link).
+	d.taskStore.Get(id).Runs = []ipc.TaskRun{{ID: "run-1", CBSessionID: "sess-1", Status: task.StatusInProgress}}
 	resp = d.taskDispatch(ipc.Request{Type: "task_status", ID: id, Status: string(task.StatusCompleted)})
 	if !resp.OK {
 		t.Fatalf("task_status: %+v", resp)
 	}
-	if got := d.taskStore.Get(id); got.Status != task.StatusCompleted || got.CBSessionID != "" {
+	if got := d.taskStore.Get(id); got.Status != task.StatusCompleted || got.Runs[0].CBSessionID != "sess-1" {
 		t.Fatalf("completed task: %+v", got)
 	}
 
@@ -82,7 +82,7 @@ func TestReconcileTaskStates(t *testing.T) {
 	mk := func(title, cbID, agentID string, updated time.Time) ipc.Task {
 		return ipc.Task{
 			Title: title, Status: task.StatusInProgress,
-			CBSessionID: cbID, AgentSessionID: agentID, UpdatedAt: updated,
+			Runs: []ipc.TaskRun{{ID: cbID, CBSessionID: cbID, AgentSessionID: agentID, Status: task.StatusInProgress, UpdatedAt: updated}}, UpdatedAt: updated,
 		}
 	}
 	tasks := []ipc.Task{
@@ -90,7 +90,7 @@ func TestReconcileTaskStates(t *testing.T) {
 		mk("vanished", "s2", "claude-keep", old),
 		mk("gone", "s3", "", old),
 		mk("fresh", "s5", "", now), // inside the grace window
-		{Title: "resting", Status: task.StatusPaused, AgentSessionID: "claude-old", UpdatedAt: old},
+		{Title: "resting", Status: task.StatusPaused, Runs: []ipc.TaskRun{{ID: "rest", AgentSessionID: "claude-old", Status: task.StatusPaused}}, UpdatedAt: old},
 	}
 	live := map[string]sessState{
 		"s1": {gone: false, harness: "claude-1"},
@@ -101,21 +101,38 @@ func TestReconcileTaskStates(t *testing.T) {
 		t.Fatal("expected changes")
 	}
 
-	if tasks[0].Status != task.StatusInProgress || tasks[0].AgentSessionID != "claude-1" {
+	if tasks[0].Status != task.StatusInProgress || tasks[0].Runs[0].AgentSessionID != "claude-1" {
 		t.Errorf("harvest: %+v", tasks[0])
 	}
 	for _, i := range []int{1, 2} { // vanished (not in map), gone (exited)
-		if tasks[i].Status != task.StatusPaused || tasks[i].CBSessionID != "" {
+		if tasks[i].Status != task.StatusPaused || tasks[i].Runs[0].CBSessionID != "" {
 			t.Errorf("%s not paused/cleared: %+v", tasks[i].Title, tasks[i])
 		}
 	}
-	if tasks[1].AgentSessionID != "claude-keep" {
+	if tasks[1].Runs[0].AgentSessionID != "claude-keep" {
 		t.Errorf("pause dropped the resume handle: %+v", tasks[1])
 	}
 	if tasks[3].Status != task.StatusInProgress {
 		t.Errorf("fresh task paused despite grace window: %+v", tasks[3])
 	}
-	if tasks[4].Status != task.StatusPaused || tasks[4].AgentSessionID != "claude-old" {
+	if tasks[4].Status != task.StatusPaused || tasks[4].Runs[0].AgentSessionID != "claude-old" {
 		t.Errorf("resting task touched: %+v", tasks[4])
+	}
+}
+
+func TestReconcileTaskStatesKeepsTaskActiveWhileAnotherRunLives(t *testing.T) {
+	now := time.Now()
+	tasks := []ipc.Task{{
+		Title: "parallel", Status: task.StatusInProgress,
+		Runs: []ipc.TaskRun{
+			{ID: "ended", CBSessionID: "ended", Status: task.StatusInProgress, UpdatedAt: now.Add(-time.Minute)},
+			{ID: "live", CBSessionID: "live", Status: task.StatusInProgress, UpdatedAt: now.Add(-time.Minute)},
+		},
+	}}
+	if !reconcileTaskStates(tasks, map[string]sessState{"live": {}}, now) {
+		t.Fatal("expected ended run to be reconciled")
+	}
+	if tasks[0].Status != task.StatusInProgress || tasks[0].Runs[0].Status != task.StatusPaused || tasks[0].Runs[1].Status != task.StatusInProgress {
+		t.Fatalf("parallel runs reconciled incorrectly: %+v", tasks[0])
 	}
 }

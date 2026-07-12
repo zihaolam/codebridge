@@ -28,6 +28,7 @@ type wsUp struct {
 	Desc   string `json:"desc,omitempty"`        // task_add / task_edit
 	Status string `json:"task_status,omitempty"` // task_status
 	Agent  string `json:"agent,omitempty"`       // task_start
+	RunID  string `json:"run_id,omitempty"`      // task_resume
 }
 
 // webSession is a SessionInfo enriched with the sidebar grouping scope,

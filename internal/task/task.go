@@ -24,8 +24,9 @@ import (
 // and every client share one shape. The alias keeps existing task.Task /
 // task.StatusInProgress references working unchanged.
 type (
-	Task   = ipc.Task
-	Status = ipc.Status
+	Task    = ipc.Task
+	TaskRun = ipc.TaskRun
+	Status  = ipc.Status
 )
 
 const (
@@ -64,7 +65,25 @@ func LoadFrom(path string) *Store {
 	if json.Unmarshal(data, st) != nil {
 		return &Store{path: path}
 	}
+	st.migrateRuns()
 	return st
+}
+
+// migrateRuns makes old single-session task records usable as one run without
+// requiring users to hand-edit tasks.json. New saves retain the old fields for
+// compatibility, but all new logic reads Runs.
+func (s *Store) migrateRuns() {
+	for i := range s.Tasks {
+		t := &s.Tasks[i]
+		if len(t.Runs) != 0 || (t.CBSessionID == "" && t.AgentSessionID == "") {
+			continue
+		}
+		t.Runs = []TaskRun{{
+			ID: uuid.NewString(), Agent: t.Agent, Cwd: t.Cwd,
+			CBSessionID: t.CBSessionID, AgentSessionID: t.AgentSessionID,
+			Status: t.Status, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
+		}}
+	}
 }
 
 // Save writes the store back to the path it was loaded from (or the default

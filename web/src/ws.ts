@@ -34,10 +34,22 @@ export type TaskInfo = {
   title: string
   desc?: string
   status: string
+  runs?: TaskRun[]
   agent?: string
   cwd?: string
   cb_session_id?: string
   agent_session_id?: string
+  created_at: string
+  updated_at: string
+}
+
+export type TaskRun = {
+  id: string
+  agent?: string
+  cwd?: string
+  cb_session_id?: string
+  agent_session_id?: string
+  status: string
   created_at: string
   updated_at: string
 }

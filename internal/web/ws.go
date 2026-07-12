@@ -157,7 +157,7 @@ func (c *client) dispatch(ctx context.Context, up wsUp) {
 			wts = []worktreeEntry{{Path: up.Cwd, Main: true}}
 		}
 		c.send(ctx, wsDown{Type: "worktrees", Cwd: up.Cwd, Worktrees: wts, Agents: availableAgents()})
-	case "task_list", "task_add", "task_edit", "task_status", "task_delete":
+	case "task_list", "task_add", "task_edit", "task_status", "task_delete", "task_resume":
 		c.proxyTask(ctx, up)
 	case "task_start":
 		c.taskStart(ctx, up)
@@ -172,7 +172,7 @@ func (c *client) dispatch(ctx context.Context, up wsUp) {
 func (c *client) proxyTask(ctx context.Context, up wsUp) {
 	resp, err := ipc.Send(ipc.Request{
 		Type: up.Type, ID: up.ID, Scope: up.Scope,
-		Title: up.Title, Desc: up.Desc, Status: up.Status,
+		Title: up.Title, Desc: up.Desc, Status: up.Status, RunID: up.RunID,
 	})
 	switch {
 	case err != nil:

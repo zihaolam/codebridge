@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
+
 	"codebridge/internal/task"
 )
 
@@ -104,10 +106,9 @@ func TestRebuildTaskRowsSections(t *testing.T) {
 	}
 }
 
-// TestTaskDoubleStartGuard: pressing s on an in_progress task must not open
-// the agent picker (which would spawn a second agent on the same work) — it
-// closes the dialog and jumps to the live session instead.
-func TestTaskDoubleStartGuard(t *testing.T) {
+// TestTaskMultipleSessions: pressing s on an in_progress task opens the agent
+// picker so a second session can be started for the same task.
+func TestTaskMultipleSessions(t *testing.T) {
 	st := testTaskStore(t)
 	id := st.Add("cur", "busy", "").ID
 	st.Get(id).Status = task.StatusInProgress
@@ -126,16 +127,13 @@ func TestTaskDoubleStartGuard(t *testing.T) {
 	}
 
 	m.handleTaskKey(key("s"))
-	if m.taskStage == taskStageAgent {
-		t.Fatal("agent picker opened for an in_progress task")
-	}
-	if m.taskOpen {
-		t.Fatal("dialog should close (jump to session) on s for in_progress")
+	if m.taskStage != taskStageAgent {
+		t.Fatal("agent picker did not open for an in_progress task")
 	}
 }
 
-// TestTaskNewFlow drives the new-task input: n opens it, typed text plus enter
-// returns to the list with the buffer cleared and emits a mutation command
+// TestTaskNewFlow drives the new-task form: n opens it, typed title and
+// description plus Ctrl+Enter returns to the list and emits a mutation command
 // (the daemon, not the client, performs the actual add — see the daemon's
 // task_add test). An empty title emits no command.
 func TestTaskNewFlow(t *testing.T) {
@@ -155,7 +153,11 @@ func TestTaskNewFlow(t *testing.T) {
 	for _, ch := range []string{"f", "i", "x"} {
 		m.handleTaskKey(key(ch))
 	}
-	_, cmd := m.handleTaskKey(key("enter"))
+	m.handleTaskKey(key("enter"))
+	for _, ch := range []string{"d", "e", "s", "c"} {
+		m.handleTaskKey(key(ch))
+	}
+	_, cmd := m.handleTaskKey(tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModCtrl})
 
 	if m.taskStage != taskStageList {
 		t.Fatalf("stage = %v, want list after enter", m.taskStage)
@@ -163,13 +165,24 @@ func TestTaskNewFlow(t *testing.T) {
 	if m.taskTitleBuf != "" {
 		t.Errorf("title buffer not cleared: %q", m.taskTitleBuf)
 	}
+	if m.taskDescBuf != "" {
+		t.Errorf("description buffer not cleared: %q", m.taskDescBuf)
+	}
 	if cmd == nil {
 		t.Fatal("enter with a non-empty title should emit an add command")
 	}
 
 	// An empty title is dropped: no command.
 	m.handleTaskKey(key("n"))
-	if _, cmd := m.handleTaskKey(key("enter")); cmd != nil {
+	if _, cmd := m.handleTaskKey(tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModCtrl}); cmd != nil {
 		t.Error("enter with an empty title should not emit a command")
+	}
+}
+
+func TestTaskPasteIntoNewForm(t *testing.T) {
+	m := &dashboardModel{taskOpen: true, taskStage: taskStageNew, taskNewTitle: true}
+	m.handleTaskPaste("fix paste\ninclude a description")
+	if m.taskTitleBuf != "fix paste" || m.taskDescBuf != "include a description" || m.taskNewTitle {
+		t.Fatalf("paste did not fill new-task form: title=%q desc=%q titleActive=%v", m.taskTitleBuf, m.taskDescBuf, m.taskNewTitle)
 	}
 }

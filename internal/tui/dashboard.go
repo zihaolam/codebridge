@@ -170,6 +170,8 @@ type dashboardModel struct {
 	taskRows        []taskRow // flattened section headers + tasks + notes
 	taskCursor      int       // index into taskRows, always on a task row
 	taskTitleBuf    string    // new-task title being typed
+	taskDescBuf     string    // new-task description being typed
+	taskNewTitle    bool      // new-task stage: true = title field, false = description
 	taskDetailID    string    // task being edited in the detail stage
 	taskEditTitle   bool      // detail stage: true = title field active, false = description
 	taskTitleEdit   string
@@ -1127,7 +1129,11 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.PasteMsg:
 		// Bracketed paste is its own message in v2. Forward it to the focused
 		// session as a single paste so the daemon wraps it in paste markers.
-		if m.focus == focusScreen && !m.scrollMode {
+		// Modals own their paste too; otherwise Bubble Tea never turns this into
+		// KeyPressMsg and task text silently disappears.
+		if m.taskOpen {
+			m.handleTaskPaste(msg.Content)
+		} else if m.focus == focusScreen && !m.scrollMode {
 			m.sendPaste(msg.Content)
 		}
 		return m, nil

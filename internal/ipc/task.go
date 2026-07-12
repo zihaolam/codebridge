@@ -16,16 +16,29 @@ const (
 	StatusCompleted  Status = "completed"
 )
 
-// Task is one backlog entry. CBSessionID links to the live daemon session
-// while in_progress and is cleared on pause; AgentSessionID is the agent's own
-// session id (harvested from Claude Code hooks / the codex rollout journal)
-// kept across pauses so a later start can resume it.
+// TaskRun is one agent session launched for a task. A task may have several
+// live runs at once, and each paused run retains its own agent resume handle.
+type TaskRun struct {
+	ID             string    `json:"id"`
+	Agent          string    `json:"agent,omitempty"`
+	Cwd            string    `json:"cwd,omitempty"`
+	CBSessionID    string    `json:"cb_session_id,omitempty"`
+	AgentSessionID string    `json:"agent_session_id,omitempty"`
+	Status         Status    `json:"status"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// Task is one backlog entry. Runs is authoritative for session tracking. The
+// legacy single-run fields remain for decoding older tasks.json files and are
+// folded into Runs by task.Load.
 type Task struct {
 	ID             string    `json:"id"`
 	Scope          string    `json:"scope"`
 	Title          string    `json:"title"`
 	Desc           string    `json:"desc,omitempty"`
 	Status         Status    `json:"status"`
+	Runs           []TaskRun `json:"runs,omitempty"`
 	Agent          string    `json:"agent,omitempty"`
 	Cwd            string    `json:"cwd,omitempty"`
 	CBSessionID    string    `json:"cb_session_id,omitempty"`

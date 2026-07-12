@@ -15,7 +15,7 @@ import (
 )
 
 // taskStage is which of the backlog dialog's views is showing: the sectioned
-// task list, the one-line new-task input, the title+description editor, or the
+// task list, the title+description new-task form, the title+description editor, or the
 // agent picker for starting a task.
 type taskStage int
 
@@ -262,22 +262,21 @@ func (m *dashboardModel) handleTaskListKey(msg tea.KeyPressMsg) (tea.Model, tea.
 			break
 		}
 		if t.Status == task.StatusInProgress {
-			// The task has a live session — enter means "take me to it".
+			// Jump to the most recently started live run.
 			m.closeAndJumpToTask(t)
 			break
 		}
 		m.beginTaskDetail(t)
+	case "e":
+		if t := m.taskUnderCursor(); t != nil {
+			m.beginTaskDetail(t)
+		}
 	case "s":
 		t := m.taskUnderCursor()
 		if t == nil {
 			break
 		}
-		switch t.Status {
-		case task.StatusInProgress:
-			// Double-start guard: a session is already running this task, so
-			// jump to it instead of spawning a second agent on the same work.
-			m.closeAndJumpToTask(t)
-		case task.StatusPending, task.StatusPaused:
+		if t.Status != task.StatusCompleted {
 			agents := availableAgents()
 			if len(agents) == 0 {
 				m.pushToast("✗ no agent binaries found (claude/codex/opencode)", "needs_approval")
@@ -287,6 +286,14 @@ func (m *dashboardModel) handleTaskListKey(msg tea.KeyPressMsg) (tea.Model, tea.
 			m.taskAgentCursor = 0
 			m.taskStartID = t.ID
 			m.taskStage = taskStageAgent
+		}
+	case "r":
+		if t := m.taskUnderCursor(); t != nil {
+			for i := len(t.Runs) - 1; i >= 0; i-- {
+				if t.Runs[i].Status == task.StatusPaused {
+					return m, m.taskResumeCmd(t.ID, t.Runs[i].ID)
+				}
+			}
 		}
 	case "c":
 		if t := m.taskUnderCursor(); t != nil {
@@ -307,30 +314,80 @@ func (m *dashboardModel) handleTaskListKey(msg tea.KeyPressMsg) (tea.Model, tea.
 func (m *dashboardModel) beginNewTask() {
 	m.taskStage = taskStageNew
 	m.taskTitleBuf = ""
+	m.taskDescBuf = ""
+	m.taskNewTitle = true
 }
 
-// handleTaskNewKey is the one-line title input for a new task: enter commits
-// (empty titles are dropped), esc cancels. Same shape as updateRename.
+// handleTaskNewKey edits a new task's title and description. Enter advances
+// from the title to the description; Ctrl+Enter saves the form.
 func (m *dashboardModel) handleTaskNewKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch {
-	case msg.Code == tea.KeyEnter:
+	case msg.Code == tea.KeyEnter && msg.Mod&tea.ModCtrl != 0:
 		title := strings.TrimSpace(m.taskTitleBuf)
+		desc := strings.TrimSpace(m.taskDescBuf)
 		m.taskTitleBuf = ""
+		m.taskDescBuf = ""
 		m.taskStage = taskStageList
 		if title != "" {
-			return m, m.taskAddCmd(m.currentScope, title)
+			return m, m.taskAddCmd(m.currentScope, title, desc)
 		}
 	case msg.Code == tea.KeyEscape, msg.Code == 'c' && msg.Mod&tea.ModCtrl != 0:
 		m.taskTitleBuf = ""
+		m.taskDescBuf = ""
 		m.taskStage = taskStageList
+	case msg.Code == tea.KeyTab:
+		m.taskNewTitle = !m.taskNewTitle
+	case msg.Code == tea.KeyEnter:
+		if m.taskNewTitle {
+			m.taskNewTitle = false
+		} else {
+			m.taskDescBuf += "\n"
+		}
 	case msg.Code == tea.KeyBackspace, msg.Code == tea.KeyDelete:
-		if r := []rune(m.taskTitleBuf); len(r) > 0 {
-			m.taskTitleBuf = string(r[:len(r)-1])
+		buf := &m.taskDescBuf
+		if m.taskNewTitle {
+			buf = &m.taskTitleBuf
+		}
+		if r := []rune(*buf); len(r) > 0 {
+			*buf = string(r[:len(r)-1])
 		}
 	case msg.Text != "":
-		m.taskTitleBuf += msg.Text
+		if m.taskNewTitle {
+			m.taskTitleBuf += msg.Text
+		} else {
+			m.taskDescBuf += msg.Text
+		}
 	}
 	return m, nil
+}
+
+// handleTaskPaste applies bracketed paste to the focused task form field.
+// A multi-line paste into a new task's title naturally fills its description,
+// which makes pasting a small task brief convenient without allowing embedded
+// newlines in a title.
+func (m *dashboardModel) handleTaskPaste(text string) {
+	if text == "" {
+		return
+	}
+	switch m.taskStage {
+	case taskStageNew:
+		if m.taskNewTitle {
+			parts := strings.SplitN(text, "\n", 2)
+			m.taskTitleBuf += strings.TrimSuffix(parts[0], "\r")
+			if len(parts) == 2 {
+				m.taskDescBuf += strings.TrimPrefix(parts[1], "\r")
+				m.taskNewTitle = false
+			}
+		} else {
+			m.taskDescBuf += text
+		}
+	case taskStageDetail:
+		if m.taskEditTitle {
+			m.taskTitleEdit += strings.ReplaceAll(text, "\n", " ")
+		} else {
+			m.taskDescEdit += text
+		}
+	}
 }
 
 func (m *dashboardModel) beginTaskDetail(t *task.Task) {
@@ -430,8 +487,8 @@ func taskCmd(req ipc.Request, selectID string) tea.Cmd {
 	}
 }
 
-func (m *dashboardModel) taskAddCmd(scope, title string) tea.Cmd {
-	return taskCmd(ipc.Request{Type: "task_add", Scope: scope, Title: title}, "pending")
+func (m *dashboardModel) taskAddCmd(scope, title, desc string) tea.Cmd {
+	return taskCmd(ipc.Request{Type: "task_add", Scope: scope, Title: title, Desc: desc}, "pending")
 }
 
 func (m *dashboardModel) taskEditCmd(id, title, desc string) tea.Cmd {
@@ -473,14 +530,39 @@ func (m *dashboardModel) taskStartCmd(id, bin string) tea.Cmd {
 	}
 }
 
+func (m *dashboardModel) taskResumeCmd(id, runID string) tea.Cmd {
+	return func() tea.Msg {
+		cwd := m.spawnTargetCwd()
+		if cwd == "" {
+			cwd, _ = os.Getwd()
+		}
+		req := ipc.Request{Type: "task_resume", ID: id, RunID: runID, Cwd: cwd}
+		if m.paneH > 0 && m.paneW > 0 {
+			req.Rows, req.Cols = m.paneH, m.paneW
+		}
+		resp, err := ipc.Send(req)
+		if err != nil || !resp.OK {
+			return refreshCmd()
+		}
+		return taskSpawnedMsg{sessionID: resp.ID, tasks: resp.Tasks}
+	}
+}
+
 // closeAndJumpToTask closes the dialog and lands the dashboard on the task's
 // live session: open its scope group (flipping into accordion mode if the
 // session lives outside the launch workspace), select it, re-attach the screen
 // pane, and focus it — the same recipe as jump_pending.
 func (m *dashboardModel) closeAndJumpToTask(t *task.Task) {
 	m.closeTaskBacklog()
+	var sessionID string
+	for i := len(t.Runs) - 1; i >= 0; i-- {
+		if t.Runs[i].Status == task.StatusInProgress {
+			sessionID = t.Runs[i].CBSessionID
+			break
+		}
+	}
 	for _, s := range m.sessions {
-		if s.ID != t.CBSessionID {
+		if s.ID != sessionID {
 			continue
 		}
 		key := m.scopeKeyOf(s.Cwd)
@@ -507,8 +589,13 @@ func (m *dashboardModel) taskGlyph(t *task.Task) string {
 	switch t.Status {
 	case task.StatusInProgress:
 		status := "working"
-		if s := m.sessionByID(t.CBSessionID); s != nil {
-			status = s.Status
+		for _, r := range t.Runs {
+			if r.Status == task.StatusInProgress {
+				if s := m.sessionByID(r.CBSessionID); s != nil {
+					status = s.Status
+				}
+				break
+			}
 		}
 		return m.indicator(status)
 	case task.StatusPaused:
@@ -559,21 +646,36 @@ func (m *dashboardModel) renderTaskList() string {
 			if i == m.taskCursor {
 				marker = selBarStyle.Render("▌ ")
 			}
-			lines = append(lines, marker+m.taskGlyph(t)+" "+truncate(t.Title, taskTitleCol))
+			runs := ""
+			if n := len(t.Runs); n > 0 {
+				runs = helpStyle.Render(fmt.Sprintf("  %d session", n)) + map[bool]string{true: "s", false: ""}[n != 1]
+			}
+			lines = append(lines, marker+m.taskGlyph(t)+" "+truncate(t.Title, taskTitleCol)+runs)
 		}
 	}
-	lines = append(lines, "", helpStyle.Render("j/k move · n new · enter open · s start · c done · x delete · esc close"))
+	lines = append(lines, "", helpStyle.Render("j/k move · n new · enter open · e details · s new session · r resume · c done · x delete · esc close"))
 	return configPanelStyle.Render(strings.Join(lines, "\n"))
 }
 
 func (m *dashboardModel) renderTaskNew() string {
+	titleLine := m.taskTitleBuf
+	descLines := strings.Split(m.taskDescBuf, "\n")
+	if m.taskNewTitle {
+		titleLine += "▎"
+	} else {
+		descLines[len(descLines)-1] += "▎"
+	}
 	lines := []string{
 		titleStyle.Render("new task"),
 		"",
-		m.taskTitleBuf + "▎",
+		helpStyle.Render("title"),
+		titleLine,
 		"",
-		helpStyle.Render("enter add · esc cancel"),
+		helpStyle.Render("description"),
+		"",
 	}
+	lines = append(lines, descLines...)
+	lines = append(lines, "", helpStyle.Render("tab switch field · enter newline · ctrl+enter add · esc cancel"))
 	return configPanelStyle.Render(strings.Join(lines, "\n"))
 }
 
@@ -595,8 +697,28 @@ func (m *dashboardModel) renderTaskDetail() string {
 		helpStyle.Render("description"),
 	}
 	lines = append(lines, descLines...)
+	if t := m.taskStore.Get(m.taskDetailID); t != nil && len(t.Runs) > 0 {
+		lines = append(lines, "", helpStyle.Render("sessions"))
+		for _, r := range t.Runs {
+			state := string(r.Status)
+			if r.Status == task.StatusInProgress {
+				state = "active"
+			}
+			lines = append(lines, fmt.Sprintf("  %s  %s · %s", m.runGlyph(r), r.Agent, state))
+		}
+	}
 	lines = append(lines, "", helpStyle.Render("tab switch field · enter newline · esc save"))
 	return configPanelStyle.Render(strings.Join(lines, "\n"))
+}
+
+func (m *dashboardModel) runGlyph(r ipc.TaskRun) string {
+	if r.Status == task.StatusInProgress {
+		if s := m.sessionByID(r.CBSessionID); s != nil {
+			return m.indicator(s.Status)
+		}
+		return m.indicator("working")
+	}
+	return statusStyle["idle"].Render("‖")
 }
 
 func (m *dashboardModel) renderTaskAgentStage() string {

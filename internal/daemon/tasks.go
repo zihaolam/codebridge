@@ -4,6 +4,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"codebridge/internal/ipc"
 	"codebridge/internal/task"
 )
@@ -51,9 +53,6 @@ func (d *Daemon) taskDispatch(req ipc.Request) ipc.Response {
 	case "task_status":
 		return d.taskMutate(req.ID, func(t *task.Task) {
 			t.Status = task.Status(req.Status)
-			if t.Status == task.StatusCompleted {
-				t.CBSessionID = "" // the live link (if any) is done tracking
-			}
 		})
 
 	case "task_delete":
@@ -70,6 +69,8 @@ func (d *Daemon) taskDispatch(req ipc.Request) ipc.Response {
 
 	case "task_start":
 		return d.taskStart(req)
+	case "task_resume":
+		return d.taskResume(req)
 	}
 	return ipc.Response{Error: "unknown task request: " + req.Type}
 }
@@ -95,13 +96,9 @@ func (d *Daemon) taskMutate(id string, fn func(*task.Task)) ipc.Response {
 	return ipc.Response{OK: true, Tasks: tasks}
 }
 
-// taskStart spawns an agent session for a task and links the task to it. Fresh
-// (pending) tasks — and paused tasks that never reported an agent session id —
-// start the bare agent with the task text prefilled (delivered unsubmitted by
-// the daemon). Paused tasks resume instead: claude/codex by exact session id,
-// codex without one falls back to `resume --last`, opencode to `--continue`.
-// This logic used to live in the TUI's startTaskCmd; it moved here so both the
-// TUI and the web bridge get identical behavior.
+// taskStart always creates a fresh run. This is deliberately distinct from
+// taskResume: a task may have multiple live sessions, so starting work must
+// never silently resume an arbitrary earlier run.
 func (d *Daemon) taskStart(req ipc.Request) ipc.Response {
 	bin := req.Agent
 	if bin == "" {
@@ -121,22 +118,6 @@ func (d *Daemon) taskStart(req ipc.Request) ipc.Response {
 	if t.Desc != "" {
 		prefill += "\n\n" + t.Desc
 	}
-	if t.Status == task.StatusPaused {
-		switch {
-		case bin == "claude" && t.AgentSessionID != "":
-			argv = []string{"claude", "--resume", t.AgentSessionID}
-			prefill = ""
-		case bin == "codex" && t.AgentSessionID != "":
-			argv = []string{"codex", "resume", t.AgentSessionID}
-			prefill = ""
-		case bin == "codex":
-			argv = []string{"codex", "resume", "--last"}
-			prefill = ""
-		case bin == "opencode":
-			argv = []string{"opencode", "--continue"}
-			prefill = ""
-		}
-	}
 	d.taskMu.Unlock()
 
 	resp := d.spawn(ipc.Request{
@@ -151,11 +132,71 @@ func (d *Daemon) taskStart(req ipc.Request) ipc.Response {
 	// two locks; if so the session still runs, we just don't track it.
 	d.taskMu.Lock()
 	if t := d.taskStore.Get(req.ID); t != nil {
-		t.Status = task.StatusInProgress
-		t.CBSessionID = resp.ID
-		t.Agent = bin
-		t.Cwd = req.Cwd
+		now := time.Now()
+		t.Runs = append(t.Runs, ipc.TaskRun{ID: uuid.NewString(), Agent: bin, Cwd: req.Cwd, CBSessionID: resp.ID, Status: task.StatusInProgress, CreatedAt: now, UpdatedAt: now})
+		t.Status = derivedTaskStatus(t)
 		t.UpdatedAt = time.Now()
+		_ = d.taskStore.Save()
+	}
+	tasks := cloneTasks(d.taskStore.Tasks)
+	d.taskMu.Unlock()
+	d.notifyChange()
+	return ipc.Response{OK: true, ID: resp.ID, Tasks: tasks}
+}
+
+// taskResume starts a new daemon session for one paused run, preserving its
+// agent-specific resume identity. The resumed session replaces the old daemon
+// attachment on that run, rather than creating a second run.
+func (d *Daemon) taskResume(req ipc.Request) ipc.Response {
+	d.taskMu.Lock()
+	t := d.taskStore.Get(req.ID)
+	if t == nil {
+		d.taskMu.Unlock()
+		return ipc.Response{Error: "no such task: " + req.ID}
+	}
+	var run *ipc.TaskRun
+	for i := range t.Runs {
+		if t.Runs[i].ID == req.RunID {
+			run = &t.Runs[i]
+			break
+		}
+	}
+	if run == nil || run.Status != task.StatusPaused {
+		d.taskMu.Unlock()
+		return ipc.Response{Error: "no such paused task run: " + req.RunID}
+	}
+	bin, agentID := run.Agent, run.AgentSessionID
+	cwd := req.Cwd
+	if cwd == "" {
+		cwd = run.Cwd
+	}
+	d.taskMu.Unlock()
+	if bin == "" {
+		return ipc.Response{Error: "task run has no agent"}
+	}
+	argv := []string{bin}
+	switch {
+	case bin == "claude" && agentID != "":
+		argv = []string{"claude", "--resume", agentID}
+	case bin == "codex" && agentID != "":
+		argv = []string{"codex", "resume", agentID}
+	case bin == "codex":
+		argv = []string{"codex", "resume", "--last"}
+	case bin == "opencode":
+		argv = []string{"opencode", "--continue"}
+	}
+	resp := d.spawn(ipc.Request{Type: "spawn", Argv: argv, Cwd: cwd, Rows: req.Rows, Cols: req.Cols})
+	if !resp.OK {
+		return resp
+	}
+	d.taskMu.Lock()
+	if t := d.taskStore.Get(req.ID); t != nil {
+		for i := range t.Runs {
+			if t.Runs[i].ID == req.RunID {
+				t.Runs[i].CBSessionID, t.Runs[i].Status, t.Runs[i].UpdatedAt = resp.ID, task.StatusInProgress, time.Now()
+			}
+		}
+		t.Status, t.UpdatedAt = derivedTaskStatus(t), time.Now()
 		_ = d.taskStore.Save()
 	}
 	tasks := cloneTasks(d.taskStore.Tasks)
@@ -177,6 +218,9 @@ func cloneTasks(in []ipc.Task) []ipc.Task {
 	}
 	out := make([]ipc.Task, len(in))
 	copy(out, in)
+	for i := range out {
+		out[i].Runs = append([]ipc.TaskRun(nil), in[i].Runs...)
+	}
 	return out
 }
 
@@ -229,27 +273,44 @@ func reconcileTaskStates(tasks []ipc.Task, live map[string]sessState, now time.T
 	dirty := false
 	for i := range tasks {
 		t := &tasks[i]
-		if t.Status != task.StatusInProgress {
-			continue
-		}
-		s, ok := live[t.CBSessionID]
-		if t.CBSessionID == "" || !ok || s.gone {
-			// Grace window: a spawn that just linked this task may not be in the
-			// session snapshot yet — absence there isn't "ended".
-			if now.Sub(t.UpdatedAt) < taskSyncGrace {
+		for j := range t.Runs {
+			r := &t.Runs[j]
+			if r.Status != task.StatusInProgress {
 				continue
 			}
-			t.Status = task.StatusPaused
-			t.CBSessionID = ""
-			t.UpdatedAt = now
-			dirty = true
-			continue
+			s, ok := live[r.CBSessionID]
+			if r.CBSessionID == "" || !ok || s.gone {
+				if now.Sub(r.UpdatedAt) < taskSyncGrace {
+					continue
+				}
+				r.Status, r.CBSessionID, r.UpdatedAt = task.StatusPaused, "", now
+				dirty = true
+				continue
+			}
+			if s.harness != "" && s.harness != r.AgentSessionID {
+				r.AgentSessionID, r.UpdatedAt = s.harness, now
+				dirty = true
+			}
 		}
-		if s.harness != "" && s.harness != t.AgentSessionID {
-			t.AgentSessionID = s.harness
-			t.UpdatedAt = now
-			dirty = true
+		status := derivedTaskStatus(t)
+		if t.Status != task.StatusCompleted && t.Status != status {
+			t.Status, t.UpdatedAt, dirty = status, now, true
 		}
 	}
 	return dirty
+}
+
+func derivedTaskStatus(t *ipc.Task) task.Status {
+	if t.Status == task.StatusCompleted {
+		return task.StatusCompleted
+	}
+	for _, r := range t.Runs {
+		if r.Status == task.StatusInProgress {
+			return task.StatusInProgress
+		}
+	}
+	if len(t.Runs) > 0 {
+		return task.StatusPaused
+	}
+	return task.StatusPending
 }

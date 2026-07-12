@@ -96,3 +96,19 @@ func TestCRUDAndForScope(t *testing.T) {
 		t.Errorf("Delete(unknown) changed the store: %+v", st.Tasks)
 	}
 }
+
+func TestLoadMigratesLegacySessionIntoRun(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "tasks.json")
+	data := []byte(`{"tasks":[{"id":"task-1","title":"legacy","status":"paused","agent":"codex","cb_session_id":"cb-1","agent_session_id":"agent-1"}]}`)
+	if err := os.WriteFile(p, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st := LoadFrom(p)
+	if len(st.Tasks) != 1 || len(st.Tasks[0].Runs) != 1 {
+		t.Fatalf("legacy task was not migrated: %+v", st.Tasks)
+	}
+	r := st.Tasks[0].Runs[0]
+	if r.CBSessionID != "cb-1" || r.AgentSessionID != "agent-1" || r.Agent != "codex" {
+		t.Fatalf("migrated run wrong: %+v", r)
+	}
+}

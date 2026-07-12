@@ -121,7 +121,8 @@ export default function TaskList({
               ) : (
                 <ul>
                   {sorted.map((t) => {
-                    const live = sessionById(t.cb_session_id)
+                    const liveRuns = (t.runs ?? []).filter((r) => r.status === 'in_progress')
+                    const live = sessionById(liveRuns[0]?.cb_session_id)
                     const working = t.status === 'in_progress' && live?.status === 'working'
                     const glyph =
                       t.status === 'in_progress'
@@ -129,7 +130,7 @@ export default function TaskList({
                           ? (SESSION_GLYPH[live.status] ?? { g: '◐', cls: 'st-waiting' })
                           : { g: '◐', cls: 'st-waiting' }
                         : (REST_GLYPH[t.status] ?? { g: '·', cls: '' })
-                    const canStart = t.status === 'pending' || t.status === 'paused'
+                    const canStart = t.status !== 'completed'
                     return (
                       <li
                         key={t.id}
@@ -144,12 +145,12 @@ export default function TaskList({
                           className="task-title"
                           title={t.desc || t.title}
                           onClick={() =>
-                            t.status === 'in_progress' && t.cb_session_id
-                              ? onJump(t.cb_session_id)
+                            t.status === 'in_progress' && liveRuns[0]?.cb_session_id
+                              ? onJump(liveRuns[0].cb_session_id)
                               : setEditor({ scope: t.scope, task: t })
                           }
                         >
-                          {t.title}
+                          {t.title}{t.runs?.length ? ` · ${t.runs.length} session${t.runs.length === 1 ? '' : 's'}` : ''}
                         </button>
                         <div className="task-actions">
                           {canStart && (

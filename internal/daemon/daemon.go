@@ -20,7 +20,6 @@ import (
 	"github.com/google/uuid"
 
 	"codebridge/internal/ipc"
-	"codebridge/internal/notify"
 	"codebridge/internal/session"
 	"codebridge/internal/task"
 )
@@ -171,7 +170,7 @@ func (d *Daemon) dispatch(req ipc.Request) ipc.Response {
 		return d.hook(req)
 	case "extract":
 		return d.extract(req)
-	case "task_list", "task_add", "task_edit", "task_status", "task_delete", "task_start":
+	case "task_list", "task_add", "task_edit", "task_status", "task_delete", "task_start", "task_resume":
 		return d.taskDispatch(req)
 	default:
 		return ipc.Response{Error: "unknown request type: " + req.Type}
@@ -279,36 +278,12 @@ func (d *Daemon) hook(req ipc.Request) ipc.Response {
 		s.SetHarnessSessionID(p.SessionID)
 	}
 
-	prev := s.Status()
 	status, msg := statusForEvent(req.Event, p)
 	s.SetStatus(status, msg)
 	log.Printf("hook %s -> session %s status=%s", req.Event, req.Session, status)
 	d.notifyChange()
 
-	// Fire a desktop notification on the edge into needs_approval, so you're
-	// alerted even when cb isn't focused (or no client is attached).
-	if status == session.StatusNeedsApproval && prev != session.StatusNeedsApproval {
-		body := msg
-		if body == "" {
-			body = "A session needs your approval"
-		}
-		notify.Send("Claude Code · "+shortLabel(s), body)
-	}
 	return ipc.Response{OK: true}
-}
-
-// shortLabel is a human hint for which session a notification is about.
-func shortLabel(s *session.Session) string {
-	if n := s.Name(); n != "" {
-		return n
-	}
-	if s.Cwd != "" {
-		parts := strings.Split(strings.TrimRight(s.Cwd, "/"), "/")
-		if n := len(parts); n > 0 && parts[n-1] != "" {
-			return parts[n-1]
-		}
-	}
-	return s.ID[:8]
 }
 
 // statusForEvent maps a hook event name to a semantic status. The mapping is
