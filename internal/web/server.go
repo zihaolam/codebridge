@@ -18,7 +18,7 @@ import (
 //go:embed all:dist
 var distFS embed.FS
 
-// DefaultPort is where `cb web` listens on 127.0.0.1 unless --port overrides.
+// DefaultPort is where the daemon-owned bridge listens on 127.0.0.1.
 const DefaultPort = 8899
 
 // Server is the bridge: static PWA + /ws, one poller shared by all clients.
@@ -45,8 +45,9 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// Run serves the bridge on 127.0.0.1:port until the process exits. The caller
-// (cli) has already ensured a protocol-matched daemon is running.
+// Run serves the bridge on 127.0.0.1:port until the process exits. The default
+// instance is launched alongside `cb daemon`; callers may use another port for
+// an explicitly requested extra bridge.
 func Run(port int) error {
 	cfg, err := LoadOrCreate()
 	if err != nil {

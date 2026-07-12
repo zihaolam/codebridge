@@ -34,10 +34,17 @@ const attachScannerBuf = 8 * 1024 * 1024
 // old to speak `watch`. Each subscriber channel is coalescing (latest wins):
 // a slow client sees fewer snapshots, never stale ones, and never blocks the
 // upstream loop or other clients.
+// snapshot is one fan-out unit: the enriched session list plus the backlog,
+// pushed together so a browser repaints both from a single wakeup.
+type snapshot struct {
+	sessions []webSession
+	tasks    []webTask
+}
+
 type poller struct {
 	mu   sync.Mutex
-	subs map[chan []webSession]struct{}
-	last []webSession
+	subs map[chan snapshot]struct{}
+	last snapshot
 	seen bool // whether last holds a real snapshot yet
 
 	// lastJSON dedupes snapshots across watch reconnects and poll ticks;
@@ -49,7 +56,7 @@ type poller struct {
 
 func newPoller() *poller {
 	return &poller{
-		subs:       make(map[chan []webSession]struct{}),
+		subs:       make(map[chan snapshot]struct{}),
 		scopeCache: make(map[string]string),
 	}
 }
@@ -110,7 +117,7 @@ func (p *poller) watch(ctx context.Context) error {
 			return errWatchUnsupported
 		}
 		if resp.OK {
-			p.publish(resp.Sessions)
+			p.publish(resp.Sessions, resp.Tasks)
 		}
 	}
 	return sc.Err()
@@ -131,21 +138,24 @@ func (p *poller) pollLoop(ctx context.Context, window time.Duration) {
 		case <-t.C:
 			resp, err := ipc.Send(ipc.Request{Type: "list"})
 			if err == nil && resp.OK {
-				p.publish(resp.Sessions)
+				p.publish(resp.Sessions, resp.Tasks)
 			}
 		}
 	}
 }
 
-// publish dedupes, enriches, and broadcasts one snapshot.
-func (p *poller) publish(list []ipc.SessionInfo) {
-	b, err := json.Marshal(list)
+// publish dedupes, enriches, and broadcasts one snapshot (sessions + backlog).
+func (p *poller) publish(list []ipc.SessionInfo, tasks []ipc.Task) {
+	b, err := json.Marshal(struct {
+		S []ipc.SessionInfo `json:"s"`
+		T []ipc.Task        `json:"t"`
+	}{list, tasks})
 	if err != nil {
 		return
 	}
 	if s := string(b); s != p.lastJSON {
 		p.lastJSON = s
-		p.broadcast(p.enrich(list))
+		p.broadcast(snapshot{sessions: p.enrich(list), tasks: enrichTasks(tasks)})
 	}
 }
 
@@ -163,7 +173,22 @@ func (p *poller) enrich(list []ipc.SessionInfo) []webSession {
 	return out
 }
 
-func (p *poller) broadcast(snap []webSession) {
+// enrichTasks tags each task with the display name of its (already-computed)
+// scope key, so the browser groups the backlog by repo. A task's Scope is set
+// by whichever client created it (the TUI's currentScope / the web group key),
+// so no filesystem walk is needed here.
+func enrichTasks(tasks []ipc.Task) []webTask {
+	if len(tasks) == 0 {
+		return nil
+	}
+	out := make([]webTask, len(tasks))
+	for i, t := range tasks {
+		out[i] = webTask{Task: t, ScopeName: scopeName(t.Scope)}
+	}
+	return out
+}
+
+func (p *poller) broadcast(snap snapshot) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.last, p.seen = snap, true
@@ -174,7 +199,7 @@ func (p *poller) broadcast(snap []webSession) {
 
 // sendLatest pushes snap into a 1-buffered channel, displacing any unread
 // older snapshot.
-func sendLatest(ch chan []webSession, snap []webSession) {
+func sendLatest(ch chan snapshot, snap snapshot) {
 	for {
 		select {
 		case ch <- snap:
@@ -190,8 +215,8 @@ func sendLatest(ch chan []webSession, snap []webSession) {
 
 // subscribe registers a coalescing snapshot channel, primed with the current
 // snapshot if one exists so new clients render the list immediately.
-func (p *poller) subscribe() chan []webSession {
-	ch := make(chan []webSession, 1)
+func (p *poller) subscribe() chan snapshot {
+	ch := make(chan snapshot, 1)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.subs[ch] = struct{}{}
@@ -201,7 +226,7 @@ func (p *poller) subscribe() chan []webSession {
 	return ch
 }
 
-func (p *poller) unsubscribe(ch chan []webSession) {
+func (p *poller) unsubscribe(ch chan snapshot) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.subs, ch)

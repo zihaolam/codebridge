@@ -24,11 +24,30 @@ export type WorktreeEntry = {
   main?: boolean
 }
 
+// TaskInfo mirrors internal/web webTask (ipc.Task + scope_name). The daemon
+// owns the backlog; the browser never persists tasks, it only sends task_*
+// ops and renders the snapshots the bridge pushes.
+export type TaskInfo = {
+  id: string
+  scope: string
+  scope_name: string
+  title: string
+  desc?: string
+  status: string
+  agent?: string
+  cwd?: string
+  cb_session_id?: string
+  agent_session_id?: string
+  created_at: string
+  updated_at: string
+}
+
 export type Down = {
-  type: 'hello' | 'sessions' | 'frame' | 'gone' | 'spawned' | 'worktrees' | 'error'
+  type: 'hello' | 'sessions' | 'tasks' | 'frame' | 'gone' | 'spawned' | 'worktrees' | 'error'
   protocol?: number
   daemon?: boolean
   sessions?: SessionInfo[]
+  tasks?: TaskInfo[]
   id?: string
   screen?: string
   cursor_x?: number
@@ -60,7 +79,9 @@ const RETRY_MS = 2000
 export class CbClient {
   onState?: (s: ClientState) => void
   onHello?: (protocol: number, daemon: boolean) => void
+  onAgents?: (agents: string[]) => void
   onSessions?: (s: SessionInfo[]) => void
+  onTasks?: (t: TaskInfo[]) => void
   onFrame?: (f: Down) => void
   onGone?: (id: string) => void
   onError?: (msg: string) => void
@@ -71,6 +92,7 @@ export class CbClient {
   private token: string
   private stopped = false
   private attachedId: string | null = null
+  private viewportSize: { rows: number; cols: number } | null = null
 
   constructor(token: string) {
     this.token = token
@@ -109,11 +131,18 @@ export class CbClient {
       case 'hello':
         this.onState?.('open')
         this.onHello?.(m.protocol ?? 0, m.daemon ?? false)
+        this.onAgents?.(m.agents ?? [])
         // Re-attach after a reconnect so the frame stream resumes.
-        if (this.attachedId) this.send({ type: 'attach', id: this.attachedId })
+        if (this.attachedId) {
+          this.send({ type: 'attach', id: this.attachedId })
+          if (this.viewportSize) this.send({ type: 'viewport', ...this.viewportSize })
+        }
         break
       case 'sessions':
         this.onSessions?.(m.sessions ?? [])
+        break
+      case 'tasks':
+        this.onTasks?.(m.tasks ?? [])
         break
       case 'frame':
         this.onFrame?.(m)
@@ -138,15 +167,9 @@ export class CbClient {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(m))
   }
 
-  attach(id: string, rows?: number, cols?: number) {
+  attach(id: string) {
     this.attachedId = id
-    const m: Record<string, unknown> = { type: 'attach', id }
-    // Claim the session size like the TUI does, so the view fills the pane.
-    if (rows && cols) {
-      m.rows = rows
-      m.cols = cols
-    }
-    this.send(m)
+    this.send({ type: 'attach', id })
   }
 
   input(text: string) {
@@ -169,6 +192,11 @@ export class CbClient {
     this.send({ type: 'resize', rows, cols })
   }
 
+  viewport(rows: number, cols: number) {
+    this.viewportSize = { rows, cols }
+    this.send({ type: 'viewport', rows, cols })
+  }
+
   spawn(argv: string[], cwd: string) {
     this.send({ type: 'spawn', argv, cwd })
   }
@@ -179,5 +207,27 @@ export class CbClient {
 
   kill(id: string) {
     this.send({ type: 'kill', id })
+  }
+
+  // Backlog ops — all proxied by the bridge to the daemon (the single writer).
+  taskAdd(scope: string, title: string, desc = '') {
+    this.send({ type: 'task_add', scope, title, desc })
+  }
+
+  taskEdit(id: string, title: string, desc: string) {
+    this.send({ type: 'task_edit', id, title, desc })
+  }
+
+  // status maps to the wire's `task_status` field (see internal/web wsUp).
+  taskStatus(id: string, status: string) {
+    this.send({ type: 'task_status', id, task_status: status })
+  }
+
+  taskDelete(id: string) {
+    this.send({ type: 'task_delete', id })
+  }
+
+  taskStart(id: string, agent: string, cwd: string) {
+    this.send({ type: 'task_start', id, agent, cwd })
   }
 }

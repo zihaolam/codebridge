@@ -17,6 +17,7 @@ import (
 	"codebridge/internal/ipc"
 	"codebridge/internal/session"
 	"codebridge/internal/tui"
+	"codebridge/internal/web"
 )
 
 // build holds the version metadata stamped into the binary at release time.
@@ -48,17 +49,15 @@ func Run(args []string) error {
 	case "demo":
 		return runDemo(args[1:])
 	case "daemon":
-		return daemon.Run()
+		return runDaemon()
 	case "stop":
-		resp, err := ipc.Send(ipc.Request{Type: "shutdown"})
-		if err != nil {
+		if err := stopDaemon(); err != nil {
 			return fmt.Errorf("daemon not running")
-		}
-		if !resp.OK {
-			return fmt.Errorf("%s", resp.Error)
 		}
 		fmt.Println("daemon stopped")
 		return nil
+	case "restart":
+		return restartDaemon()
 	case "hook":
 		return hook.Run(args[1:])
 	case "ctl":
@@ -73,11 +72,58 @@ func Run(args []string) error {
 		fmt.Println(versionString())
 		return nil
 	case "-h", "--help", "help":
-		fmt.Println("usage: cb [--all|daemon|ctl|web|hook|install-hooks|install-codex|stop|version] ...")
+		fmt.Println("usage: cb [--all|daemon|ctl|web|hook|install-hooks|install-codex|stop|restart|version] ...")
 		return nil
 	default:
 		return fmt.Errorf("unknown subcommand %q", args[0])
 	}
+}
+
+// stopDaemon asks the daemon to stop after replying, so callers can safely
+// wait for its socket to disappear before starting a replacement.
+func stopDaemon() error {
+	resp, err := ipc.Send(ipc.Request{Type: "shutdown"})
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("%s", resp.Error)
+	}
+	return nil
+}
+
+// restartDaemon replaces a running daemon (and its daemon-owned HTTP bridge).
+// If none is running it behaves like a start, which is convenient for scripts.
+func restartDaemon() error {
+	if err := stopDaemon(); err == nil {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if c, err := net.Dial("unix", ipc.SocketPath()); err != nil {
+				break
+			} else {
+				c.Close()
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if err := ensureDaemon(); err != nil {
+		return err
+	}
+	fmt.Println("daemon restarted")
+	return nil
+}
+
+// runDaemon owns the default HTTP bridge's lifetime as well as the Unix-socket
+// daemon's. Keeping this wiring in the CLI preserves the daemon package's
+// client-agnostic boundary: the web bridge continues to talk over IPC just
+// like the TUI does.
+func runDaemon() error {
+	go func() {
+		if err := web.Run(web.DefaultPort); err != nil {
+			fmt.Fprintf(os.Stderr, "cb web: %v\n", err)
+		}
+	}()
+	return daemon.Run()
 }
 
 // versionString reports the build version for `cb version` / `cb --version`.

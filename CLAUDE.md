@@ -66,9 +66,10 @@ under a PTY (see the Python `pty` harnesses used during development) or test by 
   claude / codex instantly in the launch scope's cwd (see `spawnTargetCwd`).
 - **`internal/cli`** — subcommand router + `ensureDaemon` (auto-start with a readiness wait
   and protocol-version check).
-- **`internal/web`** — the `cb web` bridge: a separate process that is just another daemon
+- **`internal/web`** — the daemon-started mobile bridge: it remains just another daemon
   client (unix socket, same ipc protocol) and serves the mobile PWA + a `/ws` WebSocket on
-  `127.0.0.1` (expose via `tailscale serve`). One multiplexed WS per browser: token auth as
+  `127.0.0.1` (expose via `tailscale serve`). The CLI starts it alongside `cb daemon`, while
+  the daemon package stays web-agnostic. One multiplexed WS per browser: token auth as
   the first message (token in `~/.cb/web.json`; `cb web token|qr`), then session-list
   snapshots and frame passthrough for the attached session. The list is push-based: the
   bridge holds one daemon `watch` stream (`daemon/watch.go` — a snapshot line on every
@@ -141,8 +142,8 @@ raw `allSessions` list.
   attached, or the child blocks on write when the PTY buffer fills. `readLoop` always runs.
 - **Stale daemon.** The daemon is long-lived and is *not* restarted by rebuilding the
   binary. `ensureDaemon` checks `ProtocolVersion` and refuses to proceed against a stale
-  daemon. Bump `ipc.ProtocolVersion` on any wire change. To restart: `cb stop` or
-  `pkill -f 'cb daemon'`.
+  daemon. Bump `ipc.ProtocolVersion` on any wire change. To restart: `cb restart` (or
+  `pkill -f 'cb daemon'`).
 - **Group kill.** Sessions are started with `Setsid` (via `pty.StartWithSize`), so
   `Session.Kill` signals the negative pid to take down claude *and* its subprocess tree.
 - **Input fidelity.** `keys.go` re-encodes Bubble Tea `KeyMsg` to bytes. It covers common

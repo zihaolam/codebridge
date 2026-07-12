@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"codebridge/internal/ipc"
 	"codebridge/internal/task"
 )
 
@@ -105,62 +104,6 @@ func TestRebuildTaskRowsSections(t *testing.T) {
 	}
 }
 
-// TestSyncTasksTransitions covers the reconcile pass: harvest a claude session
-// id from a live session; pause tasks whose session vanished / exited /
-// reported ended (keeping the resume handle); leave freshly started tasks
-// alone (grace window) and non-in_progress tasks untouched.
-func TestSyncTasksTransitions(t *testing.T) {
-	st := testTaskStore(t)
-	old := time.Now().Add(-time.Minute)
-	mk := func(title, cbID, agentID string) string {
-		id := st.Add("cur", title, "").ID
-		tk := st.Get(id)
-		tk.Status = task.StatusInProgress
-		tk.CBSessionID = cbID
-		tk.AgentSessionID = agentID
-		tk.UpdatedAt = old
-		return id
-	}
-	harvest := mk("harvest", "s1", "")
-	vanished := mk("vanished", "s2", "claude-keep")
-	exited := mk("exited", "s3", "")
-	ended := mk("ended", "s4", "")
-	fresh := mk("fresh", "s5", "")
-	st.Get(fresh).UpdatedAt = time.Now() // inside the grace window
-	pausedID := st.Add("cur", "already-paused", "").ID
-	st.Get(pausedID).Status = task.StatusPaused
-	st.Get(pausedID).AgentSessionID = "claude-old"
-
-	m := &dashboardModel{currentScope: "cur", taskStore: st}
-	m.syncTasks([]ipc.SessionInfo{
-		{ID: "s1", Status: "working", HarnessSessionID: "claude-1"},
-		{ID: "s3", Status: "working", Exited: true},
-		{ID: "s4", Status: "ended"},
-	})
-
-	if got := st.Get(harvest); got.Status != task.StatusInProgress || got.AgentSessionID != "claude-1" {
-		t.Errorf("harvest task: %+v, want in_progress with claude-1", got)
-	}
-	for _, id := range []string{vanished, exited, ended} {
-		got := st.Get(id)
-		if got.Status != task.StatusPaused {
-			t.Errorf("%s: status = %s, want paused", got.Title, got.Status)
-		}
-		if got.CBSessionID != "" {
-			t.Errorf("%s: cb_session_id not cleared: %q", got.Title, got.CBSessionID)
-		}
-	}
-	if got := st.Get(vanished); got.AgentSessionID != "claude-keep" {
-		t.Errorf("pause dropped the resume handle: %+v", got)
-	}
-	if got := st.Get(fresh); got.Status != task.StatusInProgress {
-		t.Errorf("fresh task paused despite grace window: %+v", got)
-	}
-	if got := st.Get(pausedID); got.Status != task.StatusPaused || got.AgentSessionID != "claude-old" {
-		t.Errorf("paused task touched: %+v", got)
-	}
-}
-
 // TestTaskDoubleStartGuard: pressing s on an in_progress task must not open
 // the agent picker (which would spawn a second agent on the same work) — it
 // closes the dialog and jumps to the live session instead.
@@ -192,7 +135,9 @@ func TestTaskDoubleStartGuard(t *testing.T) {
 }
 
 // TestTaskNewFlow drives the new-task input: n opens it, typed text plus enter
-// commits a pending task in the current scope, and the cursor lands on it.
+// returns to the list with the buffer cleared and emits a mutation command
+// (the daemon, not the client, performs the actual add — see the daemon's
+// task_add test). An empty title emits no command.
 func TestTaskNewFlow(t *testing.T) {
 	st := testTaskStore(t)
 	m := &dashboardModel{
@@ -210,16 +155,21 @@ func TestTaskNewFlow(t *testing.T) {
 	for _, ch := range []string{"f", "i", "x"} {
 		m.handleTaskKey(key(ch))
 	}
-	m.handleTaskKey(key("enter"))
+	_, cmd := m.handleTaskKey(key("enter"))
 
 	if m.taskStage != taskStageList {
 		t.Fatalf("stage = %v, want list after enter", m.taskStage)
 	}
-	tasks := st.ForScope("cur")
-	if len(tasks) != 1 || tasks[0].Title != "fix" || tasks[0].Status != task.StatusPending {
-		t.Fatalf("committed task wrong: %+v", tasks)
+	if m.taskTitleBuf != "" {
+		t.Errorf("title buffer not cleared: %q", m.taskTitleBuf)
 	}
-	if got := m.taskUnderCursor(); got == nil || got.ID != tasks[0].ID {
-		t.Errorf("cursor not on the new task: %+v", got)
+	if cmd == nil {
+		t.Fatal("enter with a non-empty title should emit an add command")
+	}
+
+	// An empty title is dropped: no command.
+	m.handleTaskKey(key("n"))
+	if _, cmd := m.handleTaskKey(key("enter")); cmd != nil {
+		t.Error("enter with an empty title should not emit a command")
 	}
 }

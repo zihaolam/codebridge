@@ -78,9 +78,14 @@ func (c *client) run(ctx context.Context) {
 		}
 	}()
 
-	c.send(ctx, wsDown{Type: "hello", Protocol: ipc.ProtocolVersion, Daemon: pingDaemon()})
+	c.send(ctx, wsDown{
+		Type: "hello", Protocol: ipc.ProtocolVersion,
+		Daemon: pingDaemon(), Agents: availableAgents(),
+	})
 
-	// Session-list pump.
+	// Session-list + backlog pump: each snapshot fans out both a `sessions` and
+	// a `tasks` frame so the browser repaints the sidebar and the task screen
+	// from one wakeup.
 	sub := c.srv.poller.subscribe()
 	defer c.srv.poller.unsubscribe(sub)
 	go func() {
@@ -89,7 +94,8 @@ func (c *client) run(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case snap := <-sub:
-				c.send(ctx, wsDown{Type: "sessions", Sessions: snap})
+				c.send(ctx, wsDown{Type: "sessions", Sessions: snap.sessions})
+				c.send(ctx, wsDown{Type: "tasks", Tasks: snap.tasks})
 			}
 		}
 	}()
@@ -120,6 +126,8 @@ func (c *client) dispatch(ctx context.Context, up wsUp) {
 		c.forward(ipc.StreamUp{Type: "paste", Data: up.Data})
 	case "resize":
 		c.forward(ipc.StreamUp{Type: "resize", Rows: up.Rows, Cols: up.Cols})
+	case "viewport":
+		c.forward(ipc.StreamUp{Type: "viewport", Rows: up.Rows, Cols: up.Cols})
 	case "scroll":
 		c.forward(ipc.StreamUp{Type: "scroll", Offset: up.Offset})
 	case "interrupt":
@@ -149,14 +157,58 @@ func (c *client) dispatch(ctx context.Context, up wsUp) {
 			wts = []worktreeEntry{{Path: up.Cwd, Main: true}}
 		}
 		c.send(ctx, wsDown{Type: "worktrees", Cwd: up.Cwd, Worktrees: wts, Agents: availableAgents()})
+	case "task_list", "task_add", "task_edit", "task_status", "task_delete":
+		c.proxyTask(ctx, up)
+	case "task_start":
+		c.taskStart(ctx, up)
+	}
+}
+
+// proxyTask forwards a backlog mutation straight to the daemon (the single
+// writer of tasks.json) and replies with the fresh, scope-enriched list. The
+// daemon's notifyChange also pushes the same list to every client's task pump,
+// so peers stay in sync; this reply just gives the mutating browser an
+// immediate update without waiting for that round-trip.
+func (c *client) proxyTask(ctx context.Context, up wsUp) {
+	resp, err := ipc.Send(ipc.Request{
+		Type: up.Type, ID: up.ID, Scope: up.Scope,
+		Title: up.Title, Desc: up.Desc, Status: up.Status,
+	})
+	switch {
+	case err != nil:
+		c.send(ctx, wsDown{Type: "error", Error: err.Error()})
+	case !resp.OK:
+		c.send(ctx, wsDown{Type: "error", Error: resp.Error})
+	default:
+		c.send(ctx, wsDown{Type: "tasks", Tasks: enrichTasks(resp.Tasks)})
+	}
+}
+
+// taskStart asks the daemon to spawn an agent session for a task and link it
+// (the daemon owns the resume/prefill logic). No rows/cols are sent — like a
+// plain attach, a phone must never resize a session out from under the desktop
+// TUI. On success the browser gets the fresh backlog plus a `spawned` frame so
+// it can jump to the new session.
+func (c *client) taskStart(ctx context.Context, up wsUp) {
+	resp, err := ipc.Send(ipc.Request{
+		Type: "task_start", ID: up.ID, Agent: up.Agent, Cwd: up.Cwd,
+	})
+	switch {
+	case err != nil:
+		c.send(ctx, wsDown{Type: "error", Error: err.Error()})
+	case !resp.OK:
+		c.send(ctx, wsDown{Type: "error", Error: resp.Error})
+	default:
+		c.send(ctx, wsDown{Type: "tasks", Tasks: enrichTasks(resp.Tasks)})
+		c.send(ctx, wsDown{Type: "spawned", ID: resp.ID})
 	}
 }
 
 // attach switches this client's frame stream to the given session, replacing
 // any previous attach. Frames are tagged with the session id so the browser
 // can drop stragglers from a session it just switched away from. When the
-// browser supplies rows/cols it claims the session size (like the TUI's
-// attach); last attacher wins if several clients watch one session.
+// Browser attaches normally omit rows/cols: their viewport is independent of
+// the canonical PTY. An explicit resize action may still claim the PTY size.
 func (c *client) attach(ctx context.Context, id string, rows, cols int) {
 	if id == "" {
 		return

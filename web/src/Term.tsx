@@ -3,12 +3,8 @@
 // ref — deliberately outside React state, so 30fps repaints never touch the
 // React render cycle.
 //
-// Sizing: like the TUI, the client claims the session size — FitAddon
-// proposes the grid that fills the pane at the fixed font, and we send it
-// with the attach (and again, debounced, when the pane resizes). The daemon
-// resizes the PTY, the child reflows, and frames come back at exactly the
-// pane's grid, so the view always fills the screen — live and scrollback
-// both. If the desktop TUI attaches to the same session, last attacher wins.
+// FitAddon reports this client's viewport without resizing the shared PTY.
+// The top-bar resize button is the only browser action that claims PTY size.
 import { useEffect, useRef } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
@@ -106,7 +102,7 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
         const sent = sentRef.current
         if (g && idRef.current && (g.rows !== sent.rows || g.cols !== sent.cols)) {
           sentRef.current = g
-          client.resize(g.rows, g.cols)
+          client.viewport(g.rows, g.cols)
         }
       }, RESIZE_DEBOUNCE_MS)
     })
@@ -136,10 +132,21 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
       termRef.current?.reset()
       const g = proposeGrid()
       sentRef.current = g ?? { rows: 0, cols: 0 }
-      client.attach(sessionId, g?.rows, g?.cols)
+      client.attach(sessionId)
+      if (g) client.viewport(g.rows, g.cols)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, sessionId])
+
+  useEffect(() => {
+    const claim = () => {
+      const g = proposeGrid()
+      if (g && idRef.current) client.resize(g.rows, g.cols)
+    }
+    window.addEventListener('cb-resize-session', claim)
+    return () => window.removeEventListener('cb-resize-session', claim)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [client])
 
   const setOffset = (next: number) => {
     const s = scrollRef.current

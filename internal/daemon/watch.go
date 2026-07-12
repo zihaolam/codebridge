@@ -46,11 +46,12 @@ func (d *Daemon) notifyChange() {
 	}
 }
 
-// watch takes over conn as a push stream: one Response{OK, Sessions} line
-// immediately, then another whenever the registry changes (spawn / kill /
-// rename / hook status) or the safety ticker notices a quieter change (child
-// exit). Pushes are deduped against the last snapshot's JSON so wakeups that
-// don't alter the visible list write nothing. Returns when the client closes.
+// watch takes over conn as a push stream: one Response{OK, Sessions, Tasks}
+// line immediately, then another whenever the registry or backlog changes
+// (spawn / kill / rename / hook status / task_* mutation) or the safety ticker
+// notices a quieter change (child exit → a task auto-pausing). Pushes are
+// deduped against the last snapshot's JSON so wakeups that don't alter the
+// visible state write nothing. Returns when the client closes.
 func (d *Daemon) watch(conn net.Conn, sc *bufio.Scanner) {
 	ch := d.subscribeChanges()
 	defer d.unsubscribeChanges(ch)
@@ -70,14 +71,19 @@ func (d *Daemon) watch(conn net.Conn, sc *bufio.Scanner) {
 	last := ""
 	push := func() bool {
 		d.pruneExited()
+		d.reconcileTasks()
 		snap := d.snapshot()
-		b, err := json.Marshal(snap)
+		tasks := d.taskSnapshot()
+		b, err := json.Marshal(struct {
+			S []ipc.SessionInfo `json:"s"`
+			T []ipc.Task        `json:"t"`
+		}{snap, tasks})
 		if err != nil {
 			return true
 		}
 		if s := string(b); s != last {
 			last = s
-			return ipc.WriteJSON(conn, ipc.Response{OK: true, Sessions: snap}) == nil
+			return ipc.WriteJSON(conn, ipc.Response{OK: true, Sessions: snap, Tasks: tasks}) == nil
 		}
 		return true
 	}

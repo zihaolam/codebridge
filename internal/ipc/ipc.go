@@ -15,7 +15,7 @@ import (
 // ProtocolVersion is bumped whenever the daemon/client wire protocol changes.
 // The client checks it on connect so a stale daemon (e.g. left running across a
 // rebuild) fails loudly instead of silently dropping attach/input messages.
-const ProtocolVersion = 8
+const ProtocolVersion = 10
 
 // Dir is the per-user state directory for cb.
 func Dir() string {
@@ -37,9 +37,11 @@ func SocketPath() string {
 // Request is a message from a client (or hook) to the daemon.
 type Request struct {
 	// Type also admits the stream-mode requests "attach" (bidirectional
-	// screen/input stream) and "watch" (server pushes a Response{OK,Sessions}
-	// line whenever the session list or a status changes), both of which take
-	// over the connection instead of replying once.
+	// screen/input stream) and "watch" (server pushes a Response{OK,Sessions,
+	// Tasks} line whenever the session list or backlog changes), both of which
+	// take over the connection instead of replying once. The daemon owns the
+	// task backlog: "task_list" | "task_add" | "task_edit" | "task_status" |
+	// "task_delete" | "task_start" mutate it and reply with the fresh Tasks.
 	Type string `json:"type"` // "spawn" | "list" | "kill" | "hook" | "extract" | "attach" | "watch"
 
 	// spawn
@@ -69,14 +71,25 @@ type Request struct {
 	LineEnd   int `json:"line_end,omitempty"`
 	ColStart  int `json:"col_start,omitempty"`
 	ColEnd    int `json:"col_end,omitempty"`
+
+	// task ops. ID targets an existing task (edit/status/delete/start). Scope +
+	// Title + Desc create one (task_add); Title/Desc also carry the detail edit
+	// (task_edit); Status carries the status change (task_status). Agent is the
+	// binary a task_start launches; that request reuses Cwd/Rows/Cols like spawn.
+	Scope  string `json:"scope,omitempty"`
+	Title  string `json:"title,omitempty"`
+	Desc   string `json:"desc,omitempty"`
+	Status string `json:"task_status,omitempty"`
+	Agent  string `json:"agent,omitempty"`
 }
 
 // Response is the daemon's reply.
 type Response struct {
 	OK       bool          `json:"ok"`
 	Error    string        `json:"error,omitempty"`
-	ID       string        `json:"id,omitempty"`       // spawn result
-	Sessions []SessionInfo `json:"sessions,omitempty"` // list result
+	ID       string        `json:"id,omitempty"`       // spawn / task_add / task_start result
+	Sessions []SessionInfo `json:"sessions,omitempty"` // list / watch result
+	Tasks    []Task        `json:"tasks,omitempty"`    // list / watch / task_* result
 	Version  int           `json:"version,omitempty"`  // ping result: daemon protocol version
 	PID      int           `json:"pid,omitempty"`      // ping result: daemon process id
 	Text     string        `json:"text,omitempty"`     // extract result: plain text
@@ -97,7 +110,7 @@ type SessionInfo struct {
 
 // StreamUp is a client→daemon message sent on an attached connection.
 type StreamUp struct {
-	Type string `json:"type"`           // "input" | "paste" | "resize" | "detach" | "scroll" | "interrupt"
+	Type string `json:"type"`           // "input" | "paste" | "resize" | "viewport" | "detach" | "scroll" | "interrupt"
 	Data string `json:"data,omitempty"` // base64-encoded input/paste bytes
 	Rows int    `json:"rows,omitempty"`
 	Cols int    `json:"cols,omitempty"`

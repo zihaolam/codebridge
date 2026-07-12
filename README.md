@@ -143,6 +143,7 @@ cb                 # the split view (auto-starts the daemon)
 cb install-hooks   # install the Claude Code hooks
 cb install-codex   # install the Codex hooks
 cb stop            # kill all sessions and stop the daemon
+cb restart         # restart the daemon and its HTTP bridge
 cb ctl list|spawn|kill   # scriptable client
 cb daemon          # run the hub in the foreground (normally auto-started)
 ```
@@ -225,13 +226,14 @@ native selection instead.
 
 ## Phone access (`cb web`)
 
-`cb web` serves a mobile web app — the same sidebar + live screen, from your phone: watch
-sessions, approve permissions, send prompts, spawn new agents per worktree. It's a
-separate bridge process that talks to the daemon like any other client; the daemon
+The daemon automatically starts a mobile web app — the same sidebar + live screen, from
+your phone: watch sessions, approve permissions, send prompts, spawn new agents per
+worktree. The bridge talks to the daemon like any other client; the daemon package itself
 doesn't know the web exists.
 
 ```sh
-cb web                 # serves http://127.0.0.1:8899 (embedded UI, WebSocket at /ws)
+cb                     # also starts http://127.0.0.1:8899 (embedded UI, WebSocket at /ws)
+cb web                 # prints the default bridge address
 ```
 
 ### Expose it on your tailnet

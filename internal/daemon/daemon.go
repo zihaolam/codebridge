@@ -22,6 +22,7 @@ import (
 	"codebridge/internal/ipc"
 	"codebridge/internal/notify"
 	"codebridge/internal/session"
+	"codebridge/internal/task"
 )
 
 // Daemon owns the session registry and the unix socket listener.
@@ -30,6 +31,14 @@ type Daemon struct {
 	sessions map[string]*session.Session
 	order    []string // insertion order for stable listing
 	ln       net.Listener
+
+	// taskStore is the workspace-scoped backlog. The daemon is its single
+	// writer: clients mutate it over IPC (task_* requests) instead of touching
+	// tasks.json directly, so concurrent cb clients can't clobber each other.
+	// taskMu guards the store; reconcileTasks keeps in_progress tasks in step
+	// with session lifecycle (the job the TUI used to do client-side).
+	taskMu    sync.Mutex
+	taskStore *task.Store
 
 	// watchers are wakeup channels for `watch` push streams (see watch.go),
 	// lazily initialized by subscribeChanges.
@@ -65,8 +74,9 @@ func Run() error {
 	}
 
 	d := &Daemon{
-		sessions: make(map[string]*session.Session),
-		ln:       ln,
+		sessions:  make(map[string]*session.Session),
+		ln:        ln,
+		taskStore: task.Load(),
 	}
 	log.Printf("cb daemon listening on %s", sockPath)
 
@@ -151,7 +161,8 @@ func (d *Daemon) dispatch(req ipc.Request) ipc.Response {
 		return d.spawn(req)
 	case "list":
 		d.pruneExited()
-		return ipc.Response{OK: true, Sessions: d.snapshot()}
+		d.reconcileTasks()
+		return ipc.Response{OK: true, Sessions: d.snapshot(), Tasks: d.taskSnapshot()}
 	case "kill":
 		return d.kill(req.ID)
 	case "rename":
@@ -160,6 +171,8 @@ func (d *Daemon) dispatch(req ipc.Request) ipc.Response {
 		return d.hook(req)
 	case "extract":
 		return d.extract(req)
+	case "task_list", "task_add", "task_edit", "task_status", "task_delete", "task_start":
+		return d.taskDispatch(req)
 	default:
 		return ipc.Response{Error: "unknown request type: " + req.Type}
 	}

@@ -1,12 +1,12 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"sort"
 	"strings"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -48,25 +48,44 @@ type taskRow struct {
 // active sections.
 const taskCompletedShown = 10
 
-// taskSyncGrace shields a freshly (re)started task from being flipped back to
-// paused by a stale session list: a refresh already in flight when the task's
-// session spawned won't include it, and without the grace window syncTasks
-// would read that absence as "session ended".
-const taskSyncGrace = 2 * time.Second
-
-// taskSpawnedMsg reports that a task's agent session was spawned, so Update
-// can link the task to it and jump the dashboard there.
-type taskSpawnedMsg struct {
-	taskID    string
-	sessionID string
-	agent     string
-	cwd       string
+// tasksMsg carries a fresh backlog snapshot back from a mutation (add / edit /
+// status / delete), so the dialog reflects the daemon's authoritative list
+// without waiting for the next poll. selectID, when set, lands the cursor on a
+// just-created task.
+type tasksMsg struct {
+	tasks    []ipc.Task
+	selectID string
+	err      error
 }
 
-// openTaskBacklog (prefix+t) reloads the store from disk — another cb client
-// may have written it since we last looked — and opens the dialog on the list.
+// taskSpawnedMsg reports that a task's agent session was spawned (and linked to
+// the task daemon-side), so Update can jump the dashboard there. tasks carries
+// the post-start backlog snapshot.
+type taskSpawnedMsg struct {
+	sessionID string
+	tasks     []ipc.Task
+}
+
+// applyTasks replaces the read cache with a daemon snapshot, rebuilding the
+// visible rows when the dialog is open. nil is a valid (empty) backlog.
+func (m *dashboardModel) applyTasks(tasks []ipc.Task) {
+	if m.taskStore == nil {
+		m.taskStore = &task.Store{}
+	}
+	m.taskStore.Tasks = tasks
+	if m.taskOpen {
+		m.rebuildTaskRows()
+	}
+}
+
+// openTaskBacklog (prefix+t) opens the dialog on the read cache, which the list
+// poll keeps in step with the daemon (the backlog's single writer) — no
+// blocking disk read on open. A refresh is already in flight every 500ms, so a
+// mutation from another cb client shows up within a tick.
 func (m *dashboardModel) openTaskBacklog() {
-	m.taskStore = task.Load()
+	if m.taskStore == nil {
+		m.taskStore = &task.Store{}
+	}
 	m.taskOpen = true
 	m.taskStage = taskStageList
 	m.taskPrefix = false
@@ -76,17 +95,6 @@ func (m *dashboardModel) openTaskBacklog() {
 func (m *dashboardModel) closeTaskBacklog() {
 	m.taskOpen = false
 	m.taskPrefix = false
-}
-
-// saveTasks persists the store, surfacing failures as a toast rather than
-// silently losing edits.
-func (m *dashboardModel) saveTasks() {
-	if m.taskStore == nil {
-		return
-	}
-	if err := m.taskStore.Save(); err != nil {
-		m.pushToast("✗ tasks: "+err.Error(), "needs_approval")
-	}
 }
 
 // rebuildTaskRows flattens the current scope's tasks into sectioned rows:
@@ -282,21 +290,15 @@ func (m *dashboardModel) handleTaskListKey(msg tea.KeyPressMsg) (tea.Model, tea.
 		}
 	case "c":
 		if t := m.taskUnderCursor(); t != nil {
+			next := task.StatusCompleted
 			if t.Status == task.StatusCompleted {
-				t.Status = task.StatusPending
-			} else {
-				t.Status = task.StatusCompleted
-				t.CBSessionID = "" // the live link (if any) is done tracking
+				next = task.StatusPending
 			}
-			t.UpdatedAt = time.Now()
-			m.saveTasks()
-			m.rebuildTaskRows()
+			return m, m.taskStatusCmd(t.ID, next)
 		}
 	case "x":
 		if t := m.taskUnderCursor(); t != nil {
-			m.taskStore.Delete(t.ID)
-			m.saveTasks()
-			m.rebuildTaskRows()
+			return m, m.taskDeleteCmd(t.ID)
 		}
 	}
 	return m, nil
@@ -315,11 +317,8 @@ func (m *dashboardModel) handleTaskNewKey(msg tea.KeyPressMsg) (tea.Model, tea.C
 		title := strings.TrimSpace(m.taskTitleBuf)
 		m.taskTitleBuf = ""
 		m.taskStage = taskStageList
-		if title != "" && m.taskStore != nil {
-			t := m.taskStore.Add(m.currentScope, title, "")
-			m.saveTasks()
-			m.rebuildTaskRows()
-			m.selectTaskRow(t.ID)
+		if title != "" {
+			return m, m.taskAddCmd(m.currentScope, title)
 		}
 	case msg.Code == tea.KeyEscape, msg.Code == 'c' && msg.Mod&tea.ModCtrl != 0:
 		m.taskTitleBuf = ""
@@ -349,17 +348,13 @@ func (m *dashboardModel) beginTaskDetail(t *task.Task) {
 func (m *dashboardModel) handleTaskDetailKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case msg.Code == tea.KeyEscape:
-		if t := m.taskStore.Get(m.taskDetailID); t != nil {
-			if title := strings.TrimSpace(m.taskTitleEdit); title != "" {
-				t.Title = title
-			}
-			t.Desc = strings.TrimRight(m.taskDescEdit, "\n ")
-			t.UpdatedAt = time.Now()
-			m.saveTasks()
-			m.rebuildTaskRows()
-		}
+		id := m.taskDetailID
+		title, desc := m.taskTitleEdit, m.taskDescEdit
 		m.taskStage = taskStageList
 		m.taskDetailID = ""
+		if id != "" {
+			return m, m.taskEditCmd(id, title, desc)
+		}
 	case msg.Code == tea.KeyTab:
 		m.taskEditTitle = !m.taskEditTitle
 	case msg.Code == tea.KeyEnter:
@@ -405,57 +400,68 @@ func (m *dashboardModel) handleTaskAgentKey(msg tea.KeyPressMsg) (tea.Model, tea
 	case "enter", "right", "l":
 		if m.taskAgentCursor >= 0 && m.taskAgentCursor < len(m.taskAgents) {
 			bin := m.taskAgents[m.taskAgentCursor].bin
-			t := m.taskStore.Get(m.taskStartID)
+			id := m.taskStartID
 			m.closeTaskBacklog()
-			if t != nil {
-				return m, m.startTaskCmd(*t, bin)
+			if id != "" {
+				return m, m.taskStartCmd(id, bin)
 			}
 		}
 	}
 	return m, nil
 }
 
-// startTaskCmd spawns an agent session for the task. Fresh (pending) tasks —
-// and paused tasks that never reported a session id — start the bare agent
-// with the task text prefilled (delivered unsubmitted by the daemon). Paused
-// tasks resume instead: claude and codex by exact session id (claude's comes
-// from hooks, codex's from the daemon's rollout-journal harvest); codex
-// without a harvested id falls back to `resume --last`, and opencode is
-// always best-effort `--continue` — either may pick up a different session if
-// the user ran the agent outside cb in between.
-func (m *dashboardModel) startTaskCmd(t task.Task, bin string) tea.Cmd {
+// taskCmd sends one backlog request to the daemon and folds the reply into a
+// tasksMsg. The daemon is the single writer, so the reply carries the fresh
+// authoritative list; selectID (only meaningful for adds) is threaded through.
+func taskCmd(req ipc.Request, selectID string) tea.Cmd {
+	return func() tea.Msg {
+		resp, err := ipc.Send(req)
+		if err == nil && !resp.OK {
+			err = errors.New(resp.Error)
+		}
+		if err != nil {
+			return tasksMsg{err: err}
+		}
+		id := selectID
+		if req.Type == "task_add" {
+			id = resp.ID // the daemon minted the id
+		}
+		return tasksMsg{tasks: resp.Tasks, selectID: id}
+	}
+}
+
+func (m *dashboardModel) taskAddCmd(scope, title string) tea.Cmd {
+	return taskCmd(ipc.Request{Type: "task_add", Scope: scope, Title: title}, "pending")
+}
+
+func (m *dashboardModel) taskEditCmd(id, title, desc string) tea.Cmd {
+	return taskCmd(ipc.Request{Type: "task_edit", ID: id, Title: title, Desc: desc}, "")
+}
+
+func (m *dashboardModel) taskStatusCmd(id string, status task.Status) tea.Cmd {
+	return taskCmd(ipc.Request{Type: "task_status", ID: id, Status: string(status)}, "")
+}
+
+func (m *dashboardModel) taskDeleteCmd(id string) tea.Cmd {
+	return taskCmd(ipc.Request{Type: "task_delete", ID: id}, "")
+}
+
+// taskStartCmd asks the daemon to spawn an agent session for the task and link
+// it. The daemon owns the resume/prefill logic (see daemon.taskStart); the
+// client only supplies the agent binary, the launch cwd, and the pane size.
+// The binary is checked up front so a missing agent surfaces a clear toast
+// rather than a silent no-op (the daemon can't report a PATH miss over IPC).
+func (m *dashboardModel) taskStartCmd(id, bin string) tea.Cmd {
 	if _, err := exec.LookPath(bin); err != nil {
 		return func() tea.Msg { return spawnMissingMsg{bin: bin} }
 	}
-	argv := []string{bin}
-	prefill := t.Title
-	if t.Desc != "" {
-		prefill += "\n\n" + t.Desc
-	}
-	if t.Status == task.StatusPaused {
-		switch {
-		case bin == "claude" && t.AgentSessionID != "":
-			argv = []string{"claude", "--resume", t.AgentSessionID}
-			prefill = ""
-		case bin == "codex" && t.AgentSessionID != "":
-			argv = []string{"codex", "resume", t.AgentSessionID}
-			prefill = ""
-		case bin == "codex":
-			argv = []string{"codex", "resume", "--last"}
-			prefill = ""
-		case bin == "opencode":
-			argv = []string{"opencode", "--continue"}
-			prefill = ""
-		}
-	}
 	cwd := m.spawnTargetCwd()
 	rows, cols := m.paneH, m.paneW
-	taskID := t.ID
 	return func() tea.Msg {
 		if cwd == "" {
 			cwd, _ = os.Getwd()
 		}
-		req := ipc.Request{Type: "spawn", Argv: argv, Cwd: cwd, Prefill: prefill}
+		req := ipc.Request{Type: "task_start", ID: id, Agent: bin, Cwd: cwd}
 		if rows > 0 && cols > 0 {
 			req.Rows, req.Cols = rows, cols
 		}
@@ -463,7 +469,7 @@ func (m *dashboardModel) startTaskCmd(t task.Task, bin string) tea.Cmd {
 		if err != nil || !resp.OK {
 			return refreshCmd()
 		}
-		return taskSpawnedMsg{taskID: taskID, sessionID: resp.ID, agent: bin, cwd: cwd}
+		return taskSpawnedMsg{sessionID: resp.ID, tasks: resp.Tasks}
 	}
 }
 
@@ -490,55 +496,6 @@ func (m *dashboardModel) closeAndJumpToTask(t *task.Task) {
 		m.syncStream()
 		m.focusScreenPane()
 		return
-	}
-}
-
-// syncTasks reconciles in_progress tasks against the latest session list, for
-// every scope (a task shouldn't stay "in progress" forever just because the
-// user is looking at a different repo). A task whose session vanished from the
-// poll, exited, or reported ended goes to paused — keeping its agent session
-// id as the resume handle. Live sessions have their agent session id (claude's
-// via hooks, codex's via the daemon's rollout harvest) picked up continuously,
-// since it can't be read back after the session is gone. Saves only when
-// something changed.
-func (m *dashboardModel) syncTasks(sessions []ipc.SessionInfo) {
-	if m.taskStore == nil {
-		return
-	}
-	byID := make(map[string]*ipc.SessionInfo, len(sessions))
-	for i := range sessions {
-		byID[sessions[i].ID] = &sessions[i]
-	}
-	dirty := false
-	for i := range m.taskStore.Tasks {
-		t := &m.taskStore.Tasks[i]
-		if t.Status != task.StatusInProgress {
-			continue
-		}
-		s := byID[t.CBSessionID]
-		if t.CBSessionID == "" || s == nil || s.Exited || s.Status == "ended" {
-			// Grace window: a list refresh already in flight when this task's
-			// session spawned predates it — absence there isn't "ended".
-			if time.Since(t.UpdatedAt) < taskSyncGrace {
-				continue
-			}
-			t.Status = task.StatusPaused
-			t.CBSessionID = ""
-			t.UpdatedAt = time.Now()
-			dirty = true
-			continue
-		}
-		if s.HarnessSessionID != "" && s.HarnessSessionID != t.AgentSessionID {
-			t.AgentSessionID = s.HarnessSessionID
-			t.UpdatedAt = time.Now()
-			dirty = true
-		}
-	}
-	if dirty {
-		m.saveTasks()
-		if m.taskOpen {
-			m.rebuildTaskRows()
-		}
 	}
 }
 

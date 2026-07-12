@@ -29,13 +29,23 @@ button {
   touch-action: manipulation; /* no 350ms double-tap-zoom delay */
 }
 
+/* List and terminal are two full-page views swapped via `view` (App.tsx); the
+   `.view-*` rules below hide the inactive pane at every width. On phones this is
+   the only layout; on desktop it means the session list fills the whole page
+   instead of being pinned to a narrow sidebar. */
 aside {
-  width: 260px;
+  width: 100%;
   flex: none;
   display: flex;
   flex-direction: column;
-  border-right: 1px solid #21262d;
   background: #010409;
+}
+
+.view-term aside {
+  display: none;
+}
+.view-list main {
+  display: none;
 }
 
 aside header {
@@ -49,6 +59,17 @@ aside header {
 .brand {
   font-weight: 700;
   color: #58a6ff;
+}
+
+/* Right side of the sidebar header: task-list toggle + connection dot. */
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.header-toggle.active {
+  color: #58a6ff;
+  background: #21262d;
 }
 
 /* Connection indicator: green = online, yellow = connecting, red = down. */
@@ -178,6 +199,105 @@ aside header {
 .st-ended {
   color: #484f58;
 }
+.st-pending {
+  color: #6e7681;
+}
+
+/* Task list screen (list-icon toggle) — mirrors the session list layout. */
+.task-list {
+  list-style: none;
+  padding: 4px 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  flex: 1;
+}
+.task-list ul {
+  list-style: none;
+  padding: 0;
+}
+.task-empty {
+  padding: 2px 12px 8px 24px;
+  color: #484f58;
+  font-size: 12px;
+}
+.task-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 10px 6px 24px;
+}
+.task-row.done .task-title {
+  color: #6e7681;
+  text-decoration: line-through;
+}
+.task-title {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: none;
+  color: #c9d1d9;
+  padding: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.task-title:hover {
+  color: #58a6ff;
+}
+.task-actions {
+  display: flex;
+  gap: 1px;
+  flex: none;
+}
+.task-done:hover {
+  color: #3fb950;
+}
+.task-del:hover {
+  color: #f85149;
+}
+
+/* New/edit task modal (reuses the .overlay + .picker shell). */
+.task-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+}
+.task-input,
+.task-textarea {
+  background: #010409;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  color: #c9d1d9;
+  padding: 8px 10px;
+  font: inherit;
+  width: 100%;
+}
+.task-textarea {
+  resize: vertical;
+}
+.task-editor-row {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.task-btn {
+  background: #21262d;
+  color: #c9d1d9;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+}
+.task-btn.primary {
+  background: #238636;
+  border-color: #2ea043;
+  color: #fff;
+}
+.task-btn:disabled {
+  opacity: 0.5;
+}
 
 button {
   font: inherit;
@@ -221,14 +341,16 @@ main {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.topbar-x {
+.topbar-actions {
   margin-left: auto;
+  display: flex;
+  gap: 4px;
 }
 .topbar-x:hover {
   color: #f85149;
 }
 .topbar .back {
-  display: none;
+  display: inline-flex;
 }
 
 /* Mobile key strip: keys a phone keyboard doesn't have. Hidden on desktop. */
@@ -308,27 +430,19 @@ main {
 }
 
 @media (max-width: 768px) {
-  aside {
-    width: 100%;
-    border-right: none;
-  }
   aside header {
     padding-top: calc(10px + env(safe-area-inset-top));
-  }
-  .view-term aside {
-    display: none;
-  }
-  .view-list main {
-    display: none;
   }
   .topbar {
     padding: 8px 10px;
     padding-top: calc(8px + env(safe-area-inset-top));
   }
-  .topbar .back {
-    display: inline-flex;
-  }
   .term-holder {
+    /* Wider side gutters on phones so text never runs to the screen edge;
+       FitAddon subtracts this padding, so the grid narrows to fit. Add the
+       horizontal safe-area insets for notched displays in landscape. */
+    padding-left: calc(12px + env(safe-area-inset-left));
+    padding-right: calc(12px + env(safe-area-inset-right));
     padding-bottom: 6px; /* the key bar below owns the safe-area inset */
   }
   .keybar {

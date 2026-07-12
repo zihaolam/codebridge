@@ -19,34 +19,21 @@ import (
 	"codebridge/internal/ipc"
 )
 
-// Status is a task's lifecycle state. in_progress means a live cb session is
-// linked; paused means its session ended but the task kept a resume handle.
-type Status string
-
-const (
-	StatusPending    Status = "pending"
-	StatusInProgress Status = "in_progress"
-	StatusPaused     Status = "paused"
-	StatusCompleted  Status = "completed"
+// Task and Status are the on-disk backlog types, aliased to their wire
+// definitions in internal/ipc so the daemon (the single owner of the store)
+// and every client share one shape. The alias keeps existing task.Task /
+// task.StatusInProgress references working unchanged.
+type (
+	Task   = ipc.Task
+	Status = ipc.Status
 )
 
-// Task is one backlog entry. CBSessionID links to the live daemon session
-// while in_progress and is cleared on pause; AgentSessionID is the agent's own
-// session id (harvested from Claude Code hooks) kept across pauses so a later
-// start can `claude --resume` it.
-type Task struct {
-	ID             string    `json:"id"`
-	Scope          string    `json:"scope"`
-	Title          string    `json:"title"`
-	Desc           string    `json:"desc,omitempty"`
-	Status         Status    `json:"status"`
-	Agent          string    `json:"agent,omitempty"`
-	Cwd            string    `json:"cwd,omitempty"`
-	CBSessionID    string    `json:"cb_session_id,omitempty"`
-	AgentSessionID string    `json:"agent_session_id,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
-}
+const (
+	StatusPending    = ipc.StatusPending
+	StatusInProgress = ipc.StatusInProgress
+	StatusPaused     = ipc.StatusPaused
+	StatusCompleted  = ipc.StatusCompleted
+)
 
 // Store is the on-disk shape: a flat task list; scoping is per-task. path
 // remembers where the store was loaded from so Save writes back to the same

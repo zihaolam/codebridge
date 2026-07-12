@@ -285,6 +285,12 @@ func (s *Session) Paste(text string) {
 // Resize updates both the PTY window size (triggering SIGWINCH so the child
 // repaints) and the emulator grid.
 func (s *Session) Resize(rows, cols int) error {
+	s.mu.RLock()
+	same := s.rows == rows && s.cols == cols
+	s.mu.RUnlock()
+	if same {
+		return nil
+	}
 	if err := pty.Setsize(s.ptmx, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)}); err != nil {
 		return err
 	}

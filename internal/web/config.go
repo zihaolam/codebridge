@@ -1,7 +1,7 @@
-// Package web is the `cb web` bridge: a separate process that talks to the
-// daemon over its unix socket as a normal client (exactly like the TUI) and
-// exposes a WebSocket + static-file HTTP server for the mobile PWA. The daemon
-// stays CLI-focused; everything web-specific lives here.
+// Package web is the mobile bridge: it talks to the daemon over its unix socket
+// as a normal client (exactly like the TUI) and exposes a WebSocket + static-
+// file HTTP server for the PWA. The CLI launches the default bridge alongside
+// the daemon, while the daemon package remains web-agnostic.
 //
 // The server binds 127.0.0.1 only. Remote access is expected to go through
 // `tailscale serve`, which fronts it tailnet-only with a real HTTPS cert.

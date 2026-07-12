@@ -48,6 +48,7 @@ const dashRefreshInterval = 500 * time.Millisecond
 type tickMsg struct{}
 type sessionsMsg struct {
 	sessions []ipc.SessionInfo
+	tasks    []ipc.Task // backlog snapshot piggybacked on the list poll
 	err      error
 }
 
@@ -283,7 +284,9 @@ func Dashboard(selectID, cwd string, showAll bool) (DashAction, error) {
 		worktreeCache: map[string]bool{},
 		ch:            make(chan previewMsg, 64),
 		cfg:           cfg,
-		taskStore:     task.Load(),
+		// The daemon owns the backlog now; this store is a read cache filled by
+		// the list poll (and mutation replies), never written to disk here.
+		taskStore: &task.Store{},
 	}
 	// Mouse wheel is captured (see View's MouseMode) so scrolling the screen pane
 	// browses scrollback rather than the terminal turning the wheel into arrow
@@ -898,7 +901,7 @@ func (m *dashboardModel) relayoutStream() {
 
 func refreshCmd() tea.Msg {
 	resp, err := ipc.Send(ipc.Request{Type: "list"})
-	return sessionsMsg{sessions: resp.Sessions, err: err}
+	return sessionsMsg{sessions: resp.Sessions, tasks: resp.Tasks, err: err}
 }
 
 func tick() tea.Cmd {
@@ -983,6 +986,14 @@ func renameCmd(id, name string) tea.Cmd {
 
 func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.FocusMsg:
+		// The native TUI owns the canonical size. Reclaim it when the host
+		// terminal regains focus; Session.Resize suppresses identical requests.
+		if m.conn != nil && m.paneW > 0 && m.paneH > 0 {
+			_ = ipc.WriteJSON(m.conn, ipc.StreamUp{Type: "resize", Rows: m.paneH, Cols: m.paneW})
+		}
+		return m, nil
+
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 		m.relayoutStream()
@@ -1005,24 +1016,26 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case taskSpawnedMsg:
-		// A task's agent session just spawned: link the task to it, then select
-		// and focus the new session like spawnedMsg does.
-		if m.taskStore != nil {
-			if t := m.taskStore.Get(msg.taskID); t != nil {
-				t.Status = task.StatusInProgress
-				t.CBSessionID = msg.sessionID
-				t.Agent = msg.agent
-				t.Cwd = msg.cwd
-				t.UpdatedAt = time.Now()
-				m.saveTasks()
-				if m.taskOpen {
-					m.rebuildTaskRows()
-				}
-			}
-		}
+		// A task's agent session just spawned (the daemon already linked the task
+		// to it). Refresh the backlog cache, then select and focus the new
+		// session like spawnedMsg does.
+		m.applyTasks(msg.tasks)
 		m.wantSelect = msg.sessionID
 		m.focusScreenPane()
 		return m, refreshCmd
+
+	case tasksMsg:
+		// A backlog mutation (add/edit/status/delete) replied with the fresh
+		// list; adopt it immediately rather than waiting on the next poll.
+		if msg.err != nil {
+			m.pushToast("✗ tasks: "+msg.err.Error(), "needs_approval")
+			return m, nil
+		}
+		m.applyTasks(msg.tasks)
+		if msg.selectID != "" {
+			m.selectTaskRow(msg.selectID)
+		}
+		return m, nil
 
 	case previewMsg:
 		if msg.id == m.streamID {
@@ -1085,9 +1098,9 @@ func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// the daemon knows about, not just the visible accordion rows
 			// (collapsing a group shouldn't silence notifications from it).
 			m.detectTransitions(m.sessions)
-			// Reconcile the task backlog: pause tasks whose session ended and
-			// harvest claude session ids for later resume.
-			m.syncTasks(m.sessions)
+			// The daemon reconciles the backlog now (pausing tasks whose session
+			// ended, harvesting resume ids); we just refresh the read cache.
+			m.applyTasks(msg.tasks)
 		}
 		// On the first poll that includes wantSelect, ensure its parent scope
 		// is open and stamp the selection so rebuildRows lands the cursor on
@@ -2035,6 +2048,7 @@ var (
 func (m *dashboardModel) View() tea.View {
 	v := tea.NewView(m.renderLive())
 	v.AltScreen = true
+	v.ReportFocus = true
 	if m.shouldShowSessionCursor() {
 		v.Cursor = tea.NewCursor(sidebarWidth+screenBorderStyle.GetHorizontalFrameSize()+m.cursorX, m.cursorY)
 	}

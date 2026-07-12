@@ -9,8 +9,9 @@ import (
 	"codebridge/internal/web"
 )
 
-// runWeb drives the `cb web` bridge: serve (default), token management, and
-// QR pairing for phones.
+// runWeb drives the default daemon-owned bridge: reports its address, manages
+// pairing tokens, and prints pairing QR codes. Supplying a non-default port
+// still starts an extra bridge explicitly for the rare case that it is needed.
 func runWeb(args []string) error {
 	if len(args) > 0 {
 		switch args[0] {
@@ -44,6 +45,10 @@ func runWeb(args []string) error {
 	}
 	if err := ensureDaemon(); err != nil {
 		return err
+	}
+	if *port == web.DefaultPort {
+		fmt.Printf("cb web is running at http://127.0.0.1:%d\n", web.DefaultPort)
+		return nil
 	}
 	return web.Run(*port)
 }

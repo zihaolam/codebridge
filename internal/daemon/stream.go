@@ -5,11 +5,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"codebridge/internal/ipc"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 // frameInterval bounds how often we re-render and push a frame to a client.
@@ -43,6 +46,8 @@ func (d *Daemon) attach(conn net.Conn, sc *bufio.Scanner, req ipc.Request) {
 	// scrollOff is the client's requested scroll position (lines up from the
 	// live bottom, 0 == follow). Written by the up-loop, read by the frame loop.
 	var scrollOff atomic.Int64
+	var viewportRows atomic.Int64
+	var viewportCols atomic.Int64
 
 	go func() {
 		t := time.NewTicker(frameInterval)
@@ -50,6 +55,7 @@ func (d *Daemon) attach(conn net.Conn, sc *bufio.Scanner, req ipc.Request) {
 		last := ""
 		lastOff, lastMax := -1, -1
 		lastCx, lastCy := -1, -1
+		viewX, viewY := 0, 0
 		for {
 			select {
 			case <-stop:
@@ -86,10 +92,15 @@ func (d *Daemon) attach(conn net.Conn, sc *bufio.Scanner, req ipc.Request) {
 					cx, cy = s.Cursor()
 					alt = s.IsAltScreen()
 				}
+				rows, cols := s.Size()
+				vr, vc := int(viewportRows.Load()), int(viewportCols.Load())
+				if vr > 0 && vc > 0 && (vr < rows || vc < cols) {
+					screen, cx, cy, viewX, viewY = cropViewport(screen, rows, cols, vr, vc, cx, cy, viewX, viewY)
+					rows, cols = min(vr, rows), min(vc, cols)
+				}
 				if screen != last || off != lastOff || maxOff != lastMax || cx != lastCx || cy != lastCy {
 					last, lastOff, lastMax = screen, off, maxOff
 					lastCx, lastCy = cx, cy
-					rows, cols := s.Size()
 					_ = write(ipc.StreamDown{
 						Type:      "frame",
 						Screen:    screen,
@@ -128,6 +139,11 @@ func (d *Daemon) attach(conn net.Conn, sc *bufio.Scanner, req ipc.Request) {
 			if up.Rows > 0 && up.Cols > 0 {
 				_ = s.Resize(up.Rows, up.Cols)
 			}
+		case "viewport":
+			if up.Rows > 0 && up.Cols > 0 {
+				viewportRows.Store(int64(up.Rows))
+				viewportCols.Store(int64(up.Cols))
+			}
 		case "scroll":
 			scrollOff.Store(int64(up.Offset))
 		case "interrupt":
@@ -140,4 +156,32 @@ func (d *Daemon) attach(conn net.Conn, sc *bufio.Scanner, req ipc.Request) {
 		}
 	}
 	closeStop()
+}
+
+// cropViewport projects the canonical PTY grid into a smaller per-client
+// window. The window follows the cursor only when it leaves the visible area,
+// matching tmux's larger-window/smaller-client behaviour.
+func cropViewport(screen string, rows, cols, viewRows, viewCols, cx, cy, x, y int) (string, int, int, int, int) {
+	if cx < x {
+		x = cx
+	} else if cx >= x+viewCols {
+		x = cx - viewCols + 1
+	}
+	if cy < y {
+		y = cy
+	} else if cy >= y+viewRows {
+		y = cy - viewRows + 1
+	}
+	x = max(0, min(x, cols-viewCols))
+	y = max(0, min(y, rows-viewRows))
+	lines := strings.Split(screen, "\n")
+	out := make([]string, 0, viewRows)
+	for row := y; row < y+viewRows; row++ {
+		if row < len(lines) {
+			out = append(out, ansi.Cut(lines[row], x, x+viewCols))
+		} else {
+			out = append(out, "")
+		}
+	}
+	return strings.Join(out, "\n"), cx - x, cy - y, x, y
 }

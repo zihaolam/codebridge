@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { CbClient, type ClientState, type SessionInfo } from './ws'
+import { CbClient, type ClientState, type SessionInfo, type TaskInfo } from './ws'
 import SessionList from './SessionList'
+import TaskList from './TaskList'
 import Term from './Term'
 import WorktreePicker, { type PickerData } from './WorktreePicker'
 import KeyBar from './KeyBar'
-import { IconChevronLeft, IconX } from './icons'
+import { IconChevronLeft, IconList, IconMaximize, IconX } from './icons'
 
 const TOKEN_KEY = 'cb-token'
 
@@ -58,11 +59,15 @@ function TokenGate({ onSubmit }: { onSubmit: (t: string) => void }) {
 function Dashboard({ token, onAuthFailed }: { token: string; onAuthFailed: () => void }) {
   const [state, setState] = useState<ClientState>('connecting')
   const [sessions, setSessions] = useState<SessionInfo[]>([])
+  const [tasks, setTasks] = useState<TaskInfo[]>([])
+  const [agents, setAgents] = useState<string[]>([])
   const [selected, setSelected] = useState<string | null>(null)
   const [errors, setErrors] = useState<string[]>([])
   // On phones the list and the terminal are two swappable screens; on desktop
   // the CSS ignores this and shows both panes side by side.
   const [view, setView] = useState<'list' | 'term'>('list')
+  // The sidebar shows either the session list or the backlog (list icon toggle).
+  const [screen, setScreen] = useState<'sessions' | 'tasks'>('sessions')
   const [picker, setPicker] = useState<PickerData | null>(null)
   const selectedRef = useRef(selected)
   selectedRef.current = selected
@@ -85,6 +90,8 @@ function Dashboard({ token, onAuthFailed }: { token: string; onAuthFailed: () =>
       if (cur && !list.some((s) => s.id === cur)) setSelected(null)
       if (!selectedRef.current && list.length > 0) setSelected(list[0].id)
     }
+    client.onTasks = setTasks
+    client.onAgents = setAgents
     client.onError = (msg) => setErrors((e) => [...e.slice(-4), msg])
     client.onSpawned = (id) => {
       setSelected(id)
@@ -107,26 +114,64 @@ function Dashboard({ token, onAuthFailed }: { token: string; onAuthFailed: () =>
     if (s && confirm(`Kill ${s.name || s.argv.join(' ')}?`)) client.kill(id)
   }
 
+  const killCurrent = () => {
+    if (!current) return
+    const name = current.name || current.argv.join(' ')
+    if (!confirm(`Kill ${name}?`)) return
+    client.kill(current.id)
+    setSelected(null)
+    setView('list')
+  }
+
   return (
     <div className={`app view-${view}`}>
       <aside>
         <header>
           <span className="brand">cb</span>
-          <span className={`conn-dot conn-${state}`} title={state} />
+          <div className="header-right">
+            <button
+              className={`icon-btn header-toggle ${screen === 'tasks' ? 'active' : ''}`}
+              title={screen === 'tasks' ? 'show sessions' : 'show task list'}
+              onClick={() => setScreen((s) => (s === 'tasks' ? 'sessions' : 'tasks'))}
+            >
+              <IconList />
+            </button>
+            <span className={`conn-dot conn-${state}`} title={state} />
+          </div>
         </header>
-        <SessionList
-          sessions={sessions}
-          selected={selected}
-          onSelect={(id) => {
-            setSelected(id)
-            setView('term')
-          }}
-          onKill={kill}
-          onSpawn={(cwd) => {
-            setPicker({ cwd, worktrees: null, agents: [] })
-            client.worktrees(cwd)
-          }}
-        />
+        {screen === 'tasks' ? (
+          <TaskList
+            tasks={tasks}
+            sessions={sessions}
+            agents={agents}
+            onJump={(id) => {
+              setSelected(id)
+              setView('term')
+            }}
+            onAdd={(scope, title, desc) => client.taskAdd(scope, title, desc)}
+            onEdit={(id, title, desc) => client.taskEdit(id, title, desc)}
+            onStatus={(id, status) => client.taskStatus(id, status)}
+            onDelete={(id) => {
+              const t = tasks.find((x) => x.id === id)
+              if (t && confirm(`Delete "${t.title}"?`)) client.taskDelete(id)
+            }}
+            onStart={(id, agent, cwd) => client.taskStart(id, agent, cwd)}
+          />
+        ) : (
+          <SessionList
+            sessions={sessions}
+            selected={selected}
+            onSelect={(id) => {
+              setSelected(id)
+              setView('term')
+            }}
+            onKill={kill}
+            onSpawn={(cwd) => {
+              setPicker({ cwd, worktrees: null, agents: [] })
+              client.worktrees(cwd)
+            }}
+          />
+        )}
       </aside>
       <main>
         <div className="topbar">
@@ -135,13 +180,18 @@ function Dashboard({ token, onAuthFailed }: { token: string; onAuthFailed: () =>
           </button>
           <span className="topbar-label">{currentLabel}</span>
           {current && (
-            <button
-              className="icon-btn topbar-x"
-              title="kill this session"
-              onClick={() => kill(current.id)}
-            >
-              <IconX />
-            </button>
+            <div className="topbar-actions">
+              <button
+                className="icon-btn"
+                title="resize session to this screen"
+                onClick={() => window.dispatchEvent(new Event('cb-resize-session'))}
+              >
+                <IconMaximize />
+              </button>
+              <button className="icon-btn topbar-x" title="kill this session" onClick={killCurrent}>
+                <IconX />
+              </button>
+            </div>
           )}
         </div>
         {state === 'closed' && (
