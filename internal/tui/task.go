@@ -24,6 +24,7 @@ const (
 	taskStageNew
 	taskStageDetail
 	taskStageAgent
+	taskStageRun
 )
 
 // taskRowKind distinguishes the flattened list's row types: section headers
@@ -180,8 +181,19 @@ func (m *dashboardModel) clampTaskCursor() {
 
 // moveTaskCursor steps the cursor to the next task row in the given direction,
 // hopping over section headers and notes. No wrap.
+// moveTaskCursor advances the cursor to the next selectable task row in the
+// given direction, skipping section headers and notes and wrapping around the
+// ends (down past the last task lands on the first, up past the first lands on
+// the last). n steps is enough to visit every row exactly once, so if any task
+// row exists the cursor lands on one; if none do it stays put.
 func (m *dashboardModel) moveTaskCursor(delta int) {
-	for i := m.taskCursor + delta; i >= 0 && i < len(m.taskRows); i += delta {
+	n := len(m.taskRows)
+	if n == 0 || delta == 0 {
+		return
+	}
+	i := m.taskCursor
+	for step := 0; step < n; step++ {
+		i = ((i+delta)%n + n) % n
 		if m.taskRows[i].kind == taskRowTask {
 			m.taskCursor = i
 			return
@@ -223,6 +235,8 @@ func (m *dashboardModel) handleTaskKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd)
 		return m.handleTaskDetailKey(msg)
 	case taskStageAgent:
 		return m.handleTaskAgentKey(msg)
+	case taskStageRun:
+		return m.handleTaskRunKey(msg)
 	}
 	return m.handleTaskListKey(msg)
 }
@@ -294,6 +308,10 @@ func (m *dashboardModel) handleTaskListKey(msg tea.KeyPressMsg) (tea.Model, tea.
 					return m, m.taskResumeCmd(t.ID, t.Runs[i].ID)
 				}
 			}
+		}
+	case "K":
+		if t := m.taskUnderCursor(); t != nil && len(t.Runs) > 0 {
+			m.taskRunTaskID, m.taskRunCursor, m.taskStage = t.ID, 0, taskStageRun
 		}
 	case "c":
 		if t := m.taskUnderCursor(); t != nil {
@@ -447,12 +465,12 @@ func (m *dashboardModel) handleTaskAgentKey(msg tea.KeyPressMsg) (tea.Model, tea
 	case "esc", "left", "h":
 		m.taskStage = taskStageList
 	case "up", "k":
-		if m.taskAgentCursor > 0 {
-			m.taskAgentCursor--
+		if n := len(m.taskAgents); n > 0 {
+			m.taskAgentCursor = (m.taskAgentCursor - 1 + n) % n
 		}
 	case "down", "j":
-		if m.taskAgentCursor < len(m.taskAgents)-1 {
-			m.taskAgentCursor++
+		if n := len(m.taskAgents); n > 0 {
+			m.taskAgentCursor = (m.taskAgentCursor + 1) % n
 		}
 	case "enter", "right", "l":
 		if m.taskAgentCursor >= 0 && m.taskAgentCursor < len(m.taskAgents) {
@@ -461,6 +479,46 @@ func (m *dashboardModel) handleTaskAgentKey(msg tea.KeyPressMsg) (tea.Model, tea
 			m.closeTaskBacklog()
 			if id != "" {
 				return m, m.taskStartCmd(id, bin)
+			}
+		}
+	}
+	return m, nil
+}
+
+// handleTaskRunKey lets a task own several sessions without making the main
+// backlog list unwieldy. Killing here affects only the selected live run, not
+// the task or any sibling run.
+func (m *dashboardModel) handleTaskRunKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	t := m.taskStore.Get(m.taskRunTaskID)
+	if t == nil {
+		m.taskStage = taskStageList
+		return m, nil
+	}
+	switch msg.String() {
+	case "q", "ctrl+c":
+		m.closeTaskBacklog()
+	case "esc", "left", "h":
+		m.taskStage = taskStageList
+	case "up", "k":
+		if n := len(t.Runs); n > 0 {
+			m.taskRunCursor = (m.taskRunCursor - 1 + n) % n
+		}
+	case "down", "j":
+		if n := len(t.Runs); n > 0 {
+			m.taskRunCursor = (m.taskRunCursor + 1) % n
+		}
+	case "enter", "right", "l":
+		if m.taskRunCursor >= 0 && m.taskRunCursor < len(t.Runs) {
+			r := t.Runs[m.taskRunCursor]
+			if r.Status == task.StatusInProgress {
+				m.closeAndJumpToRun(r.CBSessionID)
+			}
+		}
+	case "x":
+		if m.taskRunCursor >= 0 && m.taskRunCursor < len(t.Runs) {
+			r := t.Runs[m.taskRunCursor]
+			if r.Status == task.StatusInProgress && r.CBSessionID != "" {
+				return m, killCmd(r.CBSessionID)
 			}
 		}
 	}
@@ -553,7 +611,6 @@ func (m *dashboardModel) taskResumeCmd(id, runID string) tea.Cmd {
 // session lives outside the launch workspace), select it, re-attach the screen
 // pane, and focus it — the same recipe as jump_pending.
 func (m *dashboardModel) closeAndJumpToTask(t *task.Task) {
-	m.closeTaskBacklog()
 	var sessionID string
 	for i := len(t.Runs) - 1; i >= 0; i-- {
 		if t.Runs[i].Status == task.StatusInProgress {
@@ -561,6 +618,11 @@ func (m *dashboardModel) closeAndJumpToTask(t *task.Task) {
 			break
 		}
 	}
+	m.closeAndJumpToRun(sessionID)
+}
+
+func (m *dashboardModel) closeAndJumpToRun(sessionID string) {
+	m.closeTaskBacklog()
 	for _, s := range m.sessions {
 		if s.ID != sessionID {
 			continue
@@ -617,6 +679,8 @@ func (m *dashboardModel) renderTaskBacklog() string {
 		return m.renderTaskDetail()
 	case taskStageAgent:
 		return m.renderTaskAgentStage()
+	case taskStageRun:
+		return m.renderTaskRunStage()
 	}
 	return m.renderTaskList()
 }
@@ -653,7 +717,7 @@ func (m *dashboardModel) renderTaskList() string {
 			lines = append(lines, marker+m.taskGlyph(t)+" "+truncate(t.Title, taskTitleCol)+runs)
 		}
 	}
-	lines = append(lines, "", helpStyle.Render("j/k move · n new · enter open · e details · s new session · r resume · c done · x delete · esc close"))
+	lines = append(lines, "", helpStyle.Render("j/k move · n new · enter open · e details · s new session · r resume · K sessions · c done · x delete · esc close"))
 	return configPanelStyle.Render(strings.Join(lines, "\n"))
 }
 
@@ -746,5 +810,30 @@ func (m *dashboardModel) renderTaskAgentStage() string {
 		lines = append(lines, "", helpStyle.Render(note))
 	}
 	lines = append(lines, "", helpStyle.Render("↑↓ select · enter start · esc back"))
+	return configPanelStyle.Render(strings.Join(lines, "\n"))
+}
+
+func (m *dashboardModel) renderTaskRunStage() string {
+	t := m.taskStore.Get(m.taskRunTaskID)
+	if t == nil {
+		return configPanelStyle.Render(helpStyle.Render("task no longer exists"))
+	}
+	lines := []string{titleStyle.Render("sessions: " + truncate(t.Title, 32)), ""}
+	for i, r := range t.Runs {
+		marker := "  "
+		if i == m.taskRunCursor {
+			marker = selBarStyle.Render("▌ ")
+		}
+		state := "paused"
+		if r.Status == task.StatusInProgress {
+			state = "active"
+		}
+		label := r.Agent
+		if label == "" {
+			label = "agent"
+		}
+		lines = append(lines, marker+m.runGlyph(r)+" "+label+" · "+state)
+	}
+	lines = append(lines, "", helpStyle.Render("j/k select · enter open active · x kill active · esc back"))
 	return configPanelStyle.Render(strings.Join(lines, "\n"))
 }

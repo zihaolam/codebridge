@@ -1,8 +1,14 @@
 // Mobile key strip: the keys a phone keyboard doesn't have, sent as raw
-// bytes into the attached session, plus a jump-to-live for scrollback (the
-// shift+G of the TUI's scroll mode — untypeable on a phone).
+// bytes into the attached session, plus scrollback controls. A finger drag
+// pans the canonical frame natively, so daemon-side scrollback (history above
+// the live screen) lives here instead: ↑/↓ page through it and ⤓ jumps back
+// to live. Term.tsx owns the offset, so ↑/↓ dispatch a window event it clamps.
 import type { CbClient } from './ws'
 import { KEYS } from './keys'
+
+// dir +1 pages back into history, -1 toward live (see Term.tsx setOffset).
+const scrollback = (dir: number) =>
+  window.dispatchEvent(new CustomEvent('cb-scrollback', { detail: { dir } }))
 
 export default function KeyBar({ client }: { client: CbClient }) {
   return (
@@ -17,6 +23,12 @@ export default function KeyBar({ client }: { client: CbClient }) {
           {k.label}
         </button>
       ))}
+      <button className="key key-nav" title="scroll back" onClick={() => scrollback(1)}>
+        ↑
+      </button>
+      <button className="key" title="scroll forward" onClick={() => scrollback(-1)}>
+        ↓
+      </button>
       <button className="key key-live" title="jump to live" onClick={() => client.scroll(0)}>
         ⤓ live
       </button>

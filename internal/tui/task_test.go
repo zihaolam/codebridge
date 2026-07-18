@@ -8,6 +8,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"codebridge/internal/ipc"
 	"codebridge/internal/task"
 )
 
@@ -106,6 +107,45 @@ func TestRebuildTaskRowsSections(t *testing.T) {
 	}
 }
 
+// TestTaskCursorWraps: j past the last task lands on the first, k past the
+// first lands on the last, skipping section-header/note rows on the way.
+func TestTaskCursorWraps(t *testing.T) {
+	st := testTaskStore(t)
+	a := st.Add("cur", "a", "").ID
+	b := st.Add("cur", "b", "").ID
+	c := st.Add("cur", "c", "").ID
+
+	m := &dashboardModel{currentScope: "cur", taskStore: st, taskOpen: true, taskStage: taskStageList}
+	m.rebuildTaskRows()
+
+	// The list is pending-oldest-first under one header, so a, b, c in order.
+	idAt := func() string {
+		if tk := m.taskUnderCursor(); tk != nil {
+			return tk.ID
+		}
+		return ""
+	}
+	if idAt() != a {
+		t.Fatalf("initial cursor = %q, want %q", idAt(), a)
+	}
+	m.handleTaskKey(key("j"))
+	if idAt() != b {
+		t.Fatalf("after one j, cursor = %q, want %q", idAt(), b)
+	}
+	m.handleTaskKey(key("j"))
+	if idAt() != c {
+		t.Fatalf("after two j, cursor = %q, want %q", idAt(), c)
+	}
+	m.handleTaskKey(key("j")) // wraps to the top
+	if idAt() != a {
+		t.Fatalf("j past last did not wrap: cursor = %q, want %q", idAt(), a)
+	}
+	m.handleTaskKey(key("k")) // wraps to the bottom
+	if idAt() != c {
+		t.Fatalf("k past first did not wrap: cursor = %q, want %q", idAt(), c)
+	}
+}
+
 // TestTaskMultipleSessions: pressing s on an in_progress task opens the agent
 // picker so a second session can be started for the same task.
 func TestTaskMultipleSessions(t *testing.T) {
@@ -184,5 +224,28 @@ func TestTaskPasteIntoNewForm(t *testing.T) {
 	m.handleTaskPaste("fix paste\ninclude a description")
 	if m.taskTitleBuf != "fix paste" || m.taskDescBuf != "include a description" || m.taskNewTitle {
 		t.Fatalf("paste did not fill new-task form: title=%q desc=%q titleActive=%v", m.taskTitleBuf, m.taskDescBuf, m.taskNewTitle)
+	}
+}
+
+func TestTaskRunPickerKillsOnlySelectedLiveRun(t *testing.T) {
+	st := testTaskStore(t)
+	id := st.Add("cur", "parallel", "").ID
+	st.Get(id).Status = task.StatusInProgress
+	st.Get(id).Runs = []ipc.TaskRun{
+		{ID: "one", CBSessionID: "session-1", Status: task.StatusInProgress},
+		{ID: "two", CBSessionID: "session-2", Status: task.StatusInProgress},
+	}
+	m := &dashboardModel{currentScope: "cur", taskStore: st, taskOpen: true, taskStage: taskStageList}
+	m.rebuildTaskRows()
+	m.handleTaskKey(key("K"))
+	if m.taskStage != taskStageRun || m.taskRunTaskID != id {
+		t.Fatalf("run picker did not open: stage=%v task=%q", m.taskStage, m.taskRunTaskID)
+	}
+	_, cmd := m.handleTaskKey(key("x"))
+	if cmd == nil {
+		t.Fatal("killing selected live run did not produce a command")
+	}
+	if len(st.Get(id).Runs) != 2 {
+		t.Fatal("run picker modified task runs locally")
 	}
 }

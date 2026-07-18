@@ -23,6 +23,13 @@ body {
   display: flex;
   height: 100vh;
   height: 100dvh; /* track the real visible height under mobile browser chrome */
+  /* iOS PWA (black-translucent status bar) draws the web view under the notch.
+     Pad the whole app down by the top inset so no view renders beneath it; the
+     dark background makes the reclaimed strip read as an extension of the top
+     bar (aside header / topbar are the same colour). env() is 0 off notched
+     hardware, so this is a no-op on desktop. box-sizing keeps it inside 100dvh. */
+  padding-top: env(safe-area-inset-top);
+  background: #010409;
 }
 
 button {
@@ -314,12 +321,18 @@ main {
 .term-holder {
   flex: 1;
   min-height: 0;
-  /* The grid is font-scaled to exactly span the pane width (Term.tsx), so
-     there is never anything to scroll horizontally. */
-  overflow-x: hidden;
+  /* Frames arrive at the host PC's canonical column count (Term.tsx resizes
+     xterm to f.cols), which is usually wider than a phone. Let the pane scroll
+     horizontally so the full grid is reachable — only this pane scrolls, never
+     the page, since body/#root are overflow:hidden and main has min-width:0. */
+  overflow-x: auto;
   overflow-y: auto;
   overscroll-behavior: contain;
-  touch-action: pan-x; /* vertical drags become daemon-side scrollback */
+  /* Single scroll surface: a finger pans the canonical frame natively in both
+     axes. Daemon scrollback (history) is an explicit control (keybar ↑/↓), so
+     no gesture is overloaded. pan-x pan-y keeps native scroll but blocks
+     pinch/double-tap zoom, which would fight the fixed grid. */
+  touch-action: pan-x pan-y;
   padding: 6px;
   background: #0d1117;
 }
@@ -377,8 +390,12 @@ main {
 .keybar .key:active {
   background: #30363d;
 }
-.keybar .key-live {
+/* Scrollback controls (↑ ↓ ⤓) group on the right of the key strip; the first
+   one pushes the group over. */
+.keybar .key-nav {
   margin-left: auto;
+}
+.keybar .key-live {
   color: #8b949e;
 }
 
@@ -430,20 +447,17 @@ main {
 }
 
 @media (max-width: 768px) {
-  aside header {
-    padding-top: calc(10px + env(safe-area-inset-top));
-  }
+  /* The top safe-area inset is handled once on .app; here we only tune the
+     horizontal insets (landscape notch) and touch-target padding. */
   .topbar {
     padding: 8px 10px;
-    padding-top: calc(8px + env(safe-area-inset-top));
   }
   .term-holder {
-    /* Wider side gutters on phones so text never runs to the screen edge;
-       FitAddon subtracts this padding, so the grid narrows to fit. Add the
-       horizontal safe-area insets for notched displays in landscape. */
-    padding-left: calc(12px + env(safe-area-inset-left));
-    padding-right: calc(12px + env(safe-area-inset-right));
-    padding-bottom: 6px; /* the key bar below owns the safe-area inset */
+    /* Add the horizontal safe-area insets so the scroll gutter clears a
+       landscape notch. The bottom key bar owns the bottom inset. */
+    padding-left: calc(6px + env(safe-area-inset-left));
+    padding-right: calc(6px + env(safe-area-inset-right));
+    padding-bottom: 6px;
   }
   .keybar {
     display: flex;

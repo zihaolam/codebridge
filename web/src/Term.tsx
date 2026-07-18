@@ -148,6 +148,8 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client])
 
+  const lineHeightPx = 17
+
   const setOffset = (next: number) => {
     const s = scrollRef.current
     next = Math.min(Math.max(next, 0), s.max)
@@ -157,36 +159,29 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
     }
   }
 
+  // Daemon-side scrollback is now an explicit control (the keybar ↑/↓ buttons),
+  // not a drag gesture — a finger drag pans the canonical frame natively (both
+  // axes), so overloading vertical drag with scrollback would fight the native
+  // pan. A tap pages by roughly one screenful; dir +1 goes back in history
+  // (offset up from the live bottom), -1 toward live.
+  useEffect(() => {
+    const onScrollback = (e: Event) => {
+      const dir = (e as CustomEvent<{ dir: number }>).detail?.dir ?? 0
+      const visible = Math.floor((holder.current?.clientHeight ?? 0) / lineHeightPx)
+      const page = Math.max(1, visible - 1)
+      setOffset(scrollRef.current.offset + dir * page)
+    }
+    window.addEventListener('cb-scrollback', onScrollback)
+    return () => window.removeEventListener('cb-scrollback', onScrollback)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [client])
+
   // Wheel browses daemon-side scrollback: offset lines up from live bottom.
+  // (Desktop only in practice — the frame fits the pane there, so there is no
+  // native scroll to compete with; phones use the keybar buttons.)
   const onWheel = (e: React.WheelEvent) => {
     setOffset(scrollRef.current.offset + (e.deltaY < 0 ? SCROLL_STEP : -SCROLL_STEP))
   }
 
-  // Touch drag maps to the same daemon-side scrollback (there's no wheel on a
-  // phone, and xterm has no scrollback of its own here). Content follows the
-  // finger: dragging down reveals older lines.
-  const touch = useRef<{ y: number; offset: number } | null>(null)
-  const lineHeightPx = 17
-  const onTouchStart = (e: React.TouchEvent) => {
-    touch.current = { y: e.touches[0].clientY, offset: scrollRef.current.offset }
-  }
-  const onTouchMove = (e: React.TouchEvent) => {
-    if (!touch.current) return
-    const dy = e.touches[0].clientY - touch.current.y
-    setOffset(touch.current.offset + Math.round(dy / lineHeightPx))
-  }
-  const onTouchEnd = () => {
-    touch.current = null
-  }
-
-  return (
-    <div
-      className="term-holder"
-      ref={holder}
-      onWheel={onWheel}
-      onTouchStart={onTouchStart}
-      onTouchMove={onTouchMove}
-      onTouchEnd={onTouchEnd}
-    />
-  )
+  return <div className="term-holder" ref={holder} onWheel={onWheel} />
 }

@@ -179,6 +179,8 @@ type dashboardModel struct {
 	taskAgents      []agentChoice // installed agents, computed when the agent stage opens
 	taskAgentCursor int
 	taskStartID     string // task carried from the list into the agent stage
+	taskRunTaskID   string // task whose runs are open in the session picker
+	taskRunCursor   int    // selected run in that picker
 	taskPrefix      bool   // local prefix chord state while the dialog is open
 
 	// live screen of the selected session (right pane). When focus==focusScreen,
