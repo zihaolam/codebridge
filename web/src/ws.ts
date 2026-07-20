@@ -1,6 +1,6 @@
 // WS client for the cb web bridge. One multiplexed socket: session-list
 // snapshots, the attached session's frame stream, and upstream input.
-// Message shapes mirror internal/web/messages.go.
+// Message shapes mirror the Rust protocol types used by the web bridge.
 
 export type SessionInfo = {
   id: string

@@ -1,10 +1,12 @@
 # build artifacts
 /dist/
 /cb
+/target/
+/.tools/
 
 # web frontend
 web/node_modules/
 internal/web/dist/*
 !internal/web/dist/.gitkeep
 
-subtrees
+subtrees/*

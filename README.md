@@ -7,7 +7,7 @@ terminal tab per session — with no central view of which session needs your at
 selected session's **live, interactive** screen on the right, with status that updates as
 each session works, waits for approval, or finishes its turn.
 
-It is a single self-contained Go binary (`cb`). It owns each session's pseudo-terminal
+It is a single self-contained Rust binary (`cb`). It owns each session's pseudo-terminal
 directly — **no tmux dependency** — and a long-lived daemon keeps your sessions alive even
 when the UI is closed.
 
@@ -49,7 +49,7 @@ which one needs me.
             └───────────────────────────▲───────────────────────────────┘
                                          │ attach / detach
                           ┌──────────────┴───────────────┐
-                          │  cb TUI (Bubble Tea)          │
+                          │  cb TUI (Ratatui)             │
                           │  sidebar + live screen pane   │
                           └───────────────────────────────┘
 ```
@@ -102,7 +102,7 @@ curl -fsSL https://raw.githubusercontent.com/zihaolam/codebridge/main/install.sh
 ```
 
 That downloads the latest prebuilt `cb` binary from
-[GitHub Releases](https://github.com/zihaolam/codebridge/releases) (no Go
+[GitHub Releases](https://github.com/zihaolam/codebridge/releases) (no Rust
 toolchain required), installs it to `~/.cb/bin`, adds that dir to your `PATH`,
 and registers hooks for whichever of claude / codex you have. It's sudo-free
 (bun/rustup pattern: its own `~/.cb/bin` dir plus a `CB_INSTALL`/`PATH` line in
@@ -121,13 +121,15 @@ curl -fsSL https://raw.githubusercontent.com/zihaolam/codebridge/main/install.sh
 curl -fsSL https://raw.githubusercontent.com/zihaolam/codebridge/main/install.sh | bash -s -- --no-hooks
 ```
 
-Build from source instead (needs Go 1.25+):
+Build from source instead (needs stable Rust, Zig 0.15.2, and Node.js):
 
 ```sh
 git clone https://github.com/zihaolam/codebridge && cd codebridge
 BUILD_FROM_SOURCE=1 ./install.sh
 # or fully by hand:
-go build -o ./cb .
+cd web && npm ci && npm run build && cd ..
+cargo build --release
+cp target/release/cb ./cb
 ./cb install-hooks    # wires cb into ~/.claude/settings.json (writes a .bak)
 ./cb install-codex    # wires cb into ~/.codex/hooks.json (leaves config.toml alone)
 ```

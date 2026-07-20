@@ -2,9 +2,9 @@
 # install.sh — install cb (codebridge) into a user-owned bin dir on your
 # PATH (no sudo), then register hooks for whichever agents are installed.
 #
-# By default this downloads a prebuilt binary from GitHub Releases — no Go
+# By default this downloads a prebuilt binary from GitHub Releases — no Rust
 # toolchain required. Set BUILD_FROM_SOURCE=1 to compile locally instead
-# (needs Go 1.25+).
+# (needs stable Rust, Zig 0.15.2, and Node.js).
 #
 # Installs to ~/.cb/bin (its own dir, like bun's ~/.bun/bin) and, if that dir
 # isn't already on your PATH, appends an `export PATH=...` line to your shell
@@ -19,7 +19,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/zihaolam/codebridge/main/install.sh | bash
 #   VERSION=v0.2.0 ./install.sh        # pin to a specific release
 #   BINDIR=~/bin ./install.sh          # install to a different user dir
-#   BUILD_FROM_SOURCE=1 ./install.sh   # compile locally (needs Go 1.25+)
+#   BUILD_FROM_SOURCE=1 ./install.sh   # compile locally (Rust + Zig + Node.js)
 #   ./install.sh --no-hooks            # skip all hook installation
 set -euo pipefail
 
@@ -47,7 +47,7 @@ BINDIR="${BINDIR:-$HOME/.cb/bin}"
 BINDIR="${BINDIR/#\~/$HOME}"
 CB_INSTALL="${BINDIR%/bin}"
 
-# detect_platform sets OS / ARCH to the names goreleaser uses in archive names.
+# detect_platform sets OS / ARCH to the names used in release archive names.
 detect_platform() {
   local uname_s uname_m
   uname_s="$(uname -s)"
@@ -65,16 +65,18 @@ detect_platform() {
 }
 
 build_from_source() {
-  if ! command -v go >/dev/null 2>&1; then
-    echo "!! BUILD_FROM_SOURCE=1 but 'go' is not on PATH. Install Go 1.25+ or unset BUILD_FROM_SOURCE." >&2
-    exit 1
-  fi
+  for command in cargo zig npm; do
+    if ! command -v "$command" >/dev/null 2>&1; then
+      echo "!! BUILD_FROM_SOURCE=1 requires '$command' on PATH." >&2
+      exit 1
+    fi
+  done
   echo ">> building cb from source"
   # Resolve script dir for source builds (download path has no source tree).
   cd "$(cd "$(dirname "$0")" && pwd)"
-  mkdir -p dist
-  go build -o dist/cb .
-  BINARY="dist/cb"
+  (cd web && npm ci && npm run build)
+  cargo build --locked --release
+  BINARY="target/release/cb"
 }
 
 download_release() {

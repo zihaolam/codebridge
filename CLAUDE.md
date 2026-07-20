@@ -1,158 +1,135 @@
-# CLAUDE.md
+# Codebridge repository guide
 
-Guidance for working in this repo. `codebridge` is a Go TUI (`cb`) that manages many
-Claude Code / Codex sessions: a long-lived daemon owns each session's PTY, and a Bubble Tea
-client renders a single unified view — a session list sidebar plus the selected session's
-live, interactive screen. No tmux dependency.
+`codebridge` is a Rust TUI (`cb`) for managing Claude Code, Codex, and other
+coding-agent sessions. A long-lived daemon owns every agent PTY and its
+libghostty-vt terminal state. A Ratatui client renders the Codebridge sidebar
+and one selected live session. It is intentionally an agent-session manager,
+not a general-purpose shell or tmux replacement.
 
-## Build / test / run
-
-```sh
-go build -o ./dist/cb .    # single binary (dist/ is gitignored)
-go vet ./...
-go test ./...              # unit tests live in internal/tui, internal/hook, internal/web
-gofmt -w internal/
-```
-
-The `cb web` PWA is embedded via `//go:embed internal/web/dist`; that dir is
-gitignored (a `.gitkeep` keeps the embed valid), so build the frontend first
-whenever you touch `web/` or want the web UI in the binary:
+## Build, test, and run
 
 ```sh
-cd web && npm install && npm run build   # emits into internal/web/dist
+cargo build
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
 ```
 
-Requires Go 1.24+ (the `charmbracelet/x/vt` emulator pulls the toolchain to 1.25).
+The vendored libghostty-vt build requires Zig 0.15.2. `build.rs` uses `ZIG`
+when set, then the matching ignored `.tools/zig-<target>-0.15.2/zig`, then
+`zig` on `PATH`.
 
-Interactive parts can't be driven from plain stdin in CI — to exercise the client, run it
-under a PTY (see the Python `pty` harnesses used during development) or test by hand:
+The phone PWA is embedded at Rust compile time from `internal/web/dist`. Build
+it before release builds or after changing `web/`:
 
 ```sh
-./dist/cb daemon &            # or let `cb` auto-start it
-./dist/cb ctl spawn claude
-./dist/cb                     # sidebar + live screen; ^a →/← switch focus
+cd web && npm ci && npm run build
 ```
+
+Interactive checks require a real PTY:
+
+```sh
+./target/debug/cb daemon
+./target/debug/cb ctl spawn claude
+./target/debug/cb
+```
+
+Use `cb restart` after a protocol-changing rebuild. A stale daemon is rejected
+by protocol version.
 
 ## Architecture
 
-- **`internal/session`** — `Session` wraps one child under a PTY (`creack/pty`) plus a
-  `charmbracelet/x/vt.SafeEmulator`. Goroutines: `readLoop` (drain PTY → emulator),
-  `replyLoop` (forward emulator-generated terminal replies back to the PTY — see Gotchas),
-  `wait` (reap + mark ended). Status enum is set by hook events, not by scraping output.
-- **`internal/daemon`** — the hub. Owns the session registry and a unix-socket listener
-  (`daemon.go`). `stream.go` handles `attach`: a bidirectional stream that pushes deduped
-  screen frames (`~30fps`) and accepts input/resize/detach/scroll. A `scroll` message sets
-  a per-attach offset; the frame loop renders `Session.RenderScroll(offset)` (scrollback +
-  visible grid) and reports the clamped `Offset`/`MaxOffset` back in each frame. Spawns
-  sessions with `CB_SESSION=<uuid>` injected so hooks can correlate.
-- **`internal/ipc`** — the wire protocol: line-delimited JSON. `Request`/`Response` for
-  one-shot calls (`ping`/`spawn`/`list`/`kill`/`hook`/`shutdown`), `StreamUp`/`StreamDown`
-  for attached connections. `ProtocolVersion` gates against a stale daemon.
-- **`internal/hook`** — `cb hook <event>` is a no-op observer Claude Code invokes; it
-  reads stdin JSON + `CB_SESSION` env and POSTs to the daemon, always exiting 0.
-  `install.go` merges hook entries into `~/.claude/settings.json` (idempotent, writes a
-  `.bak`); `Installed()` detects whether they're present.
-- **`internal/tui`** — Bubble Tea client. `dashboard.go` is the whole UI: a sidebar
-  (session list, polls `list` every 500ms) beside a live screen pane that opens one attach
-  stream to the selected session and forwards input when focused (`focusZone`). The sidebar
-  scrolls to keep the cursor visible (`clampTop`); `prefix [` enters a keyboard scroll mode
-  that browses the screen pane's scrollback via daemon-rendered frames. The mouse is left
-  uncaptured on purpose so the terminal's native text selection keeps working. `keys.go`
-  maps Bubble Tea keys → raw bytes for forwarding; the `ctrl+a` prefix (configurable via
-  `CB_PREFIX`) switches focus / quits. `prefix w` opens the `worktree.go` two-stage
-  picker: `git worktree list --porcelain` on the fly → pick a worktree, then pick which
-  agent (claude / codex / opencode, filtered to binaries on `PATH`) to spawn there —
-  the agent is chosen every time, never remembered. `prefix n` / `prefix c` still spawn
-  claude / codex instantly in the launch scope's cwd (see `spawnTargetCwd`).
-- **`internal/cli`** — subcommand router + `ensureDaemon` (auto-start with a readiness wait
-  and protocol-version check).
-- **`internal/web`** — the daemon-started mobile bridge: it remains just another daemon
-  client (unix socket, same ipc protocol) and serves the mobile PWA + a `/ws` WebSocket on
-  `127.0.0.1` (expose via `tailscale serve`). The CLI starts it alongside `cb daemon`, while
-  the daemon package stays web-agnostic. One multiplexed WS per browser: token auth as
-  the first message (token in `~/.cb/web.json`; `cb web token|qr`), then session-list
-  snapshots and frame passthrough for the attached session. The list is push-based: the
-  bridge holds one daemon `watch` stream (`daemon/watch.go` — a snapshot line on every
-  spawn/kill/rename/hook change, 1s safety ticker for child exits) shared by all browsers,
-  falling back to 500ms `list` polling only against a pre-watch daemon. Snapshots are
-  enriched bridge-side with a per-cwd scope key (`web/scope.go`) mirroring the TUI
-  accordion's repo-common-dir grouping. Attaches without rows/cols on purpose so a phone
-  never resizes a session under the desktop TUI. The daemon stays web-agnostic — the watch
-  stream is generic (the TUI could adopt it); web-facing features belong here, not in
-  `internal/daemon`. Frontend source lives in `web/` (Vite + React + xterm.js); frames are
-  written straight into xterm.js outside React state.
+- `src/terminal/` owns the safe libghostty-vt wrapper and generated FFI. It
+  handles semantic styled cells, graphemes, Ghostty viewport scrollback,
+  reflow, alternate screen, synchronized output, query replies, text
+  extraction, paste, focus, and mouse encoding.
+- `src/session.rs` owns one child process group under a PTY. Its reader drains
+  output continuously even without clients, feeds Ghostty, and notifies dirty
+  subscribers. The waiter reaps the child. Killing a session signals the whole
+  Unix process group.
+- `src/daemon.rs` owns sessions, tasks, status, Unix-socket request/watch/attach
+  streams, and per-attachment absolute scroll anchors. The daemon sends an
+  immediate semantic frame and then only changed frames.
+- `src/protocol.rs` is line-delimited JSON for one-shot requests and streaming
+  messages. Bump `VERSION` on every wire-shape or semantic wire change.
+- `src/tui.rs` is client presentation state: sidebar focus and grouping,
+  prefix/config/help modals, worktree and task pickers, toasts, selection,
+  OSC52, and input forwarding. Rendering is pure; `compute_view` mutates
+  geometry before drawing.
+- `src/sidebar.rs` implements repo-common-dir scope grouping, flat/accordion
+  modes, stable logical selection, and attention jumps.
+- `src/task.rs` persists the daemon-owned backlog and multi-run state.
+  `src/codex.rs` attributes Codex rollout IDs for precise resume.
+- `src/integration.rs` follows Herdr's durable integration model: versioned
+  product-owned hook scripts, structural JSON edits, preservation of user
+  hooks, current/outdated status, safe uninstall, and Codex's top-level
+  `[features] hooks = true` migration.
+- `src/web.rs` is a daemon client that serves the embedded PWA and one
+  authenticated multiplexed WebSocket per browser. It enriches snapshots with
+  filesystem scope data and adapts semantic frames to the PWA's ANSI/xterm
+  contract. Normal phone attaches never resize the canonical PTY.
+- `src/config.rs`, `src/worktree.rs`, and `src/notify.rs` provide persistent
+  bindings, per-launch worktree/agent selection, and native notifications.
+- `web/` is the Vite/React/xterm.js PWA source. Frames are written directly to
+  xterm outside React state.
+- `vendor/libghostty-vt` is pinned terminal-engine source. Keep its provenance
+  metadata intact when updating it.
 
 ## Status model
 
-Hook event → status mapping lives in `daemon.statusForEvent`:
+Hooks are no-op observers; never scrape terminal text for status.
 
-- `SessionStart` → `idle` (fresh session, no turn has run yet — distinct from
-  *turn complete* so the sidebar can colour them differently).
-- `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `PostToolBatch` → `working`.
-- `PermissionRequest` → `needs_approval` (stores `Message`).
-- `Notification` → `needs_approval` when the message looks like a permission
-  prompt (`isApprovalMessage`), else `waiting_user` (the generic "waiting for
-  input" nudge Claude Code fires at idle).
-- `Stop` → `waiting_user` (agent turn finished).
-- `SessionEnd` → `ended`.
-- Anything else → `working` (tolerant fallback while the session is active).
+- `SessionStart` -> `idle`
+- `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolBatch` -> `working`
+- `PermissionRequest` -> `needs_approval`
+- permission-like `Notification` -> `needs_approval`
+- other `Notification` and `Stop` -> `waiting_user`
+- `SessionEnd` -> `ended`
+- unknown active events -> `working`
 
-A spawned session starts at `starting` (set by `session.New`) until the first
-hook event fires.
+Sidebar indicators are a green spinner for working, green `●` for turn
+complete, yellow `●` for newly idle, cyan `…` for starting, red `⚑` for
+approval, and grey `✗` for ended. Toast and native notification transitions
+occur only when a previously observed session enters approval or turn-complete.
 
-The hook CLI forwards *any* event name, so `statusForEvent` is the single place
-to adjust if Claude Code's event names shift between versions.
+## Workspace and tasks
 
-**Sidebar glyphs** (`dashboardModel.indicator` + `statusStyle`): green spinner
-while `working`, **green ●** for `waiting_user` (turn complete), **yellow ●**
-for `idle` (just created), cyan `…` for `starting`, red `⚑` for
-`needs_approval`, grey `✗` for `ended`. Toasts fire only on transitions *into*
-`needs_approval` and *into* `waiting_user` (with `old != ""` guarding against
-a first-observation false positive). New colours/icons should be added in both
-the style map and the indicator switch.
+The launch repo is the default flat scope. A repo's main checkout and linked
+worktrees share the canonical common `.git` directory as their scope key.
+Outside git, the launch directory is the scope. Prefix `a` toggles the global
+accordion. Scope-sensitive features must use sidebar/task scope helpers rather
+than raw session lists.
 
-## Workspace scoping
+Tasks are persisted by the daemon only. Starting creates a fresh run; resuming
+reuses a selected paused run and the agent-native resume identity. Claude uses
+`--resume`, Codex uses `resume <id>` (or `resume --last` as a fallback), and
+OpenCode uses `--continue`. Prefill is queued until the first hook or a bounded
+fallback timer.
 
-The sidebar is scoped to the directory `cb` was launched in. In a git repo
-(including any linked worktree), scope is the repo's *common directory* — the
-shared `.git` — so the main checkout and every linked worktree count as one
-scope and their sessions appear together. Outside a git repo, scope is the
-launch-dir subtree. `deriveScope` / `gitCommonDir` resolve this with pure
-filesystem reads (no `git` subprocess); `repoCache` memoizes `cwd → common dir`
-so the 500ms `list` poll doesn't re-walk per session.
+## Hard-won invariants
 
-Toggle with **prefix `a`**: `m.showAll` flips and `applyScope()` rebuilds the
-visible list, re-seeds `prev` (so the next poll doesn't toast sessions that
-merely came into view), and re-attaches the screen pane to whatever ends up
-under the cursor. The launch-time `--all` flag starts unscoped. `scopeLabel`
-renders the current mode in the sidebar header.
+- Always forward terminal-query replies from libghostty-vt to the child PTY.
+  Full-screen agents can block at startup without them.
+- Always drain PTY output. Backpressure can freeze an unattended agent.
+- Keep scrollback in Ghostty. An attachment entering history records an
+  absolute row so new output cannot move that view; offset zero resumes live
+  follow.
+- Suppress intermediate frames while synchronized-output mode 2026 is active.
+- Preserve semantic cells on the daemon wire. The terminal client draws cells;
+  only the web compatibility adapter produces ANSI.
+- A phone viewport is presentation-only. Only the explicit resize action may
+  resize the shared PTY.
+- Mouse reporting belongs to the child when its terminal mode requests it.
+  Shift is the local in-app selection override.
+- Hooks must be bounded, best-effort observers and always exit successfully.
+  `CB_SESSION` correlates events; absence of it makes the hook a no-op.
+- Do not disable Codex's shared `features.hooks` flag during uninstall; remove
+  only Codebridge's entries and owned script.
+- Preserve unrelated user configuration and dirty-worktree changes.
 
-`cb` is meant to feel per-repo by default — adding scope-sensitive features
-(filters, batch ops) should go through `visibleSessions` / `inScope`, not the
-raw `allSessions` list.
+## Release
 
-## Gotchas (hard-won)
-
-- **Terminal-query replies must be forwarded.** Claude Code (and any full-screen TUI) sends
-  device-attribute / cursor-position queries at startup and *blocks* until the terminal
-  replies. The emulator computes replies into an internal pipe; `Session.replyLoop` drains
-  that pipe back to the child's PTY. Without it, claude hangs: blank screen, no input, no
-  hooks. Don't remove it.
-- **Backpressure.** Every session's PTY must be drained continuously even with no client
-  attached, or the child blocks on write when the PTY buffer fills. `readLoop` always runs.
-- **Stale daemon.** The daemon is long-lived and is *not* restarted by rebuilding the
-  binary. `ensureDaemon` checks `ProtocolVersion` and refuses to proceed against a stale
-  daemon. Bump `ipc.ProtocolVersion` on any wire change. To restart: `cb restart` (or
-  `pkill -f 'cb daemon'`).
-- **Group kill.** Sessions are started with `Setsid` (via `pty.StartWithSize`), so
-  `Session.Kill` signals the negative pid to take down claude *and* its subprocess tree.
-- **Input fidelity.** `keys.go` re-encodes Bubble Tea `KeyMsg` to bytes. It covers common
-  xterm sequences; kitty-keyboard / full mouse fidelity is not implemented. If a key
-  misbehaves when typing into a session, that's the place to look.
-
-## Conventions
-
-- Keep the hook CLI a pure no-op observer (always exit 0; never exit 2, which would block
-  Claude Code).
-- The daemon is the source of truth for screen state; clients render frames it sends.
-- Prefer adjusting `statusForEvent` over scraping terminal output for status.
+Tag pushes run `.github/workflows/release.yml`: build the PWA, run fmt/clippy/
+tests, compile natively for macOS and Linux on x86_64 and arm64, archive `cb`,
+and publish checksums. `install.sh` downloads those archives or builds from
+source with Rust, Zig, and Node.js.

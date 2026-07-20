@@ -9,25 +9,92 @@ permissions:
   contents: write
 
 jobs:
-  goreleaser:
-    runs-on: ubuntu-latest
+  verify:
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          fetch-depth: 0
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build embedded PWA
+        run: cd web && npm ci && npm run build
+      - name: Verify Rust rewrite
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            os: darwin
+            arch: amd64
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            os: darwin
+            arch: arm64
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            os: linux
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            os: linux
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          go-version: "1.25"
-          cache: true
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build embedded PWA
+        run: cd web && npm ci && npm run build
+      - name: Build release binary
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Package
+        run: |
+          mkdir package
+          cp "target/${{ matrix.target }}/release/cb" package/cb
+          cp README.md install.sh package/
+          tar -C package -czf "cb_${{ matrix.os }}_${{ matrix.arch }}.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cb-${{ matrix.os }}-${{ matrix.arch }}
+          path: cb_${{ matrix.os }}_${{ matrix.arch }}.tar.gz
 
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
         with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          pattern: cb-*
+          merge-multiple: true
+      - name: Checksums
+        run: sha256sum cb_*.tar.gz > checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            cb_*.tar.gz
+            checksums.txt
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
