@@ -210,22 +210,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    let keyboard_enhancement = matches!(
-        crossterm::terminal::supports_keyboard_enhancement(),
-        Ok(true)
-    );
-    if keyboard_enhancement {
-        execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )?;
-    }
-    // Install restoration before backend initialization: Crossterm may query
-    // cursor state while constructing Terminal and that query can fail on a
-    // broken/disconnected host terminal.
-    let _guard = TerminalGuard {
-        keyboard_enhancement,
-    };
+    // Install restoration before writing terminal modes or initializing the
+    // backend so every early-return path restores the host terminal.
+    let _guard = TerminalGuard;
+    execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
     execute!(
         stdout,
         EnterAlternateScreen,
@@ -320,15 +311,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-struct TerminalGuard {
-    keyboard_enhancement: bool,
-}
+struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        if self.keyboard_enhancement {
-            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        }
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),

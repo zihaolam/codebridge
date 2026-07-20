@@ -67,9 +67,12 @@ Status comes from the **hook** system, not from scraping the terminal: the daemo
 
 codebridge is only fully supported on terminals that forward the Kitty keyboard
 protocol — currently **Ghostty, WezTerm, Kitty, and iTerm2 (with the Kitty
-keyboard extension enabled)**. Other terminals (Terminal.app, stock iTerm2,
-Alacritty's default config, GNOME Terminal, etc.) will run codebridge, but a
-handful of bindings will be unavailable or fall back to alternatives:
+keyboard extension enabled)**. Codebridge activates Kitty's disambiguated-key
+mode when the dashboard starts and restores the prior mode when it exits.
+Terminals that do not implement the request ignore it. Other terminals
+(Terminal.app, stock iTerm2, Alacritty's default config, GNOME Terminal, etc.)
+will run codebridge, but a handful of bindings will be unavailable or fall back
+to alternatives:
 
 - **Copy with `cmd+c`** — macOS terminals (Terminal.app, default iTerm2, etc.)
   often intercept `cmd+c` at the OS level for their *own* clipboard copy and
