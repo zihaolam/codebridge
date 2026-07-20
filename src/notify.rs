@@ -79,7 +79,8 @@ pub fn send(delivery: Delivery, title: &str, body: &str) -> bool {
         return false;
     }
     match delivery {
-        Delivery::All | Delivery::System => send_system(title, body),
+        Delivery::All => send_terminal(title, body).unwrap_or(false) || send_system(title, body),
+        Delivery::System => send_system(title, body),
         Delivery::Terminal => send_terminal(title, body).unwrap_or(false),
         Delivery::Codebridge | Delivery::Off => false,
     }

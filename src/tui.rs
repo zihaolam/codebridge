@@ -10,7 +10,8 @@ use base64::Engine;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, MouseButton, MouseEvent, MouseEventKind,
+    EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, MouseButton, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -209,6 +210,22 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
+    let keyboard_enhancement = matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    );
+    if keyboard_enhancement {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+    // Install restoration before backend initialization: Crossterm may query
+    // cursor state while constructing Terminal and that query can fail on a
+    // broken/disconnected host terminal.
+    let _guard = TerminalGuard {
+        keyboard_enhancement,
+    };
     execute!(
         stdout,
         EnterAlternateScreen,
@@ -216,10 +233,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         EnableFocusChange,
         EnableMouseCapture
     )?;
-    // Install restoration before backend initialization: Crossterm may query
-    // cursor state while constructing Terminal and that query can fail on a
-    // broken/disconnected host terminal.
-    let _guard = TerminalGuard;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -307,10 +320,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-struct TerminalGuard;
+struct TerminalGuard {
+    keyboard_enhancement: bool,
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if self.keyboard_enhancement {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
@@ -679,7 +697,7 @@ fn handle_key(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
         return handle_rename(model, key);
     }
     if model.help {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('h' | '?')) {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
             model.help = false;
             return Ok(false);
         }
@@ -737,7 +755,7 @@ fn handle_key(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
 
 fn handle_prefix(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
     match key.code {
-        KeyCode::Left => {
+        KeyCode::Left | KeyCode::Char('h') => {
             model.focus = Focus::Sidebar;
             return Ok(false);
         }
@@ -745,7 +763,7 @@ fn handle_prefix(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
             model.focus = Focus::Screen;
             return Ok(false);
         }
-        KeyCode::Char('h' | '?') => {
+        KeyCode::Char('?') => {
             model.help = !model.help;
             return Ok(false);
         }
@@ -780,11 +798,18 @@ fn handle_prefix(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
         Some("new_worktree") => open_worktree_picker(model),
         Some("kill") => {
             if let Some(id) = model.attach.as_ref().map(|attach| attach.id.clone()) {
-                let _ = request(Request {
+                let response = request(Request {
                     kind: "kill".to_owned(),
-                    id,
+                    id: id.clone(),
                     ..Request::default()
-                });
+                })?;
+                if response.ok {
+                    if !model.sidebar.select_previous_session(&id) {
+                        model.focus = Focus::Sidebar;
+                    }
+                } else {
+                    model.error = response.error;
+                }
             }
         }
         Some("newline") => send_input(model, b"\n")?,
@@ -1885,12 +1910,13 @@ fn resize_attached(model: &mut Model) -> io::Result<()> {
     Ok(())
 }
 
-fn spawn_agent(model: &Model, agent: &str) -> io::Result<()> {
-    spawn_agent_at(model, agent, model.launch_cwd.clone())
+fn spawn_agent(model: &mut Model, agent: &str) -> io::Result<()> {
+    let cwd = model.launch_cwd.clone();
+    spawn_agent_at(model, agent, cwd)
 }
 
-fn spawn_agent_at(model: &Model, agent: &str, cwd: PathBuf) -> io::Result<()> {
-    let _ = request(Request {
+fn spawn_agent_at(model: &mut Model, agent: &str, cwd: PathBuf) -> io::Result<()> {
+    let response = request(Request {
         kind: "spawn".to_owned(),
         argv: vec![agent.to_owned()],
         cwd: cwd.display().to_string(),
@@ -1898,6 +1924,11 @@ fn spawn_agent_at(model: &Model, agent: &str, cwd: PathBuf) -> io::Result<()> {
         cols: model.pane.width.max(1),
         ..Request::default()
     })?;
+    if response.ok {
+        jump_to_session(model, &response.id);
+    } else {
+        model.error = response.error;
+    }
     Ok(())
 }
 
@@ -1920,7 +1951,7 @@ fn view(model: &Model, area: Rect) -> View {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)])
         .areas(area);
-    let inner = Block::default().borders(Borders::ALL).inner(main);
+    let inner = main_content_area(main);
     let has_scrollbar = model
         .frame
         .as_ref()
@@ -1932,9 +1963,17 @@ fn view(model: &Model, area: Rect) -> View {
     }
 }
 
+fn main_content_area(main: Rect) -> Rect {
+    Rect {
+        y: main.y.saturating_add(u16::from(main.height > 0)),
+        height: main.height.saturating_sub(1),
+        ..main
+    }
+}
+
 fn compute_view(model: &mut Model, area: Rect) {
     let view = view(model, area);
-    let inner = Block::default().borders(Borders::ALL).inner(view.main);
+    let inner = main_content_area(view.main);
     model.pane = Rect {
         width: inner
             .width
@@ -1960,11 +1999,10 @@ fn render(model: &Model, frame: &mut Frame) {
     } else {
         Style::default().fg(model.palette.overlay0)
     };
-    let block = Block::default()
-        .title(format!(" {title} "))
-        .borders(Borders::ALL)
-        .border_style(border_style);
-    frame.render_widget(block, main);
+    frame.render_widget(
+        Paragraph::new(format!(" {title} ")).style(border_style),
+        Rect::new(main.x, main.y, main.width, main.height.min(1)),
+    );
 
     render_terminal(model, frame);
     if let Some(scrollbar) = view.scrollbar {
@@ -2507,7 +2545,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
             lines.push(Line::from(text));
         }
         lines.push(Line::styled(
-            "← sidebar  → screen  h/? close",
+            "h/← sidebar  → screen  ? close",
             Style::default().fg(model.palette.overlay0),
         ));
         let height = (lines.len() as u16 + 2).min(area.height).max(3);
@@ -2582,9 +2620,8 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
         model.palette.overlay0
     };
     let block = Block::default()
-        .title(format!(" codebridge ({}) ", model.sidebar.sessions().len()))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(focus))
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(model.palette.overlay0))
         .style(
             Style::default()
                 .fg(model.palette.text)
@@ -2596,6 +2633,12 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
         return;
     }
 
+    frame.render_widget(
+        Paragraph::new(format!(" codebridge ({}) ", model.sidebar.sessions().len()))
+            .style(Style::default().fg(focus)),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
     let scope = if model.sidebar.accordion() {
         "scope: all".to_owned()
     } else {
@@ -2604,10 +2647,12 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
             scope_display_name(model.sidebar.current_scope())
         )
     };
-    frame.render_widget(
-        Paragraph::new(scope).style(Style::default().fg(model.palette.overlay0)),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
+    if inner.height >= 2 {
+        frame.render_widget(
+            Paragraph::new(scope).style(Style::default().fg(model.palette.overlay0)),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
+    }
 
     let mut display_rows: Vec<(Option<usize>, Line<'static>)> = Vec::new();
     for (index, row) in model.sidebar.rows().iter().enumerate() {
@@ -2631,7 +2676,7 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
             )),
         ));
     }
-    let list_height = inner.height.saturating_sub(2) as usize;
+    let list_height = inner.height.saturating_sub(3) as usize;
     let cursor_row = display_rows
         .iter()
         .position(|(index, _)| *index == Some(model.sidebar.cursor()))
@@ -2647,10 +2692,10 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
     {
         frame.render_widget(
             Paragraph::new(line),
-            Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1),
+            Rect::new(inner.x, inner.y + 2 + row as u16, inner.width, 1),
         );
     }
-    if inner.height >= 2 {
+    if inner.height >= 3 {
         frame.render_widget(
             Paragraph::new(status_counts(model)),
             Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
@@ -2692,7 +2737,7 @@ fn sidebar_row(model: &Model, row: &Row, index: usize) -> Line<'static> {
                 Span::styled(
                     session_label(session),
                     Style::default()
-                        .fg(if selected { model.palette.text } else { color })
+                        .fg(color)
                         .bg(if selected {
                             model.palette.surface0
                         } else {

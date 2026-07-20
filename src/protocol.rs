@@ -1,7 +1,7 @@
 use crate::task::Task;
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 14;
+pub const VERSION: u32 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

@@ -170,14 +170,14 @@ A tmux-style prefix key, **`Ctrl-a`** by default, switches from typing-into-the-
 to issuing a command. Press `Ctrl-a` then tap any of the keys below. The prefix can be
 changed in two ways: persistently from the **config menu** (`Ctrl-a o`, see below), or
 per-shell via the `CB_PREFIX` env var (e.g. `CB_PREFIX=ctrl+b`) which always overrides
-the config file. `Ctrl-a` then `?` (or `h`) toggles a floating cheat-sheet that lists the
-current bindings.
+the config file. `Ctrl-a` then `?` toggles a floating cheat-sheet that lists the current
+bindings.
 
 | `Ctrl-a` then… | default key | action |
 |----------------|-------------|--------|
-| focus sidebar  | `←`         | return focus to the list (not rebindable) |
+| focus sidebar  | `h` or `←`  | return focus to the list (not rebindable) |
 | focus screen   | `l` or `→`  | focus the screen pane |
-| toggle hints   | `h` or `?`  | show/hide the floating prefix cheat-sheet (not rebindable) |
+| toggle hints   | `?`         | show/hide the floating prefix cheat-sheet (not rebindable) |
 | newline        | `enter`     | insert a newline in the session without submitting (works on any terminal) |
 | scroll mode    | `[`         | freeze the screen pane to browse scrollback |
 | new claude     | `n`         | start a new claude session |
@@ -252,7 +252,7 @@ Select **notifications** in the config menu to choose a Herdr-style delivery mod
 
 | mode | behavior |
 |------|----------|
-| `all` | clickable Codebridge toast plus a native OS notification (default) |
+| `all` | clickable Codebridge toast plus a host-terminal notification, with a native OS fallback (default) |
 | `codebridge` | clickable in-app toast only |
 | `terminal` | ask Ghostty, iTerm2, Kitty, or WezTerm to notify via OSC |
 | `system` | use the native macOS/Linux notification service |

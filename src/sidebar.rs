@@ -194,6 +194,29 @@ impl Sidebar {
         true
     }
 
+    pub fn select_previous_session(&mut self, id: &str) -> bool {
+        let Some(current) = self
+            .rows
+            .iter()
+            .position(|row| row.session().is_some_and(|session| session.id == id))
+        else {
+            return false;
+        };
+        let previous = self.rows[..current]
+            .iter()
+            .rposition(|row| row.session().is_some());
+        let fallback = self.rows[current + 1..]
+            .iter()
+            .position(|row| row.session().is_some())
+            .map(|index| current + 1 + index);
+        let Some(target) = previous.or(fallback) else {
+            return false;
+        };
+        self.cursor = target;
+        self.sync_identity();
+        true
+    }
+
     fn set_expanded(&mut self, key: &str, expanded: bool) {
         if expanded {
             self.expanded.insert(key.to_owned());
@@ -496,6 +519,20 @@ mod tests {
             session("b", &cwd, Status::Working, 1),
         ]);
         assert_eq!(sidebar.selected_session().map(|s| s.id.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn killing_a_session_selects_the_previous_visible_session() {
+        let cwd = temp_dir("kill-selection");
+        let mut sidebar = Sidebar::new(&cwd);
+        sidebar.update(vec![
+            session("a", &cwd, Status::Idle, 0),
+            session("b", &cwd, Status::Idle, 0),
+            session("c", &cwd, Status::Idle, 0),
+        ]);
+        assert!(sidebar.select_session("b"));
+        assert!(sidebar.select_previous_session("b"));
+        assert_eq!(sidebar.selected_session().map(|s| s.id.as_str()), Some("a"));
     }
 
     #[test]

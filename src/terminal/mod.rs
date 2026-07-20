@@ -411,10 +411,6 @@ impl Terminal {
         result(unsafe { ffi::ghostty_render_state_update(self.render, self.raw) })?;
         let cols = self.render_u16(ffi::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_COLS)?;
         let rows = self.render_u16(ffi::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_ROWS)?;
-        let default_fg = self
-            .render_color(ffi::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_COLOR_FOREGROUND)?;
-        let default_bg = self
-            .render_color(ffi::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_COLOR_BACKGROUND)?;
         let area = Rect::new(0, 0, cols, rows);
         let mut buffer = Buffer::empty(area);
 
@@ -429,8 +425,13 @@ impl Terminal {
             unsafe { ffi::ghostty_render_state_row_iterator_free(row_iterator) };
             return Err(error);
         }
-        let render_result =
-            self.render_cells(&mut buffer, row_iterator, row_cells, default_fg, default_bg);
+        let render_result = self.render_cells(
+            &mut buffer,
+            row_iterator,
+            row_cells,
+            Color::Reset,
+            Color::Reset,
+        );
         // SAFETY: both iterators were created above and are no longer borrowed.
         unsafe {
             ffi::ghostty_render_state_row_cells_free(row_cells);
@@ -535,18 +536,6 @@ impl Terminal {
             ffi::ghostty_render_state_get(self.render, data, (&mut value as *mut bool).cast())
         })?;
         Ok(value)
-    }
-
-    fn render_color(&self, data: ffi::GhosttyRenderStateData) -> Result<Color, TerminalError> {
-        let mut color = ffi::GhosttyColorRgb::default();
-        result(unsafe {
-            ffi::ghostty_render_state_get(
-                self.render,
-                data,
-                (&mut color as *mut ffi::GhosttyColorRgb).cast(),
-            )
-        })?;
-        Ok(rgb(color))
     }
 }
 
@@ -709,6 +698,8 @@ mod tests {
         let rendered = terminal.render().expect("render");
 
         assert_eq!(row_text(&rendered, 0), "hello");
+        assert_eq!(rendered.buffer[(0, 0)].fg, Color::Reset);
+        assert_eq!(rendered.buffer[(0, 0)].bg, Color::Reset);
         assert_eq!(
             rendered.cursor,
             Some(Cursor {
@@ -717,6 +708,18 @@ mod tests {
                 visible: true
             })
         );
+    }
+
+    #[test]
+    fn preserves_explicit_colors_while_leaving_terminal_defaults_unset() {
+        let mut terminal = Terminal::new(8, 3, 100, |_| {}).expect("terminal");
+        terminal.feed(b"\x1b[38;2;1;2;3;48;2;12;34;56mX");
+        let rendered = terminal.render().expect("render");
+
+        assert_eq!(rendered.buffer[(0, 0)].fg, Color::Rgb(1, 2, 3));
+        assert_eq!(rendered.buffer[(0, 0)].bg, Color::Rgb(12, 34, 56));
+        assert_eq!(rendered.buffer[(1, 0)].fg, Color::Reset);
+        assert_eq!(rendered.buffer[(1, 0)].bg, Color::Reset);
     }
 
     #[test]
