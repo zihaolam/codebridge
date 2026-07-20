@@ -8,6 +8,7 @@ pub mod session;
 pub mod sidebar;
 pub mod task;
 pub mod terminal;
+pub mod theme;
 pub mod tui;
 pub mod web;
 pub mod worktree;

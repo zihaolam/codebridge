@@ -56,6 +56,9 @@ by protocol version.
   prefix/config/help modals, worktree and task pickers, toasts, selection,
   OSC52, and input forwarding. Rendering is pure; `compute_view` mutates
   geometry before drawing.
+- `src/theme.rs` owns Herdr-style semantic UI palettes, built-in dark/light
+  themes, terminal-native colors, and per-token overrides. Themes apply to
+  Codebridge chrome and never alter agent terminal cells.
 - `src/sidebar.rs` implements repo-common-dir scope grouping, flat/accordion
   modes, stable logical selection, and attention jumps.
 - `src/task.rs` persists the daemon-owned backlog and multi-run state.
@@ -69,7 +72,8 @@ by protocol version.
   filesystem scope data and adapts semantic frames to the PWA's ANSI/xterm
   contract. Normal phone attaches never resize the canonical PTY.
 - `src/config.rs`, `src/worktree.rs`, and `src/notify.rs` provide persistent
-  bindings, per-launch worktree/agent selection, and native notifications.
+  bindings, per-launch worktree/agent selection, and delayed/focus-aware
+  notification delivery through Codebridge, terminal OSC, or native services.
 - `web/` is the Vite/React/xterm.js PWA source. Frames are written directly to
   xterm outside React state.
 - `vendor/libghostty-vt` is pinned terminal-engine source. Keep its provenance

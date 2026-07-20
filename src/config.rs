@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::notify::NotificationConfig;
+use crate::theme::ThemeConfig;
+
 pub const DEFAULT_PREFIX: &str = "ctrl+a";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,9 +91,12 @@ pub const ACTIONS: &[Action] = &[
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Config {
     pub prefix: String,
     pub bindings: HashMap<String, String>,
+    pub theme: ThemeConfig,
+    pub notifications: NotificationConfig,
 }
 
 impl Default for Config {
@@ -101,6 +107,8 @@ impl Default for Config {
                 .iter()
                 .map(|action| (action.id.to_owned(), action.default.to_owned()))
                 .collect(),
+            theme: ThemeConfig::default(),
+            notifications: NotificationConfig::default(),
         }
     }
 }
@@ -129,6 +137,8 @@ impl Config {
                 config.bindings.insert(id, key);
             }
         }
+        config.theme = stored.theme;
+        config.notifications = stored.notifications;
         config
     }
 
@@ -187,6 +197,7 @@ mod tests {
         assert_eq!(config.bindings["new_claude"], "m");
         assert_eq!(config.bindings["quit"], "q");
         assert!(!config.bindings.contains_key("unknown"));
+        assert_eq!(config.theme.name, crate::theme::DEFAULT_THEME);
     }
 
     #[test]
@@ -197,5 +208,47 @@ mod tests {
         let config = Config::load_from(Some(path.clone()));
         let _ = fs::remove_file(path);
         assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn theme_config_loads_without_losing_binding_defaults() {
+        let path =
+            std::env::temp_dir().join(format!("cb-theme-config-{}.json", std::process::id()));
+        fs::write(
+            &path,
+            br##"{"theme":{"name":"nord","custom":{"accent":"#abcdef"}}}"##,
+        )
+        .unwrap();
+        let config = Config::load_from(Some(path.clone()));
+        let _ = fs::remove_file(path);
+        assert_eq!(config.theme.name, "nord");
+        assert_eq!(config.theme.custom.accent.as_deref(), Some("#abcdef"));
+        assert_eq!(config.bindings["quit"], "q");
+    }
+
+    #[test]
+    fn notification_config_loads_and_old_configs_keep_compatible_defaults() {
+        let path =
+            std::env::temp_dir().join(format!("cb-notify-config-{}.json", std::process::id()));
+        fs::write(
+            &path,
+            br#"{"notifications":{"delivery":"terminal","delay_seconds":3,"notify_done":false}}"#,
+        )
+        .unwrap();
+        let config = Config::load_from(Some(path.clone()));
+        let _ = fs::remove_file(path);
+        assert_eq!(
+            config.notifications.delivery,
+            crate::notify::Delivery::Terminal
+        );
+        assert_eq!(config.notifications.delay_seconds, 3);
+        assert!(!config.notifications.notify_done);
+        assert!(config.notifications.notify_approval);
+
+        let path = std::env::temp_dir().join(format!("cb-old-config-{}.json", std::process::id()));
+        fs::write(&path, br#"{"prefix":"ctrl+b"}"#).unwrap();
+        let config = Config::load_from(Some(path.clone()));
+        let _ = fs::remove_file(path);
+        assert_eq!(config.notifications.delivery, crate::notify::Delivery::All);
     }
 }

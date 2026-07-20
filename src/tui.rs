@@ -30,6 +30,7 @@ use crate::protocol::{
 };
 use crate::sidebar::{scope_display_name, Row, Sidebar};
 use crate::task::{Task, TaskStatus};
+use crate::theme::{Palette, THEME_NAMES};
 use crate::worktree::{self, Agent as AgentChoice, Worktree};
 
 const SIDEBAR_WIDTH: u16 = 30;
@@ -59,6 +60,11 @@ struct Toast {
     text: String,
 }
 
+struct PendingNotification {
+    toast: Toast,
+    deadline: Instant,
+}
+
 struct Rename {
     id: String,
     input: String,
@@ -82,6 +88,9 @@ struct ConfigMenu {
     cursor: usize,
     capture: bool,
     error: String,
+    theme_cursor: Option<usize>,
+    notification_cursor: Option<usize>,
+    original_theme: Option<String>,
 }
 
 #[derive(Clone)]
@@ -159,12 +168,15 @@ struct Model {
     attach: Option<Attach>,
     error: String,
     previous_status: HashMap<String, Status>,
+    pending_notifications: HashMap<String, PendingNotification>,
+    outer_focused: bool,
     worktree_cwds: std::collections::HashSet<String>,
     hooks_ok: bool,
     toasts: Vec<Toast>,
     rename: Option<Rename>,
     worktree_picker: Option<WorktreePicker>,
     config: Config,
+    palette: Palette,
     config_menu: Option<ConfigMenu>,
     selection: Option<Selection>,
     tasks: Vec<Task>,
@@ -214,6 +226,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let launch_cwd = std::env::current_dir()?;
     let config = Config::load();
+    let palette = Palette::resolve(&config.theme);
     let mut model = Model {
         sidebar: Sidebar::new(&launch_cwd),
         launch_cwd,
@@ -225,6 +238,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         attach: None,
         error: String::new(),
         previous_status: HashMap::new(),
+        pending_notifications: HashMap::new(),
+        outer_focused: true,
         worktree_cwds: std::collections::HashSet::new(),
         hooks_ok: matches!(
             crate::integration::status(crate::integration::Agent::Claude),
@@ -234,6 +249,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         rename: None,
         worktree_picker: None,
         config,
+        palette,
         config_menu: None,
         selection: None,
         tasks: Vec::new(),
@@ -246,6 +262,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         drain_events(&mut model, &receiver);
+        deliver_due_notifications(&mut model);
         let previous_pane = model.pane;
         let size = terminal.size()?;
         compute_view(&mut model, Rect::new(0, 0, size.width, size.height));
@@ -271,8 +288,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Event::Resize(_, _) => resize_attached(&mut model)?,
                 Event::Paste(text) => handle_paste(&mut model, &text)?,
-                Event::FocusGained => send_focus(&mut model, true)?,
-                Event::FocusLost => send_focus(&mut model, false)?,
+                Event::FocusGained => {
+                    model.outer_focused = true;
+                    send_focus(&mut model, true)?;
+                }
+                Event::FocusLost => {
+                    model.outer_focused = false;
+                    send_focus(&mut model, false)?;
+                }
                 Event::Mouse(mouse) => handle_mouse(&mut model, mouse)?,
             }
         }
@@ -466,14 +489,125 @@ fn drain_events(model: &mut Model, receiver: &Receiver<UiEvent>) {
 }
 
 fn detect_transitions(model: &mut Model, sessions: &[SessionInfo]) {
+    model.pending_notifications.retain(|id, pending| {
+        sessions
+            .iter()
+            .find(|session| session.id == *id)
+            .is_some_and(|session| session.status == pending.toast.status)
+    });
     let transitions = transition_toasts(&mut model.previous_status, sessions);
-    for toast in &transitions {
-        crate::notify::send("codebridge", &toast.text);
+    for toast in transitions {
+        let allowed = match toast.status {
+            Status::NeedsApproval => model.config.notifications.notify_approval,
+            Status::WaitingUser => model.config.notifications.notify_done,
+            _ => false,
+        };
+        if !allowed {
+            continue;
+        }
+        let delay = Duration::from_secs(model.config.notifications.bounded_delay_seconds());
+        if delay.is_zero() {
+            deliver_notification(model, toast);
+        } else {
+            model.pending_notifications.insert(
+                toast.session_id.clone(),
+                PendingNotification {
+                    toast,
+                    deadline: Instant::now() + delay,
+                },
+            );
+        }
     }
-    model.toasts.extend(transitions);
-    if model.toasts.len() > 5 {
-        model.toasts.drain(..model.toasts.len() - 5);
+}
+
+fn deliver_due_notifications(model: &mut Model) {
+    let now = Instant::now();
+    let due = model
+        .pending_notifications
+        .iter()
+        .filter_map(|(id, pending)| (pending.deadline <= now).then_some(id.clone()))
+        .collect::<Vec<_>>();
+    for id in due {
+        let Some(pending) = model.pending_notifications.remove(&id) else {
+            continue;
+        };
+        let still_current = model
+            .sidebar
+            .session_by_id(&id)
+            .is_some_and(|session| session.status == pending.toast.status);
+        if still_current {
+            deliver_notification(model, pending.toast);
+        }
     }
+}
+
+fn deliver_notification(model: &mut Model, toast: Toast) {
+    let delivery = model.config.notifications.delivery;
+    let active = model
+        .attach
+        .as_ref()
+        .is_some_and(|attach| attach.id == toast.session_id);
+    let (show_in_app, show_external) = notification_channels(
+        delivery,
+        model.config.notifications.suppress_focused,
+        active,
+        model.outer_focused,
+    );
+    if show_in_app {
+        model.toasts.push(Toast {
+            session_id: toast.session_id.clone(),
+            status: toast.status.clone(),
+            text: toast.text.clone(),
+        });
+        if model.toasts.len() > 5 {
+            model.toasts.drain(..model.toasts.len() - 5);
+        }
+    }
+    if show_external {
+        let (title, body) = notification_text(model, &toast);
+        crate::notify::send(delivery, &title, &body);
+    }
+}
+
+fn notification_channels(
+    delivery: crate::notify::Delivery,
+    suppress_focused: bool,
+    active: bool,
+    outer_focused: bool,
+) -> (bool, bool) {
+    let in_app = delivery.shows_in_app() && !active;
+    let external = matches!(
+        delivery,
+        crate::notify::Delivery::All
+            | crate::notify::Delivery::Terminal
+            | crate::notify::Delivery::System
+    ) && !(suppress_focused && active && outer_focused);
+    (in_app, external)
+}
+
+fn notification_text(model: &Model, toast: &Toast) -> (String, String) {
+    let Some(session) = model.sidebar.session_by_id(&toast.session_id) else {
+        return ("Codebridge".to_owned(), toast.text.clone());
+    };
+    let agent = session
+        .argv
+        .first()
+        .and_then(|argument| Path::new(argument).file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "agent".to_owned());
+    let event = match toast.status {
+        Status::NeedsApproval => "needs attention",
+        Status::WaitingUser => "finished",
+        _ => "updated",
+    };
+    (
+        format!("{agent} {event}"),
+        format!(
+            "{} · {}",
+            session_label(session),
+            scope_display_name(&session.cwd)
+        ),
+    )
 }
 
 fn transition_toasts(
@@ -496,13 +630,13 @@ fn transition_toasts(
                     toasts.push(Toast {
                         session_id: session.id.clone(),
                         status: Status::NeedsApproval,
-                        text: format!("⚑ {} — {detail}", short_id(&session.id)),
+                        text: format!("⚑ {} — {detail}", session_label(session)),
                     });
                 }
                 Status::WaitingUser => toasts.push(Toast {
                     session_id: session.id.clone(),
                     status: Status::WaitingUser,
-                    text: format!("● {} — turn completed", short_id(&session.id)),
+                    text: format!("● {} — turn completed", session_label(session)),
                 }),
                 _ => {}
             }
@@ -657,9 +791,16 @@ fn handle_prefix(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
         Some("quit") => return Ok(true),
         Some("config") => {
             model.config_menu = Some(ConfigMenu {
-                cursor: usize::from(prefix_overridden()),
+                cursor: match (prefix_overridden(), theme_overridden()) {
+                    (false, _) => 0,
+                    (true, false) => 1,
+                    (true, true) => 2,
+                },
                 capture: false,
                 error: String::new(),
+                theme_cursor: None,
+                notification_cursor: None,
+                original_theme: None,
             });
         }
         Some("task_backlog") => {
@@ -717,8 +858,104 @@ fn prefix_overridden() -> bool {
         .is_some_and(|prefix| !prefix.trim().is_empty())
 }
 
+fn theme_overridden() -> bool {
+    std::env::var("CB_THEME")
+        .ok()
+        .is_some_and(|theme| !theme.trim().is_empty())
+}
+
 fn handle_config_menu(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
-    let row_count = crate::config::ACTIONS.len() + 2;
+    let row_count = crate::config::ACTIONS.len() + 4;
+    if let Some(cursor) = model
+        .config_menu
+        .as_ref()
+        .and_then(|menu| menu.notification_cursor)
+    {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(menu) = model.config_menu.as_mut() {
+                    menu.notification_cursor = None;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(menu) = model.config_menu.as_mut() {
+                    menu.notification_cursor = Some(
+                        (cursor + crate::notify::DELIVERY_NAMES.len() - 1)
+                            % crate::notify::DELIVERY_NAMES.len(),
+                    );
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(menu) = model.config_menu.as_mut() {
+                    menu.notification_cursor =
+                        Some((cursor + 1) % crate::notify::DELIVERY_NAMES.len());
+                }
+            }
+            KeyCode::Enter => {
+                model.config.notifications.delivery =
+                    crate::notify::Delivery::from_name(crate::notify::DELIVERY_NAMES[cursor])
+                        .unwrap_or_default();
+                if model.config.notifications.delivery == crate::notify::Delivery::Off {
+                    model.pending_notifications.clear();
+                    model.toasts.clear();
+                }
+                if let Some(menu) = model.config_menu.as_mut() {
+                    menu.notification_cursor = None;
+                    menu.error.clear();
+                }
+                if let Err(error) = model.config.save() {
+                    model.error = format!("config save failed: {error}");
+                }
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if model
+        .config_menu
+        .as_ref()
+        .is_some_and(|menu| menu.theme_cursor.is_some())
+    {
+        let cursor = model
+            .config_menu
+            .as_ref()
+            .and_then(|menu| menu.theme_cursor)
+            .unwrap_or_default();
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(original) = model
+                    .config_menu
+                    .as_mut()
+                    .and_then(|menu| menu.original_theme.take())
+                {
+                    model.config.theme.name = original;
+                    model.palette = Palette::resolve(&model.config.theme);
+                }
+                if let Some(menu) = model.config_menu.as_mut() {
+                    menu.theme_cursor = None;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let next = (cursor + THEME_NAMES.len() - 1) % THEME_NAMES.len();
+                preview_theme(model, next);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                preview_theme(model, (cursor + 1) % THEME_NAMES.len());
+            }
+            KeyCode::Enter => {
+                if let Some(menu) = model.config_menu.as_mut() {
+                    menu.theme_cursor = None;
+                    menu.original_theme = None;
+                    menu.error.clear();
+                }
+                if let Err(error) = model.config.save() {
+                    model.error = format!("config save failed: {error}");
+                }
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     let Some(menu) = model.config_menu.as_mut() else {
         return Ok(false);
     };
@@ -742,8 +979,8 @@ fn handle_config_menu(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
                 return Ok(false);
             }
             model.config.prefix = name;
-        } else if menu.cursor <= crate::config::ACTIONS.len() {
-            let action = crate::config::ACTIONS[menu.cursor - 1];
+        } else if (3..crate::config::ACTIONS.len() + 3).contains(&menu.cursor) {
+            let action = crate::config::ACTIONS[menu.cursor - 3];
             if let Some(conflict) =
                 model.config.bindings.iter().find_map(|(id, bound)| {
                     (id != action.id && bound == &name).then_some(id.clone())
@@ -774,23 +1011,39 @@ fn handle_config_menu(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
         }
         KeyCode::Up | KeyCode::Char('k') => loop {
             menu.cursor = (menu.cursor + row_count - 1) % row_count;
-            if !(menu.cursor == 0 && prefix_overridden()) {
+            if !(menu.cursor == 0 && prefix_overridden() || menu.cursor == 1 && theme_overridden())
+            {
                 break;
             }
         },
         KeyCode::Down | KeyCode::Char('j') => loop {
             menu.cursor = (menu.cursor + 1) % row_count;
-            if !(menu.cursor == 0 && prefix_overridden()) {
+            if !(menu.cursor == 0 && prefix_overridden() || menu.cursor == 1 && theme_overridden())
+            {
                 break;
             }
         },
         KeyCode::Enter => {
             if menu.cursor == row_count - 1 {
                 model.config = Config::default();
+                model.palette = Palette::resolve(&model.config.theme);
                 menu.error.clear();
                 if let Err(error) = model.config.save() {
                     model.error = format!("config save failed: {error}");
                 }
+            } else if menu.cursor == 1 {
+                let cursor = THEME_NAMES
+                    .iter()
+                    .position(|name| *name == model.config.theme.name)
+                    .unwrap_or_default();
+                menu.theme_cursor = Some(cursor);
+                menu.original_theme = Some(model.config.theme.name.clone());
+            } else if menu.cursor == 2 {
+                let cursor = crate::notify::DELIVERY_NAMES
+                    .iter()
+                    .position(|name| *name == model.config.notifications.delivery.name())
+                    .unwrap_or_default();
+                menu.notification_cursor = Some(cursor);
             } else {
                 menu.capture = true;
                 menu.error.clear();
@@ -799,6 +1052,15 @@ fn handle_config_menu(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
         _ => {}
     }
     Ok(false)
+}
+
+fn preview_theme(model: &mut Model, cursor: usize) {
+    let cursor = cursor.min(THEME_NAMES.len().saturating_sub(1));
+    model.config.theme.name = THEME_NAMES[cursor].to_owned();
+    model.palette = Palette::resolve(&model.config.theme);
+    if let Some(menu) = model.config_menu.as_mut() {
+        menu.theme_cursor = Some(cursor);
+    }
 }
 
 fn reserved_binding(key: &str) -> Option<&'static str> {
@@ -1692,11 +1954,11 @@ fn render(model: &Model, frame: &mut Frame) {
         .map(session_label)
         .unwrap_or_else(|| "session".to_owned());
     let border_style = if model.scroll_mode {
-        Style::default().fg(Color::Magenta)
+        Style::default().fg(model.palette.mauve)
     } else if model.focus == Focus::Screen {
-        Style::default().fg(Color::Green)
+        Style::default().fg(model.palette.green)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(model.palette.overlay0)
     };
     let block = Block::default()
         .title(format!(" {title} "))
@@ -1711,7 +1973,7 @@ fn render(model: &Model, frame: &mut Frame) {
     if !model.error.is_empty() && frame.area().height > 0 {
         let area = Rect::new(0, frame.area().bottom() - 1, frame.area().width, 1);
         frame.render_widget(
-            Paragraph::new(model.error.clone()).style(Style::default().fg(Color::Red)),
+            Paragraph::new(model.error.clone()).style(Style::default().fg(model.palette.red)),
             area,
         );
     }
@@ -1728,7 +1990,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 if indices.is_empty() {
                     lines.push(Line::styled(
                         "no tasks — press n to create one",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(model.palette.overlay0),
                     ));
                 }
                 let mut prior = None;
@@ -1737,20 +1999,20 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                     if prior != Some(task.status) {
                         lines.push(Line::styled(
                             format!("{:?}", task.status).to_ascii_lowercase(),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(model.palette.overlay0),
                         ));
                         prior = Some(task.status);
                     }
                     let (glyph, color) = match task.status {
-                        TaskStatus::InProgress => ('●', Color::Green),
-                        TaskStatus::Paused => ('‖', Color::Yellow),
-                        TaskStatus::Pending => ('○', Color::Gray),
-                        TaskStatus::Completed => ('✓', Color::DarkGray),
+                        TaskStatus::InProgress => ('●', model.palette.green),
+                        TaskStatus::Paused => ('‖', model.palette.yellow),
+                        TaskStatus::Pending => ('○', model.palette.overlay1),
+                        TaskStatus::Completed => ('✓', model.palette.overlay0),
                     };
                     lines.push(Line::from(vec![
                         Span::styled(
                             if cursor == modal.cursor { "▌ " } else { "  " },
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(model.palette.accent),
                         ),
                         Span::styled(glyph.to_string(), Style::default().fg(color)),
                         Span::raw(format!(
@@ -1766,7 +2028,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 }
                 lines.push(Line::styled(
                     "n new · enter open · e edit · s start · r resume · K sessions · c done · x delete",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(model.palette.overlay0),
                 ));
                 format!(
                     "tasks — {}",
@@ -1778,14 +2040,17 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 desc,
                 title_active,
             } => {
-                lines.push(Line::styled("title", Style::default().fg(Color::DarkGray)));
+                lines.push(Line::styled(
+                    "title",
+                    Style::default().fg(model.palette.overlay0),
+                ));
                 lines.push(Line::from(format!(
                     "{title}{}",
                     if *title_active { "▎" } else { "" }
                 )));
                 lines.push(Line::styled(
                     "description",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(model.palette.overlay0),
                 ));
                 lines.extend(desc.lines().map(|line| Line::from(line.to_owned())));
                 if !*title_active {
@@ -1793,7 +2058,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 }
                 lines.push(Line::styled(
                     "tab switch · ctrl+enter add · esc cancel",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(model.palette.overlay0),
                 ));
                 "new task".to_owned()
             }
@@ -1803,14 +2068,17 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 title_active,
                 ..
             } => {
-                lines.push(Line::styled("title", Style::default().fg(Color::DarkGray)));
+                lines.push(Line::styled(
+                    "title",
+                    Style::default().fg(model.palette.overlay0),
+                ));
                 lines.push(Line::from(format!(
                     "{title}{}",
                     if *title_active { "▎" } else { "" }
                 )));
                 lines.push(Line::styled(
                     "description",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(model.palette.overlay0),
                 ));
                 lines.extend(desc.lines().map(|line| Line::from(line.to_owned())));
                 if !*title_active {
@@ -1818,7 +2086,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 }
                 lines.push(Line::styled(
                     "tab switch · esc save",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(model.palette.overlay0),
                 ));
                 "edit task".to_owned()
             }
@@ -1832,7 +2100,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 }
                 lines.push(Line::styled(
                     "enter start · esc back",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(model.palette.overlay0),
                 ));
                 "choose task agent".to_owned()
             }
@@ -1850,7 +2118,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 }
                 lines.push(Line::styled(
                     "enter jump · x kill · esc back",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(model.palette.overlay0),
                 ));
                 "task sessions".to_owned()
             }
@@ -1865,18 +2133,157 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
         );
         frame.render_widget(Clear, panel);
         frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .title(format!(" {title} "))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Magenta)),
-            ),
+            Paragraph::new(lines)
+                .style(
+                    Style::default()
+                        .fg(model.palette.text)
+                        .bg(model.palette.panel_bg),
+                )
+                .block(
+                    Block::default()
+                        .title(format!(" {title} "))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(model.palette.accent)),
+                ),
             panel,
         );
         return;
     }
     if let Some(menu) = model.config_menu.as_ref() {
-        let mut rows = Vec::with_capacity(crate::config::ACTIONS.len() + 2);
+        if let Some(cursor) = menu.theme_cursor {
+            let mut lines = vec![Line::styled(
+                "↑↓ preview · enter apply · esc cancel",
+                Style::default().fg(model.palette.overlay0),
+            )];
+            let visible = usize::from(area.height.saturating_sub(3).max(1));
+            let start = cursor
+                .saturating_sub(visible.saturating_sub(1))
+                .min(THEME_NAMES.len().saturating_sub(visible));
+            lines.extend(
+                THEME_NAMES
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(visible)
+                    .map(|(index, name)| {
+                        let selected = index == cursor;
+                        Line::styled(
+                            format!("{} {name}", if selected { "▌" } else { " " }),
+                            Style::default()
+                                .fg(if selected {
+                                    model.palette.text
+                                } else {
+                                    model.palette.subtext0
+                                })
+                                .bg(if selected {
+                                    model.palette.surface0
+                                } else {
+                                    model.palette.panel_bg
+                                })
+                                .add_modifier(if selected {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                }),
+                        )
+                    }),
+            );
+            let height = (lines.len() as u16 + 2).min(area.height).max(3);
+            let width = area.width.saturating_sub(4).clamp(1, 42);
+            let panel = Rect::new(
+                area.x + area.width.saturating_sub(width) / 2,
+                area.y + area.height.saturating_sub(height) / 2,
+                width,
+                height,
+            );
+            frame.render_widget(Clear, panel);
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .style(
+                        Style::default()
+                            .fg(model.palette.text)
+                            .bg(model.palette.panel_bg),
+                    )
+                    .block(
+                        Block::default()
+                            .title(" choose theme ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(model.palette.accent)),
+                    ),
+                panel,
+            );
+            return;
+        }
+        if let Some(cursor) = menu.notification_cursor {
+            let mut lines = vec![Line::styled(
+                "↑↓ select · enter apply · esc cancel",
+                Style::default().fg(model.palette.overlay0),
+            )];
+            lines.extend(
+                crate::notify::DELIVERY_NAMES
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        let selected = index == cursor;
+                        let description = match *name {
+                            "all" => "in-app + native system",
+                            "codebridge" => "clickable in-app toast",
+                            "terminal" => "Ghostty/iTerm/Kitty/WezTerm OSC",
+                            "system" => "native OS notification",
+                            "off" => "disable notifications",
+                            _ => "",
+                        };
+                        Line::styled(
+                            format!(
+                                "{} {name:<12} {description}",
+                                if selected { "▌" } else { " " }
+                            ),
+                            Style::default()
+                                .fg(if selected {
+                                    model.palette.text
+                                } else {
+                                    model.palette.subtext0
+                                })
+                                .bg(if selected {
+                                    model.palette.surface0
+                                } else {
+                                    model.palette.panel_bg
+                                })
+                                .add_modifier(if selected {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                }),
+                        )
+                    }),
+            );
+            let height = (lines.len() as u16 + 2).min(area.height).max(3);
+            let width = area.width.saturating_sub(4).clamp(1, 58);
+            let panel = Rect::new(
+                area.x + area.width.saturating_sub(width) / 2,
+                area.y + area.height.saturating_sub(height) / 2,
+                width,
+                height,
+            );
+            frame.render_widget(Clear, panel);
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .style(
+                        Style::default()
+                            .fg(model.palette.text)
+                            .bg(model.palette.panel_bg),
+                    )
+                    .block(
+                        Block::default()
+                            .title(" notification delivery ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(model.palette.accent)),
+                    ),
+                panel,
+            );
+            return;
+        }
+        let mut rows = Vec::with_capacity(crate::config::ACTIONS.len() + 4);
         rows.push((
             "prefix".to_owned(),
             if prefix_overridden() {
@@ -1884,6 +2291,21 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
             } else {
                 model.config.prefix.clone()
             },
+        ));
+        rows.push((
+            "theme".to_owned(),
+            if theme_overridden() {
+                format!(
+                    "{} (CB_THEME)",
+                    std::env::var("CB_THEME").unwrap_or_default()
+                )
+            } else {
+                model.config.theme.name.clone()
+            },
+        ));
+        rows.push((
+            "notifications".to_owned(),
+            model.config.notifications.delivery.name().to_owned(),
         ));
         rows.extend(crate::config::ACTIONS.iter().map(|action| {
             (
@@ -1893,8 +2315,8 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
         }));
         rows.push(("reset all to defaults".to_owned(), String::new()));
         let mut lines = vec![Line::styled(
-            "prefix + key · saved automatically",
-            Style::default().fg(Color::DarkGray),
+            "enter edits · theme previews live · saved automatically",
+            Style::default().fg(model.palette.overlay0),
         )];
         lines.extend(rows.into_iter().enumerate().map(|(index, (label, value))| {
             let value = if menu.capture && menu.cursor == index {
@@ -1909,9 +2331,14 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 ),
                 Style::default()
                     .fg(if index == menu.cursor {
-                        Color::White
+                        model.palette.text
                     } else {
-                        Color::Gray
+                        model.palette.subtext0
+                    })
+                    .bg(if index == menu.cursor {
+                        model.palette.surface0
+                    } else {
+                        model.palette.panel_bg
                     })
                     .add_modifier(if index == menu.cursor {
                         Modifier::BOLD
@@ -1923,7 +2350,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
         if !menu.error.is_empty() {
             lines.push(Line::styled(
                 menu.error.clone(),
-                Style::default().fg(Color::Red),
+                Style::default().fg(model.palette.red),
             ));
         }
         let height = (lines.len() as u16 + 2).min(area.height).max(3);
@@ -1936,12 +2363,18 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
         );
         frame.render_widget(Clear, panel);
         frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .title(" codebridge config ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Magenta)),
-            ),
+            Paragraph::new(lines)
+                .style(
+                    Style::default()
+                        .fg(model.palette.text)
+                        .bg(model.palette.panel_bg),
+                )
+                .block(
+                    Block::default()
+                        .title(" codebridge config ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(model.palette.accent)),
+                ),
             panel,
         );
         return;
@@ -1986,16 +2419,21 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
         );
         let lines = std::iter::once(Line::styled(
             subtitle.to_owned(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(model.palette.overlay0),
         ))
         .chain(choices.into_iter().enumerate().map(|(index, choice)| {
             Line::styled(
                 format!("{} {choice}", if index == cursor { "▌" } else { " " }),
                 Style::default()
                     .fg(if index == cursor {
-                        Color::White
+                        model.palette.text
                     } else {
-                        Color::Gray
+                        model.palette.subtext0
+                    })
+                    .bg(if index == cursor {
+                        model.palette.surface0
+                    } else {
+                        model.palette.panel_bg
                     })
                     .add_modifier(if index == cursor {
                         Modifier::BOLD
@@ -2007,12 +2445,18 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
         .collect::<Vec<_>>();
         frame.render_widget(Clear, panel);
         frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .title(format!(" {title} "))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
-            ),
+            Paragraph::new(lines)
+                .style(
+                    Style::default()
+                        .fg(model.palette.text)
+                        .bg(model.palette.panel_bg),
+                )
+                .block(
+                    Block::default()
+                        .title(format!(" {title} "))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(model.palette.accent)),
+                ),
             panel,
         );
         return;
@@ -2032,9 +2476,13 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                     Block::default()
                         .title(" rename ")
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow)),
+                        .border_style(Style::default().fg(model.palette.accent)),
                 )
-                .style(Style::default().fg(Color::White)),
+                .style(
+                    Style::default()
+                        .fg(model.palette.text)
+                        .bg(model.palette.panel_bg),
+                ),
             prompt,
         );
         return;
@@ -2042,7 +2490,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
     if model.prefix || model.help {
         let mut lines = vec![Line::styled(
             format!("prefix = {}", model.config.effective_prefix()),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(model.palette.overlay0),
         )];
         let actions = crate::config::ACTIONS;
         for pair in actions.chunks(2) {
@@ -2060,7 +2508,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
         }
         lines.push(Line::styled(
             "← sidebar  → screen  h/? close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(model.palette.overlay0),
         ));
         let height = (lines.len() as u16 + 2).min(area.height).max(3);
         let width = area.width.saturating_sub(4).clamp(1, 78);
@@ -2072,12 +2520,18 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
         );
         frame.render_widget(Clear, panel);
         frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .title(" prefix commands ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Magenta)),
-            ),
+            Paragraph::new(lines)
+                .style(
+                    Style::default()
+                        .fg(model.palette.text)
+                        .bg(model.palette.panel_bg),
+                )
+                .block(
+                    Block::default()
+                        .title(" prefix commands ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(model.palette.accent)),
+                ),
             panel,
         );
         return;
@@ -2088,7 +2542,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
         frame.render_widget(
             Paragraph::new("⚠ hooks not installed — run: cb install-hooks").style(
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(model.palette.peach)
                     .add_modifier(Modifier::BOLD),
             ),
             warning,
@@ -2108,9 +2562,9 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
             1,
         );
         let color = match toast.status {
-            Status::NeedsApproval => Color::Red,
-            Status::WaitingUser => Color::Green,
-            _ => Color::White,
+            Status::NeedsApproval => model.palette.red,
+            Status::WaitingUser => model.palette.green,
+            _ => model.palette.text,
         };
         frame.render_widget(Clear, toast_area);
         frame.render_widget(
@@ -2123,14 +2577,19 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
 
 fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
     let focus = if model.focus == Focus::Sidebar {
-        Color::Cyan
+        model.palette.accent
     } else {
-        Color::DarkGray
+        model.palette.overlay0
     };
     let block = Block::default()
         .title(format!(" codebridge ({}) ", model.sidebar.sessions().len()))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(focus));
+        .border_style(Style::default().fg(focus))
+        .style(
+            Style::default()
+                .fg(model.palette.text)
+                .bg(model.palette.panel_bg),
+        );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 {
@@ -2146,7 +2605,7 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
         )
     };
     frame.render_widget(
-        Paragraph::new(scope).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(scope).style(Style::default().fg(model.palette.overlay0)),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
 
@@ -2168,7 +2627,7 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
             None,
             Line::from(Span::styled(
                 " no sessions",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(model.palette.overlay0),
             )),
         ));
     }
@@ -2203,9 +2662,9 @@ fn sidebar_row(model: &Model, row: &Row, index: usize) -> Line<'static> {
     let selected = index == model.sidebar.cursor();
     let gutter = if selected { "▌" } else { " " };
     let gutter_color = if model.focus == Focus::Sidebar {
-        Color::Yellow
+        model.palette.accent
     } else {
-        Color::DarkGray
+        model.palette.overlay0
     };
     match row {
         Row::Scope {
@@ -2224,7 +2683,7 @@ fn sidebar_row(model: &Model, row: &Row, index: usize) -> Line<'static> {
             ])
         }
         Row::Session { session, .. } => {
-            let (glyph, color) = indicator(session, model.spin);
+            let (glyph, color) = indicator(session, model.spin, &model.palette);
             let mut spans = vec![
                 Span::styled(gutter.to_owned(), Style::default().fg(gutter_color)),
                 Span::raw(" "),
@@ -2233,7 +2692,12 @@ fn sidebar_row(model: &Model, row: &Row, index: usize) -> Line<'static> {
                 Span::styled(
                     session_label(session),
                     Style::default()
-                        .fg(if selected { Color::White } else { color })
+                        .fg(if selected { model.palette.text } else { color })
+                        .bg(if selected {
+                            model.palette.surface0
+                        } else {
+                            model.palette.panel_bg
+                        })
                         .add_modifier(if selected {
                             Modifier::BOLD
                         } else {
@@ -2242,7 +2706,10 @@ fn sidebar_row(model: &Model, row: &Row, index: usize) -> Line<'static> {
                 ),
             ];
             if model.worktree_cwds.contains(&session.cwd) {
-                spans.push(Span::styled(" ⎇", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    " ⎇",
+                    Style::default().fg(model.palette.overlay0),
+                ));
             }
             Line::from(spans)
         }
@@ -2273,13 +2740,13 @@ fn status_counts(model: &Model) -> Line<'static> {
             .count()
     };
     Line::from(vec![
-        Span::styled("⠴", Style::default().fg(Color::Green)),
+        Span::styled("⠴", Style::default().fg(model.palette.green)),
         Span::raw(format!(" {} ", count(Status::Working))),
-        Span::styled("⚑", Style::default().fg(Color::Red)),
+        Span::styled("⚑", Style::default().fg(model.palette.red)),
         Span::raw(format!(" {} ", count(Status::NeedsApproval))),
-        Span::styled("●", Style::default().fg(Color::Green)),
+        Span::styled("●", Style::default().fg(model.palette.green)),
         Span::raw(format!(" {} ", count(Status::WaitingUser))),
-        Span::styled("●", Style::default().fg(Color::Yellow)),
+        Span::styled("●", Style::default().fg(model.palette.yellow)),
         Span::raw(format!(" {}", count(Status::Idle))),
     ])
 }
@@ -2288,7 +2755,7 @@ fn render_terminal(model: &Model, frame: &mut Frame) {
     let Some(terminal) = model.frame.as_ref() else {
         frame.render_widget(
             Paragraph::new("No sessions. Ctrl-a n starts Claude; Ctrl-a c starts Codex.")
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(model.palette.overlay0)),
             model.pane,
         );
         return;
@@ -2324,7 +2791,7 @@ fn render_terminal(model: &Model, frame: &mut Frame) {
                     .is_some_and(|attach| attach.id == selection.session_id)
                     && selection.contains(absolute_row, x)
             }) {
-                target.set_bg(Color::Indexed(238));
+                target.set_bg(model.palette.surface1);
             }
         }
     }
@@ -2359,21 +2826,21 @@ fn render_scrollbar(model: &Model, frame: &mut Frame, area: Rect) {
         frame.buffer_mut()[(area.x, area.y + y)]
             .set_symbol(if active { "┃" } else { "│" })
             .set_fg(if active {
-                Color::Magenta
+                model.palette.mauve
             } else {
-                Color::DarkGray
+                model.palette.overlay0
             });
     }
 }
 
-fn indicator(session: &SessionInfo, spin: usize) -> (char, Color) {
+fn indicator(session: &SessionInfo, spin: usize, palette: &Palette) -> (char, Color) {
     match session.status {
-        Status::Working => (SPINNERS[spin % SPINNERS.len()], Color::Green),
-        Status::WaitingUser => ('●', Color::Green),
-        Status::Idle => ('●', Color::Yellow),
-        Status::Starting => ('…', Color::Cyan),
-        Status::NeedsApproval => ('⚑', Color::Red),
-        Status::Ended => ('✗', Color::DarkGray),
+        Status::Working => (SPINNERS[spin % SPINNERS.len()], palette.green),
+        Status::WaitingUser => ('●', palette.green),
+        Status::Idle => ('●', palette.yellow),
+        Status::Starting => ('…', palette.teal),
+        Status::NeedsApproval => ('⚑', palette.red),
+        Status::Ended => ('✗', palette.overlay0),
     }
 }
 
@@ -2633,6 +3100,36 @@ mod tests {
         let waiting = transition_toasts(&mut previous, &[session(Status::WaitingUser, "")]);
         assert_eq!(waiting.len(), 1);
         assert_eq!(waiting[0].status, Status::WaitingUser);
+    }
+
+    #[test]
+    fn notification_channels_follow_delivery_and_focus() {
+        use crate::notify::Delivery;
+
+        assert_eq!(
+            notification_channels(Delivery::All, true, false, true),
+            (true, true)
+        );
+        assert_eq!(
+            notification_channels(Delivery::All, true, true, true),
+            (false, false)
+        );
+        assert_eq!(
+            notification_channels(Delivery::All, true, true, false),
+            (false, true)
+        );
+        assert_eq!(
+            notification_channels(Delivery::Codebridge, true, false, true),
+            (true, false)
+        );
+        assert_eq!(
+            notification_channels(Delivery::Terminal, true, false, true),
+            (false, true)
+        );
+        assert_eq!(
+            notification_channels(Delivery::Off, false, false, false),
+            (false, false)
+        );
     }
 
     #[test]

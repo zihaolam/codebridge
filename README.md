@@ -192,7 +192,8 @@ current bindings.
 
 ### Config menu (`Ctrl-a o`)
 
-Opens a modal that lets you change the prefix and rebind every prefix command above.
+Opens a modal that lets you change the prefix, choose a theme and notification delivery,
+and rebind every prefix command above.
 Changes auto-save to `~/.config/cb/config.json` (or `$XDG_CONFIG_HOME/cb/config.json`)
 the moment you press them, so closing the modal commits nothing extra and esc-ing out
 of capture mode reverts cleanly.
@@ -200,7 +201,7 @@ of capture mode reverts cleanly.
 | key | action |
 |-----|--------|
 | `↑`/`↓` or `k`/`j` | move the cursor |
-| `enter` | rebind the highlighted row (next keypress becomes the new binding) |
+| `enter` | edit the highlighted row; theme and notifications open pickers |
 | `esc` (while capturing) | cancel the rebind |
 | `enter` on **reset all to defaults** | restore the factory bindings |
 | `esc` or `q` | close the modal |
@@ -210,6 +211,76 @@ reserved keys (`esc`, `h`, `?`, arrows, `j`/`k`, `Ctrl-c`) that the system layer
 before dispatch — both with an inline error so you can pick another key. If `CB_PREFIX`
 is set in your shell, the prefix row is shown read-only with a "(locked by CB_PREFIX)"
 note, since the env override always wins.
+
+### Themes
+
+Select **theme** in the config menu to open a live-preview picker. Codebridge includes
+Terminal (the backward-compatible default), Catppuccin, Catppuccin Latte, Dracula,
+Tokyo Night, Nord, Gruvbox, One Dark, Solarized, Kanagawa, Rosé Pine, Vesper, and the
+available light variants. Press `enter` to save the previewed theme or `esc` to restore
+the prior one.
+
+The theme applies only to Codebridge chrome—the sidebar, borders, status indicators,
+pickers, and overlays. Agent terminal cells retain the exact colors produced by Claude
+or Codex.
+
+For per-shell selection, `CB_THEME=dracula cb` overrides the saved theme. Semantic
+tokens can also be customized in `~/.config/cb/config.json`:
+
+```json
+{
+  "theme": {
+    "name": "catppuccin",
+    "custom": {
+      "accent": "#f5c2e7",
+      "panel_bg": "#181825",
+      "green": "#a6e3a1",
+      "red": "#f38ba8"
+    }
+  }
+}
+```
+
+Supported tokens are `accent`, `panel_bg`, `surface0`, `surface1`, `surface_dim`,
+`overlay0`, `overlay1`, `text`, `subtext0`, `mauve`, `green`, `yellow`, `red`,
+`blue`, `teal`, and `peach`. Values accept `#rgb`, `#rrggbb`, `rgb(r,g,b)`,
+terminal color names, or reset aliases such as `reset`, `default`, and `transparent`.
+
+### Notifications
+
+Select **notifications** in the config menu to choose a Herdr-style delivery mode:
+
+| mode | behavior |
+|------|----------|
+| `all` | clickable Codebridge toast plus a native OS notification (default) |
+| `codebridge` | clickable in-app toast only |
+| `terminal` | ask Ghostty, iTerm2, Kitty, or WezTerm to notify via OSC |
+| `system` | use the native macOS/Linux notification service |
+| `off` | disable agent-state notifications |
+
+Notifications are status-driven: approvals produce **needs attention**, and completed
+turns produce **finished**. A one-second default delay suppresses transient states. If
+the session is currently visible and the host terminal is focused, its notification is
+suppressed; background sessions still notify, and clicking an in-app toast jumps to its
+session.
+
+Advanced behavior can be adjusted in `~/.config/cb/config.json`:
+
+```json
+{
+  "notifications": {
+    "delivery": "all",
+    "delay_seconds": 1,
+    "notify_approval": true,
+    "notify_done": true,
+    "suppress_focused": true
+  }
+}
+```
+
+`delay_seconds` is capped at one hour. Set `CB_NO_NOTIFY=1` to suppress external
+terminal/system delivery for one invocation without disabling Codebridge’s in-app
+toasts.
 
 ### Scroll mode (browsing scrollback)
 
