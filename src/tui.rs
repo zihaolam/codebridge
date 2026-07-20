@@ -1951,58 +1951,31 @@ fn view(model: &Model, area: Rect) -> View {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)])
         .areas(area);
-    let inner = main_content_area(main);
     let has_scrollbar = model
         .frame
         .as_ref()
-        .is_some_and(|terminal| terminal.max_offset > 0 && inner.width > 1);
+        .is_some_and(|terminal| terminal.max_offset > 0 && main.width > 1);
     View {
         sidebar,
         main,
-        scrollbar: has_scrollbar.then(|| Rect::new(inner.right() - 1, inner.y, 1, inner.height)),
-    }
-}
-
-fn main_content_area(main: Rect) -> Rect {
-    Rect {
-        y: main.y.saturating_add(u16::from(main.height > 0)),
-        height: main.height.saturating_sub(1),
-        ..main
+        scrollbar: has_scrollbar.then(|| Rect::new(main.right() - 1, main.y, 1, main.height)),
     }
 }
 
 fn compute_view(model: &mut Model, area: Rect) {
     let view = view(model, area);
-    let inner = main_content_area(view.main);
     model.pane = Rect {
-        width: inner
+        width: view
+            .main
             .width
             .saturating_sub(u16::from(view.scrollbar.is_some())),
-        ..inner
+        ..view.main
     };
 }
 
 fn render(model: &Model, frame: &mut Frame) {
     let view = view(model, frame.area());
-    let sidebar = view.sidebar;
-    let main = view.main;
-    render_sidebar(model, frame, sidebar);
-
-    let title = model
-        .attached_session()
-        .map(session_label)
-        .unwrap_or_else(|| "session".to_owned());
-    let border_style = if model.scroll_mode {
-        Style::default().fg(model.palette.mauve)
-    } else if model.focus == Focus::Screen {
-        Style::default().fg(model.palette.green)
-    } else {
-        Style::default().fg(model.palette.overlay0)
-    };
-    frame.render_widget(
-        Paragraph::new(format!(" {title} ")).style(border_style),
-        Rect::new(main.x, main.y, main.width, main.height.min(1)),
-    );
+    render_sidebar(model, frame, view.sidebar);
 
     render_terminal(model, frame);
     if let Some(scrollbar) = view.scrollbar {
