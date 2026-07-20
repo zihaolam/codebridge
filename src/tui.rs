@@ -210,16 +210,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Install restoration before writing terminal modes or initializing the
-    // backend so every early-return path restores the host terminal.
+    // Kitty keyboard state is screen-local, so enter the alternate screen
+    // before enabling it. The guard reverses that order during restoration.
     let _guard = TerminalGuard;
     execute!(
         stdout,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    )?;
-    execute!(
-        stdout,
         EnterAlternateScreen,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
         EnableBracketedPaste,
         EnableFocusChange,
         EnableMouseCapture
@@ -2574,11 +2571,6 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
 }
 
 fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
-    let focus = if model.focus == Focus::Sidebar {
-        model.palette.accent
-    } else {
-        model.palette.overlay0
-    };
     let block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Style::default().fg(model.palette.overlay0))
@@ -2593,12 +2585,6 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    frame.render_widget(
-        Paragraph::new(format!(" codebridge ({}) ", model.sidebar.sessions().len()))
-            .style(Style::default().fg(focus)),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
-
     let scope = if model.sidebar.accordion() {
         "scope: all".to_owned()
     } else {
@@ -2607,12 +2593,10 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
             scope_display_name(model.sidebar.current_scope())
         )
     };
-    if inner.height >= 2 {
-        frame.render_widget(
-            Paragraph::new(scope).style(Style::default().fg(model.palette.overlay0)),
-            Rect::new(inner.x, inner.y + 1, inner.width, 1),
-        );
-    }
+    frame.render_widget(
+        Paragraph::new(scope).style(Style::default().fg(model.palette.overlay0)),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
 
     let mut display_rows: Vec<(Option<usize>, Line<'static>)> = Vec::new();
     for (index, row) in model.sidebar.rows().iter().enumerate() {
@@ -2636,7 +2620,7 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
             )),
         ));
     }
-    let list_height = inner.height.saturating_sub(3) as usize;
+    let list_height = inner.height.saturating_sub(2) as usize;
     let cursor_row = display_rows
         .iter()
         .position(|(index, _)| *index == Some(model.sidebar.cursor()))
@@ -2652,10 +2636,10 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
     {
         frame.render_widget(
             Paragraph::new(line),
-            Rect::new(inner.x, inner.y + 2 + row as u16, inner.width, 1),
+            Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1),
         );
     }
-    if inner.height >= 3 {
+    if inner.height >= 2 {
         frame.render_widget(
             Paragraph::new(status_counts(model)),
             Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
