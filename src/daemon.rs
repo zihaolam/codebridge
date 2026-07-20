@@ -862,7 +862,7 @@ fn status_for_event(event: &str, payload: &Value) -> (Status, String) {
                 (Status::WaitingUser, String::new())
             }
         }
-        "Stop" => (Status::WaitingUser, String::new()),
+        "Stop" | "StopFailure" => (Status::WaitingUser, String::new()),
         "SessionEnd" => (Status::Ended, String::new()),
         _ => (Status::Working, String::new()),
     }
@@ -912,6 +912,14 @@ mod tests {
         assert_eq!(
             status_for_event("Stop", &Value::Null).0,
             Status::WaitingUser
+        );
+        assert_eq!(
+            status_for_event("StopFailure", &Value::Null).0,
+            Status::WaitingUser
+        );
+        assert_eq!(
+            status_for_event("PostToolBatch", &Value::Null).0,
+            Status::Working
         );
         assert_eq!(
             status_for_event(

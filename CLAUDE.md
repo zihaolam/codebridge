@@ -87,7 +87,7 @@ Hooks are no-op observers; never scrape terminal text for status.
 - `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolBatch` -> `working`
 - `PermissionRequest` -> `needs_approval`
 - permission-like `Notification` -> `needs_approval`
-- other `Notification` and `Stop` -> `waiting_user`
+- other `Notification`, `Stop`, and `StopFailure` -> `waiting_user`
 - `SessionEnd` -> `ended`
 - unknown active events -> `working`
 

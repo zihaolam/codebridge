@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-const INTEGRATION_VERSION: u32 = 2;
+const INTEGRATION_VERSION: u32 = 3;
 const HOOK_NAME: &str = "codebridge-agent-state.sh";
 const MARKER: &str = "CODEBRIDGE_INTEGRATION_ID=lifecycle";
 
@@ -21,9 +21,11 @@ const CLAUDE_EVENTS: &[&str] = &[
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
+    "PostToolBatch",
     "Notification",
     "PermissionRequest",
     "Stop",
+    "StopFailure",
     "SessionEnd",
 ];
 
