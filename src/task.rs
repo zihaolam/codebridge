@@ -27,6 +27,11 @@ pub struct TaskRun {
     pub cb_session_id: String,
     #[serde(default)]
     pub agent_session_id: String,
+    /// First prompt sent in this session, captured from the agent's
+    /// `UserPromptSubmit` hook (or seeded from a task prefill). Used as the
+    /// human-readable label in the historical-session picker.
+    #[serde(default)]
+    pub first_message: String,
     pub status: TaskStatus,
     #[serde(default = "epoch", with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -45,6 +50,11 @@ pub struct Task {
     pub status: TaskStatus,
     #[serde(default)]
     pub runs: Vec<TaskRun>,
+    /// True when this task was synthesized to record an ad-hoc agent session
+    /// rather than being authored in the backlog. Auto tasks are hidden from
+    /// the backlog and surfaced only in the historical-session picker.
+    #[serde(default)]
+    pub auto: bool,
     #[serde(default)]
     pub agent: String,
     #[serde(default)]
@@ -113,6 +123,7 @@ impl TaskStore {
             desc,
             status: TaskStatus::Pending,
             runs: Vec::new(),
+            auto: false,
             agent: String::new(),
             cwd: String::new(),
             cb_session_id: String::new(),
@@ -121,6 +132,47 @@ impl TaskStore {
             updated_at: now,
         });
         id
+    }
+
+    /// Records an ad-hoc agent session as an auto task carrying a single live
+    /// run. Returns `(task_id, run_id)` so the caller can later reconcile or
+    /// resume it. The run's `first_message` fills in from the first hook.
+    pub fn add_auto_session(
+        &mut self,
+        scope: String,
+        agent: String,
+        cwd: String,
+        cb_session_id: String,
+    ) -> (String, String) {
+        let now = OffsetDateTime::now_utc();
+        let task_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        self.tasks.push(Task {
+            id: task_id.clone(),
+            scope,
+            title: agent.clone(),
+            desc: String::new(),
+            status: TaskStatus::InProgress,
+            runs: vec![TaskRun {
+                id: run_id.clone(),
+                agent,
+                cwd,
+                cb_session_id,
+                agent_session_id: String::new(),
+                first_message: String::new(),
+                status: TaskStatus::InProgress,
+                created_at: now,
+                updated_at: now,
+            }],
+            auto: true,
+            agent: String::new(),
+            cwd: String::new(),
+            cb_session_id: String::new(),
+            agent_session_id: String::new(),
+            created_at: now,
+            updated_at: now,
+        });
+        (task_id, run_id)
     }
 
     pub fn delete(&mut self, id: &str) {
@@ -151,6 +203,7 @@ impl TaskStore {
                     cwd: task.cwd.clone(),
                     cb_session_id: task.cb_session_id.clone(),
                     agent_session_id: task.agent_session_id.clone(),
+                    first_message: String::new(),
                     status: task.status,
                     created_at: task.created_at,
                     updated_at: task.updated_at,
@@ -214,6 +267,7 @@ mod tests {
             desc: String::new(),
             status: TaskStatus::Paused,
             runs: Vec::new(),
+            auto: false,
             agent: String::new(),
             cwd: String::new(),
             cb_session_id: String::new(),
@@ -227,6 +281,7 @@ mod tests {
             cwd: String::new(),
             cb_session_id: "session".to_owned(),
             agent_session_id: String::new(),
+            first_message: String::new(),
             status: TaskStatus::InProgress,
             created_at: now,
             updated_at: now,

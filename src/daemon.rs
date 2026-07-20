@@ -190,7 +190,34 @@ impl Daemon {
         }
     }
 
+    /// Spawns a session and, when it launches a known agent, records it as an
+    /// auto task so it can later be listed and resumed from the historical
+    /// picker. `task_start`/`task_resume` bypass this by calling
+    /// `spawn_session` directly, since they manage their own runs.
     fn spawn(&self, request: Request) -> Response {
+        let agent = agent_name(&request.argv);
+        let cwd = if request.cwd.is_empty() {
+            std::env::current_dir()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            request.cwd.clone()
+        };
+        let response = self.spawn_session(request);
+        if response.ok {
+            if let Some(agent) = agent {
+                let scope = crate::sidebar::scope_key(&cwd);
+                if let Ok(mut tasks) = self.tasks.lock() {
+                    tasks.add_auto_session(scope, agent.to_owned(), cwd, response.id.clone());
+                    let _ = tasks.save();
+                }
+                self.notify_watchers();
+            }
+        }
+        response
+    }
+
+    fn spawn_session(&self, request: Request) -> Response {
         let id = Uuid::new_v4().to_string();
         let rows = if request.rows == 0 { 24 } else { request.rows };
         let cols = if request.cols == 0 { 80 } else { request.cols };
@@ -253,7 +280,12 @@ impl Daemon {
         if let Ok(mut order) = self.order.write() {
             order.retain(|session_id| session_id != id);
         }
+        // Capture the agent-native resume id off the session before it is gone,
+        // then park the bound run so the killed session is immediately
+        // resumable without waiting for lazy reconciliation.
+        let harness = session.snapshot().harness_session_id;
         let result = session.kill();
+        self.park_runs_for_session(id, &harness);
         self.notify_watchers();
         match result {
             Ok(()) => Response {
@@ -441,13 +473,13 @@ impl Daemon {
         } else {
             format!("{}\n\n{}", task.title, task.desc)
         };
-        let response = self.spawn(Request {
+        let response = self.spawn_session(Request {
             kind: "spawn".to_owned(),
             argv: vec![request.agent.clone()],
             cwd: request.cwd.clone(),
             rows: request.rows,
             cols: request.cols,
-            prefill,
+            prefill: prefill.clone(),
             ..Request::default()
         });
         if !response.ok {
@@ -465,6 +497,7 @@ impl Daemon {
                 cwd: request.cwd,
                 cb_session_id: response.id.clone(),
                 agent_session_id: String::new(),
+                first_message: prefill,
                 status: TaskStatus::InProgress,
                 created_at: now,
                 updated_at: now,
@@ -521,7 +554,7 @@ impl Daemon {
         } else {
             request.cwd
         };
-        let response = self.spawn(Request {
+        let response = self.spawn_session(Request {
             kind: "spawn".to_owned(),
             argv,
             cwd,
@@ -555,6 +588,65 @@ impl Daemon {
             id: response.id,
             tasks: snapshot,
             ..Response::default()
+        }
+    }
+
+    /// Marks any live run bound to `session_id` as paused, retaining the
+    /// agent-native resume id (refreshed from `harness` when non-empty) so the
+    /// session can be resumed later. Invoked the moment a session is killed.
+    fn park_runs_for_session(&self, session_id: &str, harness: &str) {
+        let Ok(mut tasks) = self.tasks.lock() else {
+            return;
+        };
+        let now = OffsetDateTime::now_utc();
+        let mut dirty = false;
+        for task in tasks.tasks_mut() {
+            for run in &mut task.runs {
+                if run.cb_session_id == session_id && run.status == TaskStatus::InProgress {
+                    if !harness.is_empty() {
+                        run.agent_session_id = harness.to_owned();
+                    }
+                    run.status = TaskStatus::Paused;
+                    run.cb_session_id.clear();
+                    run.updated_at = now;
+                    dirty = true;
+                }
+            }
+            let status = derived_status(task);
+            if task.status != TaskStatus::Completed && task.status != status {
+                task.status = status;
+                task.updated_at = now;
+                dirty = true;
+            }
+        }
+        if dirty {
+            let _ = tasks.save();
+        }
+    }
+
+    /// Applies `update` to every run bound to `session_id`, bumping the run's
+    /// timestamp and persisting when the closure reports a change. Used to fold
+    /// hook-delivered data (resume id, first message) into the persisted run.
+    fn update_run_for_session(
+        &self,
+        session_id: &str,
+        mut update: impl FnMut(&mut TaskRun) -> bool,
+    ) {
+        let Ok(mut tasks) = self.tasks.lock() else {
+            return;
+        };
+        let now = OffsetDateTime::now_utc();
+        let mut dirty = false;
+        for task in tasks.tasks_mut() {
+            for run in &mut task.runs {
+                if run.cb_session_id == session_id && update(run) {
+                    run.updated_at = now;
+                    dirty = true;
+                }
+            }
+        }
+        if dirty {
+            let _ = tasks.save();
         }
     }
 
@@ -627,13 +719,42 @@ impl Daemon {
             };
         };
         let (status, message) = status_for_event(&request.event, &request.payload);
-        if let Some(id) = request
+        let harness_id = request
             .payload
             .get("session_id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
-        {
-            session.set_harness_session_id(id.to_owned());
+            .map(str::to_owned);
+        if let Some(id) = harness_id.clone() {
+            session.set_harness_session_id(id);
+        }
+        let first_message = (request.event == "UserPromptSubmit")
+            .then(|| {
+                request
+                    .payload
+                    .get("prompt")
+                    .or_else(|| request.payload.get("message"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten();
+        if harness_id.is_some() || first_message.is_some() {
+            self.update_run_for_session(&request.session, |run| {
+                let mut changed = false;
+                if let Some(id) = &harness_id {
+                    if run.agent_session_id != *id {
+                        run.agent_session_id = id.clone();
+                        changed = true;
+                    }
+                }
+                if let Some(message) = &first_message {
+                    if run.first_message.is_empty() && !message.trim().is_empty() {
+                        run.first_message = message.clone();
+                        changed = true;
+                    }
+                }
+                changed
+            });
         }
         let _ = session.flush_prefill();
         session.set_status(status, message);
@@ -837,6 +958,23 @@ impl Daemon {
     }
 }
 
+/// Normalizes the first argv entry to a known agent name, or `None` for
+/// arbitrary commands. Only known agents are auto-recorded as resumable
+/// sessions, since resume depends on the agent's own `--resume`/`resume`.
+fn agent_name(argv: &[String]) -> Option<&'static str> {
+    let base = argv
+        .first()
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())?;
+    match base {
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "opencode" => Some("opencode"),
+        _ => None,
+    }
+}
+
 fn status_for_event(event: &str, payload: &Value) -> (Status, String) {
     match event {
         "SessionStart" => (Status::Idle, String::new()),
@@ -1024,5 +1162,77 @@ mod tests {
             .iter()
             .all(|run| run.status == TaskStatus::Paused));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn agent_name_recognizes_known_agents_by_basename() {
+        assert_eq!(agent_name(&["claude".to_owned()]), Some("claude"));
+        assert_eq!(
+            agent_name(&["/usr/local/bin/codex".to_owned()]),
+            Some("codex")
+        );
+        assert_eq!(agent_name(&["opencode".to_owned()]), Some("opencode"));
+        assert_eq!(agent_name(&["/bin/bash".to_owned()]), None);
+        assert_eq!(agent_name(&[]), None);
+    }
+
+    #[test]
+    fn spawning_an_agent_records_a_resumable_session_and_parks_on_kill() {
+        let path = std::env::temp_dir().join(format!("cb-daemon-auto-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        // Give the spawned binary a known-agent basename so it is auto-recorded,
+        // while still pointing at a real executable that stays alive on a PTY.
+        let bindir = std::env::temp_dir().join(format!("cb-agentbin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&bindir);
+        fs::create_dir_all(&bindir).unwrap();
+        let claude = bindir.join("claude");
+        std::os::unix::fs::symlink("/bin/cat", &claude).unwrap();
+
+        let daemon = Daemon::new_with_task_path(path.clone());
+        let spawned = daemon.dispatch(Request {
+            kind: "spawn".to_owned(),
+            argv: vec![claude.to_string_lossy().into_owned()],
+            cwd: "/tmp".to_owned(),
+            rows: 4,
+            cols: 40,
+            ..Request::default()
+        });
+        assert!(spawned.ok);
+
+        let listed = daemon.dispatch(Request {
+            kind: "task_list".to_owned(),
+            ..Request::default()
+        });
+        assert_eq!(listed.tasks.len(), 1);
+        let task = &listed.tasks[0];
+        assert!(task.auto);
+        assert_eq!(task.scope, crate::sidebar::scope_key("/tmp"));
+        assert_eq!(task.runs.len(), 1);
+        assert_eq!(task.runs[0].agent, "claude");
+        assert_eq!(task.runs[0].status, TaskStatus::InProgress);
+
+        // A hook delivers the agent-native resume id and first prompt.
+        daemon.dispatch(Request {
+            kind: "hook".to_owned(),
+            event: "UserPromptSubmit".to_owned(),
+            session: spawned.id.clone(),
+            payload: json!({"session_id": "sess-123", "prompt": "hello world"}),
+            ..Request::default()
+        });
+
+        // Killing frees the process but the run is immediately resumable.
+        assert!(daemon.kill(&spawned.id).ok);
+        let parked = daemon.dispatch(Request {
+            kind: "task_list".to_owned(),
+            ..Request::default()
+        });
+        let run = &parked.tasks[0].runs[0];
+        assert_eq!(run.status, TaskStatus::Paused);
+        assert_eq!(run.agent_session_id, "sess-123");
+        assert_eq!(run.first_message, "hello world");
+        assert!(run.cb_session_id.is_empty());
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(&bindir);
     }
 }

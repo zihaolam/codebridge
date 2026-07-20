@@ -232,13 +232,7 @@ impl Sidebar {
         if let Some(cached) = self.repo_cache.get(cwd) {
             return cached.clone();
         }
-        let key = git_common_dir(Path::new(cwd))
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|| {
-                canonical_or_owned(Path::new(cwd))
-                    .to_string_lossy()
-                    .into_owned()
-            });
+        let key = scope_key(cwd);
         self.repo_cache.insert(cwd.to_owned(), key.clone());
         key
     }
@@ -348,6 +342,20 @@ pub fn scope_display_name(key: &str) -> String {
             } else {
                 key.to_owned()
             }
+        })
+}
+
+/// Scope key for a working directory: the git common dir when inside a repo
+/// (so a checkout and its linked worktrees collapse into one scope), otherwise
+/// the canonical directory. Shared with the daemon so auto-recorded sessions
+/// group under the same scope the sidebar renders.
+pub fn scope_key(cwd: &str) -> String {
+    git_common_dir(Path::new(cwd))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            canonical_or_owned(Path::new(cwd))
+                .to_string_lossy()
+                .into_owned()
         })
 }
 

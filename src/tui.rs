@@ -23,6 +23,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
+use time::OffsetDateTime;
 
 use crate::config::Config;
 use crate::daemon::socket_path;
@@ -158,6 +159,21 @@ struct TaskModal {
     cursor: usize,
 }
 
+struct HistoryModal {
+    cursor: usize,
+}
+
+/// One resumable past session, flattened from a task run for the historical
+/// picker. `first_message` is the human-readable label.
+struct HistoryEntry {
+    task_id: String,
+    run_id: String,
+    agent: String,
+    first_message: String,
+    auto: bool,
+    updated_at: OffsetDateTime,
+}
+
 struct Model {
     sidebar: Sidebar,
     launch_cwd: PathBuf,
@@ -182,6 +198,7 @@ struct Model {
     selection: Option<Selection>,
     tasks: Vec<Task>,
     task_modal: Option<TaskModal>,
+    history_modal: Option<HistoryModal>,
     pending_jump: Option<String>,
     spin: usize,
     pane: Rect,
@@ -254,6 +271,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         config_menu: None,
         selection: None,
         tasks: Vec::new(),
+        history_modal: None,
         task_modal: None,
         pending_jump: None,
         spin: 0,
@@ -671,6 +689,9 @@ fn handle_key(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
     if model.task_modal.is_some() {
         return handle_task_modal(model, key);
     }
+    if model.history_modal.is_some() {
+        return handle_history_modal(model, key);
+    }
     if model.config_menu.is_some() {
         return handle_config_menu(model, key);
     }
@@ -739,7 +760,9 @@ fn handle_key(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
 
 fn handle_prefix(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
     match key.code {
-        KeyCode::Left | KeyCode::Char('h') => {
+        // `Left` still focuses the sidebar; `h` falls through to the action
+        // table so it can drive `session_history` (or any user rebinding).
+        KeyCode::Left => {
             model.focus = Focus::Sidebar;
             return Ok(false);
         }
@@ -817,6 +840,9 @@ fn handle_prefix(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
                 stage: TaskStage::List,
                 cursor: 0,
             });
+        }
+        Some("session_history") => {
+            model.history_modal = Some(HistoryModal { cursor: 0 });
         }
         Some("yank") => {
             copy_selection(model)?;
@@ -1089,7 +1115,9 @@ fn visible_task_indices(model: &Model) -> Vec<usize> {
         .tasks
         .iter()
         .enumerate()
-        .filter_map(|(index, task)| (task.scope == model.sidebar.current_scope()).then_some(index))
+        .filter_map(|(index, task)| {
+            (!task.auto && task.scope == model.sidebar.current_scope()).then_some(index)
+        })
         .collect();
     indices.sort_by(|left, right| {
         let left_task = &model.tasks[*left];
@@ -1422,6 +1450,84 @@ fn apply_task_response(model: &mut Model, response: Response) {
     } else {
         model.error = response.error;
     }
+}
+
+/// Paused (resumable) runs in the current workspace scope, most recent first.
+/// These are the "historical sessions" surfaced by the `session_history`
+/// action — both ad-hoc auto sessions and paused task runs.
+fn history_entries(model: &Model) -> Vec<HistoryEntry> {
+    let scope = model.sidebar.current_scope();
+    let mut entries: Vec<HistoryEntry> = model
+        .tasks
+        .iter()
+        .filter(|task| task.scope == scope)
+        .flat_map(|task| {
+            task.runs
+                .iter()
+                .filter(|run| run.status == TaskStatus::Paused)
+                .map(|run| HistoryEntry {
+                    task_id: task.id.clone(),
+                    run_id: run.id.clone(),
+                    agent: run.agent.clone(),
+                    first_message: run.first_message.clone(),
+                    auto: task.auto,
+                    updated_at: run.updated_at,
+                })
+        })
+        .collect();
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
+    entries
+}
+
+fn handle_history_modal(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
+    let Some(mut modal) = model.history_modal.take() else {
+        return Ok(false);
+    };
+    let entries = history_entries(model);
+    modal.cursor = modal.cursor.min(entries.len().saturating_sub(1));
+    let mut keep_open = true;
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => keep_open = false,
+        KeyCode::Up | KeyCode::Char('k') if !entries.is_empty() => {
+            modal.cursor = (modal.cursor + entries.len() - 1) % entries.len();
+        }
+        KeyCode::Down | KeyCode::Char('j') if !entries.is_empty() => {
+            modal.cursor = (modal.cursor + 1) % entries.len();
+        }
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            if let Some(entry) = entries.get(modal.cursor) {
+                let response = request(Request {
+                    kind: "task_resume".to_owned(),
+                    id: entry.task_id.clone(),
+                    run_id: entry.run_id.clone(),
+                    cwd: model.launch_cwd.display().to_string(),
+                    rows: model.pane.height,
+                    cols: model.pane.width,
+                    ..Request::default()
+                })?;
+                apply_task_response(model, response);
+                keep_open = false;
+            }
+        }
+        KeyCode::Char('x') => {
+            // Only auto sessions are deletable here; real backlog tasks are
+            // managed from the task modal, so leave those untouched.
+            if let Some(entry) = entries.get(modal.cursor).filter(|entry| entry.auto) {
+                let response = request(Request {
+                    kind: "task_delete".to_owned(),
+                    id: entry.task_id.clone(),
+                    ..Request::default()
+                })?;
+                apply_task_response(model, response);
+            }
+        }
+        _ => {}
+    }
+    if keep_open {
+        model.history_modal = Some(modal);
+    }
+    Ok(false)
 }
 
 fn jump_to_session(model: &mut Model, id: &str) {
@@ -1977,6 +2083,70 @@ fn render(model: &Model, frame: &mut Frame) {
 
 fn render_overlays(model: &Model, frame: &mut Frame) {
     let area = frame.area();
+    if let Some(modal) = model.history_modal.as_ref() {
+        let entries = history_entries(model);
+        let mut lines = Vec::new();
+        if entries.is_empty() {
+            lines.push(Line::styled(
+                "no past sessions in this workspace",
+                Style::default().fg(model.palette.overlay0),
+            ));
+        }
+        for (cursor, entry) in entries.iter().enumerate() {
+            let selected = cursor == modal.cursor;
+            let label = entry.first_message.replace(['\n', '\t'], " ");
+            let label = label.trim();
+            let label: String = if label.is_empty() {
+                "(no message yet)".to_owned()
+            } else {
+                label.chars().take(64).collect()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "▌ " } else { "  " },
+                    Style::default().fg(model.palette.accent),
+                ),
+                Span::styled(
+                    format!("{:<8} ", entry.agent),
+                    Style::default().fg(model.palette.overlay1),
+                ),
+                Span::raw(label),
+            ]));
+        }
+        lines.push(Line::styled(
+            "enter resume · x delete · esc close",
+            Style::default().fg(model.palette.overlay0),
+        ));
+        let title = format!(
+            "history — {}",
+            scope_display_name(model.sidebar.current_scope())
+        );
+        let height = (lines.len() as u16 + 2).min(area.height).max(3);
+        let width = area.width.saturating_sub(4).clamp(1, 82);
+        let panel = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, panel);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(
+                    Style::default()
+                        .fg(model.palette.text)
+                        .bg(model.palette.panel_bg),
+                )
+                .block(
+                    Block::default()
+                        .title(format!(" {title} "))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(model.palette.accent)),
+                ),
+            panel,
+        );
+        return;
+    }
     if let Some(modal) = model.task_modal.as_ref() {
         let mut lines = Vec::new();
         let title = match &modal.stage {
