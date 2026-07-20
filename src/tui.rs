@@ -2620,7 +2620,7 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
             )),
         ));
     }
-    let list_height = inner.height.saturating_sub(2) as usize;
+    let list_height = inner.height.saturating_sub(3) as usize;
     let cursor_row = display_rows
         .iter()
         .position(|(index, _)| *index == Some(model.sidebar.cursor()))
@@ -2636,7 +2636,7 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
     {
         frame.render_widget(
             Paragraph::new(line),
-            Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1),
+            Rect::new(inner.x, inner.y + 2 + row as u16, inner.width, 1),
         );
     }
     if inner.height >= 2 {
@@ -2681,7 +2681,7 @@ fn sidebar_row(model: &Model, row: &Row, index: usize) -> Line<'static> {
                 Span::styled(
                     session_label(session),
                     Style::default()
-                        .fg(color)
+                        .fg(model.palette.text)
                         .bg(if selected {
                             model.palette.surface0
                         } else {
