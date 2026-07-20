@@ -110,6 +110,16 @@ reuses a selected paused run and the agent-native resume identity. Claude uses
 OpenCode uses `--continue`. Prefill is queued until the first hook or a bounded
 fallback timer.
 
+Spawning a known agent auto-records the session as an `auto` task carrying one
+run, so any killed session stays resumable without keeping its process resident.
+Killing frees the process group and immediately parks the run as paused,
+capturing the agent-native resume id off the session first. The run's
+`first_message` is captured from the first `UserPromptSubmit` hook (or seeded
+from a task prefill). Prefix `h` (`session_history`) opens a scope-filtered
+picker of paused runs labelled by first message; entering one runs the native
+resume in a fresh PTY. Auto tasks are hidden from the backlog and surfaced only
+in that picker.
+
 ## Hard-won invariants
 
 - Always forward terminal-query replies from libghostty-vt to the child PTY.
@@ -137,3 +147,32 @@ Tag pushes run `.github/workflows/release.yml`: build the PWA, run fmt/clippy/
 tests, compile natively for macOS and Linux on x86_64 and arm64, archive `cb`,
 and publish checksums. `install.sh` downloads those archives or builds from
 source with Rust, Zig, and Node.js.
+
+### Cutting a release
+
+The version lives in exactly one place: `version` in `Cargo.toml`. `Cargo.lock`
+picks it up on the next `cargo build`. Nothing else embeds the version (not
+`README.md`, `install.sh`, or `web/package.json`), so do not grep for it
+elsewhere.
+
+Releases are plain annotated tags on `main`; there is no dedicated "release"
+commit. The version bump rides along in the substantive commit, which is then
+tagged `vX.Y.Z` (tag name must match `Cargo.toml` exactly, `v`-prefixed).
+Pushing the tag is what triggers the workflow. Semver intent: bug-fix releases
+bump patch, user-facing features bump minor (pre-1.0, so both stay under `0.`).
+
+Steps to cut a release for a change already committed locally:
+
+```sh
+# 1. bump `version` in Cargo.toml (edit), then sync the lockfile
+cargo build
+# 2. amend the bump into the change commit, or add it as the final commit
+git add Cargo.toml Cargo.lock && git commit --amend --no-edit   # or a fresh commit
+# 3. tag the tip and push branch + tag together
+git tag vX.Y.Z
+git push origin main vX.Y.Z
+```
+
+CI runs the same fmt/clippy/test gate, so make it green locally first. A
+protocol-version bump (`src/protocol.rs`) means users must `cb restart` after
+upgrading; call that out in release notes.
