@@ -147,8 +147,14 @@ aside header {
   color: #484f58;
 }
 .chevron {
-  width: 1em;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex: none;
+  transition: transform 120ms ease;
+}
+.chevron.closed {
+  transform: rotate(-90deg);
 }
 
 .session-row {

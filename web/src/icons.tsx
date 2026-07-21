@@ -33,6 +33,12 @@ export const IconChevronLeft = ({ size = 16 }: P) => (
   </svg>
 )
 
+export const IconChevronDown = ({ size = 14 }: P) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" {...base}>
+    <path d="m6 9 6 6 6-6" />
+  </svg>
+)
+
 export const IconList = ({ size = 15 }: P) => (
   <svg width={size} height={size} viewBox="0 0 24 24" {...base}>
     <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />

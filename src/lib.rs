@@ -1,4 +1,5 @@
 pub mod codex;
+pub mod conductor;
 pub mod config;
 pub mod daemon;
 pub mod integration;
@@ -8,6 +9,7 @@ pub mod session;
 pub mod sidebar;
 pub mod task;
 pub mod terminal;
+pub mod terminal_theme;
 pub mod theme;
 pub mod tui;
 pub mod web;

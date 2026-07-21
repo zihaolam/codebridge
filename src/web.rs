@@ -626,7 +626,7 @@ fn attach_browser(
                         },
                     );
                 }
-                StreamDown::Gone => {
+                StreamDown::Gone { .. } => {
                     send_latest(
                         &out,
                         WsDown {

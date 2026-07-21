@@ -1,22 +1,21 @@
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use base64::Engine;
 use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::protocol::{Request, Response, Status, StreamDown, StreamUp, TerminalFrame, VERSION};
-use crate::session::Session;
+#[cfg(test)]
+use crate::conductor::Conductor;
+use crate::conductor::{conductor_socket_path, ConductorClient, Engine};
+use crate::protocol::{Request, Response, Status, VERSION};
 use crate::task::{derived_status, TaskRun, TaskStatus, TaskStore};
-use crate::terminal::MouseAction;
 
 pub fn state_dir() -> PathBuf {
     if let Some(path) = std::env::var_os("CB_HOME").filter(|value| !value.is_empty()) {
@@ -36,28 +35,34 @@ pub fn socket_path() -> PathBuf {
 }
 
 pub struct Daemon {
-    sessions: RwLock<HashMap<String, Arc<Session>>>,
-    order: RwLock<Vec<String>>,
+    conductor: Box<dyn Engine>,
     watchers: Mutex<Vec<mpsc::Sender<()>>>,
     tasks: Mutex<TaskStore>,
-    codex_claimed: Arc<Mutex<HashSet<String>>>,
     shutdown: AtomicBool,
 }
 
 impl Daemon {
+    /// The production broker talks to the conductor process over its socket.
     pub fn new() -> Arc<Self> {
-        Self::new_with_task_path(state_dir().join("tasks.json"))
+        Self::with_engine(
+            Box::new(ConductorClient::new(conductor_socket_path())),
+            state_dir().join("tasks.json"),
+        )
     }
 
-    fn new_with_task_path(task_path: PathBuf) -> Arc<Self> {
+    fn with_engine(conductor: Box<dyn Engine>, task_path: PathBuf) -> Arc<Self> {
         Arc::new(Self {
-            sessions: RwLock::new(HashMap::new()),
-            order: RwLock::new(Vec::new()),
+            conductor,
             watchers: Mutex::new(Vec::new()),
             tasks: Mutex::new(TaskStore::load(task_path)),
-            codex_claimed: Arc::new(Mutex::new(HashSet::new())),
             shutdown: AtomicBool::new(false),
         })
+    }
+
+    /// Tests drive an in-process conductor so they stay fast and hermetic.
+    #[cfg(test)]
+    fn new_with_task_path(task_path: PathBuf) -> Arc<Self> {
+        Self::with_engine(Box::new(Conductor::new()), task_path)
     }
 
     pub fn run(self: &Arc<Self>, path: &Path) -> io::Result<()> {
@@ -124,10 +129,11 @@ impl Daemon {
                     continue;
                 }
             };
+            // `shutdown` stops the broker only, leaving the conductor and its
+            // sessions alive — this is what `cb restart` relies on so PTYs
+            // survive. Tearing the conductor down is `cb stop`'s job, done by
+            // signalling the conductor directly.
             if request.kind == "shutdown" {
-                for session in self.all_sessions() {
-                    let _ = session.kill();
-                }
                 write_json(
                     &mut BufWriter::new(stream.try_clone()?),
                     &Response {
@@ -141,7 +147,15 @@ impl Daemon {
                 return Ok(());
             }
             match request.kind.as_str() {
-                "attach" => return self.attach(stream, reader, request),
+                "attach" => {
+                    return self.conductor.attach(
+                        stream,
+                        reader,
+                        &request.id,
+                        request.rows,
+                        request.cols,
+                    )
+                }
                 "watch" => return self.watch(stream),
                 _ => write_json(
                     &mut BufWriter::new(stream.try_clone()?),
@@ -161,12 +175,15 @@ impl Daemon {
                 pid: Some(std::process::id()),
                 ..Response::default()
             },
-            "list" => Response {
-                ok: true,
-                sessions: self.snapshot(),
-                tasks: self.task_snapshot(),
-                ..Response::default()
-            },
+            "list" => {
+                self.reap_and_park();
+                Response {
+                    ok: true,
+                    sessions: self.conductor.snapshot(),
+                    tasks: self.task_snapshot(),
+                    ..Response::default()
+                }
+            }
             "spawn" => self.spawn(request),
             "kill" => self.kill(&request.id),
             "rename" => self.rename(&request.id, request.name),
@@ -174,10 +191,8 @@ impl Daemon {
             kind if kind.starts_with("task_") => self.task_dispatch(request),
             "hook" => self.hook(request),
             "shutdown" => {
+                // Broker-only stop; the conductor keeps its sessions alive.
                 self.shutdown.store(true, Ordering::Release);
-                for session in self.all_sessions() {
-                    let _ = session.kill();
-                }
                 Response {
                     ok: true,
                     ..Response::default()
@@ -203,53 +218,20 @@ impl Daemon {
         } else {
             request.cwd.clone()
         };
-        let response = self.spawn_session(request);
-        if response.ok {
-            if let Some(agent) = agent {
-                let scope = crate::sidebar::scope_key(&cwd);
-                if let Ok(mut tasks) = self.tasks.lock() {
-                    tasks.add_auto_session(scope, agent.to_owned(), cwd, response.id.clone());
-                    let _ = tasks.save();
-                }
-                self.notify_watchers();
-            }
-        }
-        response
-    }
-
-    fn spawn_session(&self, request: Request) -> Response {
-        let id = Uuid::new_v4().to_string();
-        let rows = if request.rows == 0 { 24 } else { request.rows };
-        let cols = if request.cols == 0 { 80 } else { request.cols };
-        let prefill = request.prefill;
-        let is_codex = request
-            .argv
-            .first()
-            .and_then(|binary| Path::new(binary).file_name())
-            .is_some_and(|binary| binary == "codex");
-        let cwd = if request.cwd.is_empty() {
-            std::env::current_dir().unwrap_or_default()
-        } else {
-            PathBuf::from(&request.cwd)
-        };
-        let cwd_string = cwd.to_string_lossy().into_owned();
-        let spawned_at = SystemTime::now();
-        match Session::spawn(id.clone(), request.argv, cwd_string, rows, cols) {
-            Ok(session) => {
-                Session::queue_prefill(&session, prefill);
-                if is_codex {
-                    crate::codex::start_harvest(
-                        Arc::clone(&session),
-                        cwd,
-                        spawned_at,
-                        Arc::clone(&self.codex_claimed),
-                    );
-                }
-                if let Ok(mut sessions) = self.sessions.write() {
-                    sessions.insert(id.clone(), session);
-                }
-                if let Ok(mut order) = self.order.write() {
-                    order.push(id.clone());
+        match self.conductor.spawn_session(
+            request.argv,
+            request.cwd,
+            request.rows,
+            request.cols,
+            request.prefill,
+        ) {
+            Ok(id) => {
+                if let Some(agent) = agent {
+                    let scope = crate::sidebar::scope_key(&cwd);
+                    if let Ok(mut tasks) = self.tasks.lock() {
+                        tasks.add_auto_session(scope, agent.to_owned(), cwd, id.clone());
+                        let _ = tasks.save();
+                    }
                 }
                 self.notify_watchers();
                 Response {
@@ -259,32 +241,22 @@ impl Daemon {
                 }
             }
             Err(error) => Response {
-                error: error.to_string(),
+                error,
                 ..Response::default()
             },
         }
     }
 
     fn kill(&self, id: &str) -> Response {
-        let session = self
-            .sessions
-            .write()
-            .ok()
-            .and_then(|mut sessions| sessions.remove(id));
-        let Some(session) = session else {
+        // The conductor removes the session and hands back the agent-native
+        // resume id captured before it is gone; park the bound run here so the
+        // killed session is immediately resumable without lazy reconciliation.
+        let Some((harness, result)) = self.conductor.kill(id) else {
             return Response {
                 error: format!("no such session: {id}"),
                 ..Response::default()
             };
         };
-        if let Ok(mut order) = self.order.write() {
-            order.retain(|session_id| session_id != id);
-        }
-        // Capture the agent-native resume id off the session before it is gone,
-        // then park the bound run so the killed session is immediately
-        // resumable without waiting for lazy reconciliation.
-        let harness = session.snapshot().harness_session_id;
-        let result = session.kill();
         self.park_runs_for_session(id, &harness);
         self.notify_watchers();
         match result {
@@ -293,20 +265,35 @@ impl Daemon {
                 ..Response::default()
             },
             Err(error) => Response {
-                error: error.to_string(),
+                error,
                 ..Response::default()
             },
         }
     }
 
+    /// Parks the runs of sessions the conductor reaped because their agent
+    /// exited deliberately (`/exit`, normal quit): each leaves the engine and
+    /// its bound run is parked so it stays resumable from the history picker.
+    /// Sessions that crashed (non-zero exit or signal) are left in place so
+    /// their ended row stays visible. A no-op when nothing exited cleanly.
+    fn reap_and_park(&self) {
+        let reaped = self.conductor.reap();
+        if reaped.is_empty() {
+            return;
+        }
+        for (id, harness) in &reaped {
+            self.park_runs_for_session(id, harness);
+        }
+        self.notify_watchers();
+    }
+
     fn rename(&self, id: &str, name: String) -> Response {
-        let Some(session) = self.lookup(id) else {
+        if !self.conductor.set_name(id, name) {
             return Response {
                 error: format!("no such session: {id}"),
                 ..Response::default()
             };
-        };
-        session.set_name(name);
+        }
         self.notify_watchers();
         Response {
             ok: true,
@@ -315,13 +302,8 @@ impl Daemon {
     }
 
     fn extract(&self, request: Request) -> Response {
-        let Some(session) = self.lookup(&request.id) else {
-            return Response {
-                error: format!("no such session: {}", request.id),
-                ..Response::default()
-            };
-        };
-        match session.extract_text(
+        match self.conductor.extract(
+            &request.id,
             (request.col_start, request.line_start),
             (request.col_end, request.line_end),
         ) {
@@ -331,7 +313,7 @@ impl Daemon {
                 ..Response::default()
             },
             Err(error) => Response {
-                error: error.to_string(),
+                error,
                 ..Response::default()
             },
         }
@@ -473,18 +455,21 @@ impl Daemon {
         } else {
             format!("{}\n\n{}", task.title, task.desc)
         };
-        let response = self.spawn_session(Request {
-            kind: "spawn".to_owned(),
-            argv: vec![request.agent.clone()],
-            cwd: request.cwd.clone(),
-            rows: request.rows,
-            cols: request.cols,
-            prefill: prefill.clone(),
-            ..Request::default()
-        });
-        if !response.ok {
-            return response;
-        }
+        let session_id = match self.conductor.spawn_session(
+            vec![request.agent.clone()],
+            request.cwd.clone(),
+            request.rows,
+            request.cols,
+            prefill.clone(),
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                return Response {
+                    error,
+                    ..Response::default()
+                }
+            }
+        };
         let mut tasks = match self.tasks.lock() {
             Ok(tasks) => tasks,
             Err(_) => return task_lock_error(),
@@ -495,7 +480,7 @@ impl Daemon {
                 id: Uuid::new_v4().to_string(),
                 agent: request.agent,
                 cwd: request.cwd,
-                cb_session_id: response.id.clone(),
+                cb_session_id: session_id.clone(),
                 agent_session_id: String::new(),
                 first_message: prefill,
                 status: TaskStatus::InProgress,
@@ -511,7 +496,7 @@ impl Daemon {
         self.notify_watchers();
         Response {
             ok: true,
-            id: response.id,
+            id: session_id,
             tasks: snapshot,
             ..Response::default()
         }
@@ -554,17 +539,19 @@ impl Daemon {
         } else {
             request.cwd
         };
-        let response = self.spawn_session(Request {
-            kind: "spawn".to_owned(),
-            argv,
-            cwd,
-            rows: request.rows,
-            cols: request.cols,
-            ..Request::default()
-        });
-        if !response.ok {
-            return response;
-        }
+        let session_id =
+            match self
+                .conductor
+                .spawn_session(argv, cwd, request.rows, request.cols, String::new())
+            {
+                Ok(id) => id,
+                Err(error) => {
+                    return Response {
+                        error,
+                        ..Response::default()
+                    }
+                }
+            };
         let mut tasks = match self.tasks.lock() {
             Ok(tasks) => tasks,
             Err(_) => return task_lock_error(),
@@ -572,7 +559,7 @@ impl Daemon {
         if let Some(task) = tasks.get_mut(&request.id) {
             let now = OffsetDateTime::now_utc();
             if let Some(run) = task.runs.iter_mut().find(|run| run.id == request.run_id) {
-                run.cb_session_id = response.id.clone();
+                run.cb_session_id = session_id.clone();
                 run.status = TaskStatus::InProgress;
                 run.updated_at = now;
             }
@@ -585,7 +572,7 @@ impl Daemon {
         self.notify_watchers();
         Response {
             ok: true,
-            id: response.id,
+            id: session_id,
             tasks: snapshot,
             ..Response::default()
         }
@@ -651,25 +638,7 @@ impl Daemon {
     }
 
     fn task_snapshot(&self) -> Vec<crate::task::Task> {
-        let live: HashMap<String, (bool, String)> = self
-            .sessions
-            .read()
-            .map(|sessions| {
-                sessions
-                    .iter()
-                    .map(|(id, session)| {
-                        let snapshot = session.snapshot();
-                        (
-                            id.clone(),
-                            (
-                                snapshot.exited || snapshot.status == Status::Ended,
-                                snapshot.harness_session_id,
-                            ),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let live = self.conductor.session_liveness();
         let mut tasks = match self.tasks.lock() {
             Ok(tasks) => tasks,
             Err(_) => return Vec::new(),
@@ -712,12 +681,6 @@ impl Daemon {
     }
 
     fn hook(&self, request: Request) -> Response {
-        let Some(session) = self.lookup(&request.session) else {
-            return Response {
-                ok: true,
-                ..Response::default()
-            };
-        };
         let (status, message) = status_for_event(&request.event, &request.payload);
         let harness_id = request
             .payload
@@ -725,9 +688,14 @@ impl Daemon {
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
             .map(str::to_owned);
-        if let Some(id) = harness_id.clone() {
-            session.set_harness_session_id(id);
-        }
+        // Claude reports the absolute path to its own transcript on every hook
+        // payload; capturing it lets us confirm user interrupts (which fire no
+        // hook) against the agent's ground truth.
+        let transcript = request
+            .payload
+            .get("transcript_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let first_message = (request.event == "UserPromptSubmit")
             .then(|| {
                 request
@@ -738,6 +706,21 @@ impl Daemon {
                     .map(str::to_owned)
             })
             .flatten();
+        // Fold the observation into the session (harness id, prefill flush,
+        // status). A missing session makes the hook a no-op, matching the
+        // CB_SESSION-absent contract.
+        let harness = harness_id.clone().unwrap_or_default();
+        if !self
+            .conductor
+            .apply_hook(&request.session, status, message, &harness, transcript)
+        {
+            return Response {
+                ok: true,
+                ..Response::default()
+            };
+        }
+        // Task-store side (broker-owned): fold the harness id and first message
+        // into the bound run.
         if harness_id.is_some() || first_message.is_some() {
             self.update_run_for_session(&request.session, |run| {
                 let mut changed = false;
@@ -756,144 +739,11 @@ impl Daemon {
                 changed
             });
         }
-        let _ = session.flush_prefill();
-        session.set_status(status, message);
         self.notify_watchers();
         Response {
             ok: true,
             ..Response::default()
         }
-    }
-
-    fn attach(
-        self: &Arc<Self>,
-        stream: UnixStream,
-        mut reader: BufReader<UnixStream>,
-        request: Request,
-    ) -> io::Result<()> {
-        let Some(session) = self.lookup(&request.id) else {
-            return write_json(&mut BufWriter::new(stream), &StreamDown::Gone);
-        };
-        if request.rows > 0 && request.cols > 0 {
-            let _ = session.resize(request.rows, request.cols);
-        }
-
-        let writer = Arc::new(Mutex::new(BufWriter::new(stream.try_clone()?)));
-        let offset = Arc::new(AtomicUsize::new(0));
-        let anchor_row = Arc::new(AtomicUsize::new(0));
-        let anchored = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(AtomicBool::new(false));
-        let changes = session.subscribe();
-        let render_session = Arc::clone(&session);
-        let render_writer = Arc::clone(&writer);
-        let render_offset = Arc::clone(&offset);
-        let render_anchor = Arc::clone(&anchor_row);
-        let render_anchored = Arc::clone(&anchored);
-        let render_stop = Arc::clone(&stop);
-        thread::spawn(move || {
-            let mut last: Option<TerminalFrame> = None;
-            loop {
-                if render_stop.load(Ordering::Acquire) {
-                    break;
-                }
-                if render_session.synchronized_output_active() {
-                    Session::wait_for_change(&changes, Duration::from_millis(16));
-                    continue;
-                }
-                let frame = if render_anchored.load(Ordering::Acquire) {
-                    render_session.render_at_row(render_anchor.load(Ordering::Acquire))
-                } else {
-                    render_session.render_at(render_offset.load(Ordering::Acquire))
-                };
-                if let Ok(frame) = frame {
-                    render_offset.store(frame.offset, Ordering::Release);
-                    if last.as_ref() != Some(&frame) {
-                        if let Ok(mut writer) = render_writer.lock() {
-                            if write_json(
-                                &mut *writer,
-                                &StreamDown::Frame {
-                                    frame: frame.clone(),
-                                },
-                            )
-                            .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        last = Some(frame);
-                    }
-                }
-                if render_session.exited() {
-                    if let Ok(mut writer) = render_writer.lock() {
-                        let _ = write_json(&mut *writer, &StreamDown::Gone);
-                    }
-                    break;
-                }
-                Session::wait_for_change(&changes, Duration::from_millis(250));
-            }
-        });
-
-        let mut line = String::new();
-        while reader.read_line(&mut line)? != 0 {
-            if let Ok(up) = serde_json::from_str::<StreamUp>(line.trim_end()) {
-                match up.kind.as_str() {
-                    "input" => {
-                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(up.data)
-                        {
-                            let _ = session.write_input(&bytes);
-                        }
-                    }
-                    "paste" => {
-                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(up.data)
-                        {
-                            let _ = session.paste(&bytes);
-                        }
-                    }
-                    "focus" => {
-                        let _ = session.report_focus(up.data == "1");
-                    }
-                    "mouse" => {
-                        let action = match up.mouse_action {
-                            0 => MouseAction::Press,
-                            1 => MouseAction::Release,
-                            _ => MouseAction::Motion,
-                        };
-                        let button = (up.mouse_button != 0).then_some(up.mouse_button);
-                        let _ = session.mouse(
-                            action,
-                            button,
-                            up.mouse_modifiers,
-                            up.mouse_x,
-                            up.mouse_y,
-                            up.mouse_pressed,
-                        );
-                    }
-                    "resize" if up.rows > 0 && up.cols > 0 => {
-                        let _ = session.resize(up.rows, up.cols);
-                    }
-                    "scroll" => {
-                        offset.store(up.offset, Ordering::Release);
-                        if up.offset == 0 {
-                            anchored.store(false, Ordering::Release);
-                        } else if let Ok(frame) = session.render_at(up.offset) {
-                            anchor_row.store(
-                                frame.max_offset.saturating_sub(frame.offset),
-                                Ordering::Release,
-                            );
-                            anchored.store(true, Ordering::Release);
-                            if let Ok(mut writer) = writer.lock() {
-                                let _ = write_json(&mut *writer, &StreamDown::Frame { frame });
-                            }
-                        }
-                    }
-                    "detach" => break,
-                    _ => {}
-                }
-            }
-            line.clear();
-        }
-        stop.store(true, Ordering::Release);
-        Ok(())
     }
 
     fn watch(&self, stream: UnixStream) -> io::Result<()> {
@@ -903,11 +753,12 @@ impl Daemon {
         }
         let mut writer = BufWriter::new(stream);
         loop {
+            self.reap_and_park();
             write_json(
                 &mut writer,
                 &Response {
                     ok: true,
-                    sessions: self.snapshot(),
+                    sessions: self.conductor.snapshot(),
                     tasks: self.task_snapshot(),
                     ..Response::default()
                 },
@@ -918,37 +769,6 @@ impl Daemon {
                 return Ok(());
             }
         }
-    }
-
-    fn lookup(&self, id: &str) -> Option<Arc<Session>> {
-        self.sessions
-            .read()
-            .ok()
-            .and_then(|sessions| sessions.get(id).cloned())
-    }
-
-    fn all_sessions(&self) -> Vec<Arc<Session>> {
-        self.sessions
-            .read()
-            .map(|sessions| sessions.values().cloned().collect())
-            .unwrap_or_default()
-    }
-
-    fn snapshot(&self) -> Vec<crate::protocol::SessionInfo> {
-        let sessions = match self.sessions.read() {
-            Ok(sessions) => sessions,
-            Err(_) => return Vec::new(),
-        };
-        self.order
-            .read()
-            .map(|order| {
-                order
-                    .iter()
-                    .filter_map(|id| sessions.get(id))
-                    .map(|session| session.snapshot())
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     fn notify_watchers(&self) {
@@ -1140,13 +960,10 @@ mod tests {
         assert!(first.ok && second.ok);
         assert_eq!(second.tasks[0].runs.len(), 2);
         thread::sleep(Duration::from_millis(1_200));
-        let session = daemon.lookup(&first.id).expect("first task session");
-        let frame = session.render_at(0).expect("prefill frame");
-        let text = frame
-            .cells
-            .iter()
-            .map(|cell| cell.symbol.as_str())
-            .collect::<String>();
+        let text = daemon
+            .conductor
+            .extract(&first.id, (0, 0), (39, 2))
+            .expect("prefill text");
         assert!(text.contains("prefilled task"));
 
         assert!(daemon.kill(&first.id).ok);
@@ -1231,6 +1048,92 @@ mod tests {
         assert_eq!(run.agent_session_id, "sess-123");
         assert_eq!(run.first_message, "hello world");
         assert!(run.cb_session_id.is_empty());
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(&bindir);
+    }
+
+    #[test]
+    fn clean_exit_reaps_the_session_while_a_crash_stays_visible() {
+        let path = std::env::temp_dir().join(format!("cb-daemon-reap-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let bindir = std::env::temp_dir().join(format!("cb-reapbin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&bindir);
+        fs::create_dir_all(&bindir).unwrap();
+        // A known-agent basename so each session is auto-recorded, pointing at a
+        // shell we can make exit with a chosen status.
+        let claude = bindir.join("claude");
+        std::os::unix::fs::symlink("/bin/sh", &claude).unwrap();
+        let claude = claude.to_string_lossy().into_owned();
+
+        let daemon = Daemon::new_with_task_path(path.clone());
+        let clean = daemon.dispatch(Request {
+            kind: "spawn".to_owned(),
+            argv: vec![claude.clone(), "-c".to_owned(), "exit 0".to_owned()],
+            cwd: "/tmp".to_owned(),
+            rows: 4,
+            cols: 40,
+            ..Request::default()
+        });
+        let crash = daemon.dispatch(Request {
+            kind: "spawn".to_owned(),
+            argv: vec![claude.clone(), "-c".to_owned(), "exit 3".to_owned()],
+            cwd: "/tmp".to_owned(),
+            rows: 4,
+            cols: 40,
+            ..Request::default()
+        });
+        assert!(clean.ok && crash.ok);
+
+        // Label each run before the children exit; the sessions linger in the
+        // map until a list/watch reaps them, so the hook still resolves.
+        for (id, message) in [(&clean.id, "clean run"), (&crash.id, "crash run")] {
+            daemon.dispatch(Request {
+                kind: "hook".to_owned(),
+                event: "UserPromptSubmit".to_owned(),
+                session: id.clone(),
+                payload: json!({"session_id": format!("sess-{message}"), "prompt": message}),
+                ..Request::default()
+            });
+        }
+
+        // Let both children exit and the waiter record their exit status.
+        thread::sleep(Duration::from_millis(400));
+
+        let listed = daemon.dispatch(Request {
+            kind: "list".to_owned(),
+            ..Request::default()
+        });
+        let ids: Vec<&str> = listed.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            !ids.contains(&clean.id.as_str()),
+            "clean exit should be reaped"
+        );
+        let crashed = listed
+            .sessions
+            .iter()
+            .find(|s| s.id == crash.id)
+            .expect("crashed session stays visible");
+        assert!(crashed.exited && crashed.status == Status::Ended);
+
+        // The reaped session's run is parked (resumable); the crashed session's
+        // run is still bound and live (not yet reconciled).
+        let run_for = |message: &str| {
+            listed
+                .tasks
+                .iter()
+                .flat_map(|task| &task.runs)
+                .find(|run| run.first_message == message)
+                .cloned()
+                .unwrap()
+        };
+        let clean_run = run_for("clean run");
+        assert_eq!(clean_run.status, TaskStatus::Paused);
+        assert_eq!(clean_run.agent_session_id, "sess-clean run");
+        assert!(clean_run.cb_session_id.is_empty());
+        let crash_run = run_for("crash run");
+        assert_eq!(crash_run.status, TaskStatus::InProgress);
+        assert_eq!(crash_run.cb_session_id, crash.id);
 
         let _ = fs::remove_file(path);
         let _ = fs::remove_dir_all(&bindir);

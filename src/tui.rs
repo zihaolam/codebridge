@@ -21,7 +21,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::{Frame, Terminal};
 use time::OffsetDateTime;
 
@@ -41,7 +41,7 @@ const SPINNERS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 enum UiEvent {
     Snapshot(Vec<SessionInfo>, Vec<Task>),
     Frame(String, TerminalFrame),
-    Gone(String),
+    Gone(String, bool),
     Error(String),
 }
 
@@ -202,6 +202,7 @@ struct Model {
     pending_jump: Option<String>,
     spin: usize,
     pane: Rect,
+    screen: Rect,
 }
 
 impl Model {
@@ -276,6 +277,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         pending_jump: None,
         spin: 0,
         pane: Rect::default(),
+        screen: Rect::default(),
     };
     let mut last_spin = Instant::now();
 
@@ -426,8 +428,8 @@ fn start_attach(id: String, pane: Rect, sender: Sender<UiEvent>) -> io::Result<A
                         break;
                     }
                 }
-                Ok(StreamDown::Gone) => {
-                    let _ = sender.send(UiEvent::Gone(event_id.clone()));
+                Ok(StreamDown::Gone { clean }) => {
+                    let _ = sender.send(UiEvent::Gone(event_id.clone(), clean));
                     break;
                 }
                 Ok(StreamDown::Error { message }) => {
@@ -499,8 +501,16 @@ fn drain_events(model: &mut Model, receiver: &Receiver<UiEvent>) {
             {
                 model.frame = Some(frame);
             }
-            UiEvent::Gone(id) if model.attach.as_ref().is_some_and(|attach| attach.id == id) => {
+            UiEvent::Gone(id, clean)
+                if model.attach.as_ref().is_some_and(|attach| attach.id == id) =>
+            {
                 model.attach = None;
+                // A deliberate `/exit` closes the session outright: advance to a
+                // neighbour like `kill` does. A crash leaves the ended row in
+                // place so it stays visible.
+                if clean && !model.sidebar.select_previous_session(&id) {
+                    model.focus = Focus::Sidebar;
+                }
             }
             UiEvent::Error(error) => model.error = error,
             _ => {}
@@ -751,6 +761,14 @@ fn handle_key(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
         },
         Focus::Screen => {
             if let Some(bytes) = encode_key(key) {
+                // Claude fires no hook when the user interrupts a turn, so an
+                // Escape would leave the sidebar spinner stuck. Flag it to the
+                // conductor (which confirms it against Claude's transcript)
+                // ahead of the Escape byte so the baseline length is captured
+                // before the agent reacts.
+                if key.code == KeyCode::Esc && attached_is_claude(model) {
+                    send_interrupt_check(model)?;
+                }
                 send_input(model, &bytes)?;
             }
         }
@@ -1707,6 +1725,35 @@ fn send_input(model: &mut Model, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether the attached session is a Claude agent. Interrupt confirmation only
+/// applies to Claude, which alone reports a transcript path and fires no hook
+/// on interrupt.
+fn attached_is_claude(model: &Model) -> bool {
+    model
+        .attached_session()
+        .and_then(|session| session.argv.first())
+        .map(std::path::Path::new)
+        .and_then(std::path::Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("claude")
+}
+
+/// Signal the conductor that the user pressed Escape on the attached session so
+/// it can confirm the interrupt against the agent's transcript. Sent before the
+/// Escape byte itself; see the `Focus::Screen` handler.
+fn send_interrupt_check(model: &mut Model) -> io::Result<()> {
+    if let Some(attach) = model.attach.as_mut() {
+        write_json(
+            &mut attach.writer,
+            &StreamUp {
+                kind: "interrupt_check".to_owned(),
+                ..StreamUp::default()
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn handle_paste(model: &mut Model, text: &str) -> io::Result<()> {
     if let Some(modal) = model.task_modal.as_mut() {
         match &mut modal.stage {
@@ -1887,32 +1934,68 @@ fn mouse_button(button: MouseButton) -> u8 {
     }
 }
 
-fn toast_at(model: &Model, column: u16, row: u16) -> Option<String> {
-    let area = Rect::new(0, 0, model.pane.right(), model.pane.bottom());
-    model
-        .toasts
+/// Sonner-style toast cards, stacked at the bottom-left with the newest
+/// nearest the corner. Returns each visible toast's index into `model.toasts`
+/// paired with the bordered card rect. Shared by rendering and hit-testing so
+/// clicks always match what is drawn.
+const TOAST_MAX_WIDTH: u16 = 46;
+const TOAST_HEIGHT: u16 = 3;
+const TOAST_GAP: u16 = 1;
+const TOAST_MARGIN_X: u16 = 2;
+const TOAST_MARGIN_Y: u16 = 1;
+const TOAST_VISIBLE: usize = 5;
+
+fn toast_cards(toasts: &[Toast], area: Rect) -> Vec<(usize, Rect)> {
+    let mut cards = Vec::new();
+    if area.width < 20 {
+        return cards;
+    }
+    let inner_cap = TOAST_MAX_WIDTH
+        .saturating_sub(4)
+        .min(area.width.saturating_sub(TOAST_MARGIN_X + 4));
+    for (slot, (index, toast)) in toasts
         .iter()
-        .rev()
-        .take(5)
         .enumerate()
-        .find_map(|(index, toast)| {
-            if area.width < 10 || area.height <= index as u16 + 2 {
-                return None;
-            }
-            let width = (toast.text.chars().count() as u16 + 2)
-                .min(area.width.saturating_sub(2))
-                .max(1);
-            let toast_area = Rect::new(
-                area.right().saturating_sub(width + 1),
-                area.y + 1 + u16::from(!model.hooks_ok) + index as u16,
-                width,
-                1,
-            );
-            (column >= toast_area.x
-                && column < toast_area.right()
-                && row >= toast_area.y
-                && row < toast_area.bottom())
-            .then(|| toast.session_id.clone())
+        .rev()
+        .take(TOAST_VISIBLE)
+        .enumerate()
+    {
+        let slot = slot as u16;
+        let offset = TOAST_MARGIN_Y + (slot + 1) * TOAST_HEIGHT + slot * TOAST_GAP;
+        if area.height < offset {
+            break;
+        }
+        let inner = (toast.text.chars().count() as u16).min(inner_cap).max(1);
+        let width = inner + 4;
+        let card = Rect::new(
+            area.x + TOAST_MARGIN_X,
+            area.bottom().saturating_sub(offset),
+            width,
+            TOAST_HEIGHT,
+        );
+        cards.push((index, card));
+    }
+    cards
+}
+
+fn truncate_ellipsis(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(max - 1).collect();
+    out.push('…');
+    out
+}
+
+fn toast_at(model: &Model, column: u16, row: u16) -> Option<String> {
+    toast_cards(&model.toasts, model.screen)
+        .into_iter()
+        .find_map(|(index, card)| {
+            (column >= card.x && column < card.right() && row >= card.y && row < card.bottom())
+                .then(|| model.toasts[index].session_id.clone())
         })
 }
 
@@ -2054,6 +2137,7 @@ fn view(model: &Model, area: Rect) -> View {
 
 fn compute_view(model: &mut Model, area: Rect) {
     let view = view(model, area);
+    model.screen = area;
     model.pane = Rect {
         width: view
             .main
@@ -2713,29 +2797,30 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
             warning,
         );
     }
-    for (index, toast) in model.toasts.iter().rev().take(5).enumerate() {
-        if area.width < 10 || area.height <= index as u16 + 2 {
-            break;
-        }
-        let width = (toast.text.chars().count() as u16 + 2)
-            .min(area.width.saturating_sub(2))
-            .max(1);
-        let toast_area = Rect::new(
-            area.right().saturating_sub(width + 1),
-            area.y + 1 + u16::from(!model.hooks_ok) + index as u16,
-            width,
-            1,
-        );
+    for (index, card) in toast_cards(&model.toasts, model.screen) {
+        let toast = &model.toasts[index];
         let color = match toast.status {
             Status::NeedsApproval => model.palette.red,
             Status::WaitingUser => model.palette.green,
             _ => model.palette.text,
         };
-        frame.render_widget(Clear, toast_area);
+        let text = truncate_ellipsis(&toast.text, card.width.saturating_sub(4) as usize);
+        frame.render_widget(Clear, card);
         frame.render_widget(
-            Paragraph::new(format!("› {}", toast.text))
-                .style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            toast_area,
+            Paragraph::new(Line::styled(
+                text,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(model.palette.surface0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(color))
+                    .padding(Padding::horizontal(1))
+                    .style(Style::default().bg(model.palette.surface0)),
+            ),
+            card,
         );
     }
 }
@@ -2770,7 +2855,7 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
 
     let mut display_rows: Vec<(Option<usize>, Line<'static>)> = Vec::new();
     for (index, row) in model.sidebar.rows().iter().enumerate() {
-        display_rows.push((Some(index), sidebar_row(model, row, index)));
+        display_rows.push((Some(index), sidebar_row(model, row, index, inner.width)));
         if matches!(row, Row::Session { .. })
             && model
                 .sidebar
@@ -2817,7 +2902,7 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
     }
 }
 
-fn sidebar_row(model: &Model, row: &Row, index: usize) -> Line<'static> {
+fn sidebar_row(model: &Model, row: &Row, index: usize, width: u16) -> Line<'static> {
     let selected = index == model.sidebar.cursor();
     let gutter = if selected { "▌" } else { " " };
     let gutter_color = if model.focus == Focus::Sidebar {
@@ -2832,13 +2917,21 @@ fn sidebar_row(model: &Model, row: &Row, index: usize) -> Line<'static> {
             expanded,
         } => {
             let glyph = if *expanded { '▾' } else { '▸' };
+            let trailer = format!("{count} {glyph}");
+            let trailer_width = Line::from(trailer.as_str()).width();
+            let name_width = usize::from(width)
+                .saturating_sub(1 + trailer_width)
+                .saturating_sub(1);
+            let name = truncate_with_ellipsis(scope_display_name(key), name_width);
+            let left_width = 1 + Line::from(name.as_str()).width();
+            let gap = usize::from(width)
+                .saturating_sub(left_width + trailer_width)
+                .max(1);
             Line::from(vec![
                 Span::styled(gutter.to_owned(), Style::default().fg(gutter_color)),
-                Span::styled(
-                    scope_display_name(key),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!(" {count} {glyph}")),
+                Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" ".repeat(gap)),
+                Span::raw(trailer),
             ])
         }
         Row::Session { session, .. } => {
@@ -2873,6 +2966,19 @@ fn sidebar_row(model: &Model, row: &Row, index: usize) -> Line<'static> {
             Line::from(spans)
         }
     }
+}
+
+fn truncate_with_ellipsis(mut value: String, width: usize) -> String {
+    if Line::from(value.as_str()).width() <= width {
+        return value;
+    }
+    if width == 0 {
+        return String::new();
+    }
+    while !value.is_empty() && Line::from(format!("{value}…")).width() > width {
+        value.pop();
+    }
+    format!("{value}…")
 }
 
 fn is_linked_worktree(cwd: &Path) -> bool {
@@ -3235,6 +3341,68 @@ mod tests {
     }
 
     #[test]
+    fn toast_cards_stack_bottom_left_newest_nearest_corner() {
+        let toast = |id: &str| Toast {
+            session_id: id.to_owned(),
+            status: Status::WaitingUser,
+            text: "● session — turn completed".to_owned(),
+        };
+        let toasts = vec![toast("older"), toast("newest")];
+        let area = Rect::new(0, 0, 100, 40);
+        let cards = toast_cards(&toasts, area);
+        assert_eq!(cards.len(), 2);
+
+        // Newest (last pushed, index 1) sits nearest the bottom-left corner.
+        let (newest_index, newest) = cards[0];
+        assert_eq!(newest_index, 1);
+        assert_eq!(newest.bottom(), area.bottom() - TOAST_MARGIN_Y);
+        assert_eq!(newest.x, area.x + TOAST_MARGIN_X);
+        assert_eq!(newest.height, TOAST_HEIGHT);
+
+        // Older toast stacks directly above it with the configured gap.
+        let (older_index, older) = cards[1];
+        assert_eq!(older_index, 0);
+        assert_eq!(older.x, area.x + TOAST_MARGIN_X);
+        assert_eq!(older.bottom(), newest.y - TOAST_GAP);
+    }
+
+    #[test]
+    fn toast_card_width_caps_and_hit_test_matches_render() {
+        use ratatui::backend::TestBackend;
+
+        let long = "●".to_owned() + &" verbose session status message".repeat(6);
+        let toasts = vec![Toast {
+            session_id: "abc".to_owned(),
+            status: Status::NeedsApproval,
+            text: long,
+        }];
+        let area = Rect::new(0, 0, 120, 30);
+        let cards = toast_cards(&toasts, area);
+        let (_, card) = cards[0];
+        assert!(card.width <= TOAST_MAX_WIDTH);
+
+        // Render into a test buffer and confirm the rounded border is drawn at
+        // the card corners (i.e. the toast is an actual bordered card).
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Clear, card);
+                frame.render_widget(
+                    Paragraph::new("x").block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded),
+                    ),
+                    card,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(card.x, card.y)].symbol(), "╭");
+        assert_eq!(buffer[(card.right() - 1, card.bottom() - 1)].symbol(), "╯");
+    }
+
+    #[test]
     fn transition_toasts_ignore_first_observation_and_stay_status_driven() {
         let session = |status, message: &str| SessionInfo {
             id: "12345678-rest".to_owned(),
@@ -3246,6 +3414,7 @@ mod tests {
             harness_session_id: String::new(),
             exited: false,
             status_since_unix_ms: 0,
+            transcript_path: String::new(),
         };
         let mut previous = HashMap::new();
         assert!(transition_toasts(&mut previous, &[session(Status::Working, "")]).is_empty());

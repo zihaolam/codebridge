@@ -20,16 +20,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.first().map(String::as_str) {
         Some("daemon") => {
+            ensure_conductor()?;
             codebridge::web::start_default();
             Daemon::new().run(&socket_path())?;
+        }
+        Some("conductor") => {
+            let conductor = codebridge::conductor::Conductor::new();
+            // `cb conductor --resume <stash>` is the hot-upgrade successor: adopt
+            // the predecessor's sessions from their surviving fds before binding
+            // the socket, so clients only reconnect once state is restored.
+            if let Some(stash) = resume_stash_arg(&args[1..]) {
+                conductor.resume_from(std::path::Path::new(&stash))?;
+            }
+            conductor.run(&codebridge::conductor::conductor_socket_path())?;
         }
         Some("ctl") => ctl(&args[1..])?,
         Some("web") => web_command(&args[1..])?,
         Some("stop") => {
-            stop_daemon().map_err(|_| "daemon not running")?;
+            // Stop the broker, then tear the conductor (and its sessions) down.
+            // Either being present counts as "was running".
+            let broker = stop_daemon().is_ok();
+            let conductor = stop_conductor();
+            if !broker && !conductor {
+                return Err("daemon not running".into());
+            }
             println!("daemon stopped");
         }
         Some("restart") => restart_daemon()?,
+        Some("upgrade") => upgrade_conductor()?,
         Some("hook") => hook(&args[1..])?,
         Some("integration") => integration_command(&args[1..])?,
         Some("install-hooks") => print_install(Agent::Claude)?,
@@ -138,6 +156,15 @@ fn hook(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
     let event = args.first().cloned().unwrap_or_default();
+    let codex_config = args
+        .windows(2)
+        .find(|args| args[0] == "--codex-config")
+        .map(|args| std::path::Path::new(&args[1]));
+    if event == "PermissionRequest"
+        && codex_config.is_some_and(integration::codex_handles_approvals_automatically)
+    {
+        return Ok(());
+    }
     let mut bytes = Vec::new();
     let _ = io::stdin().take(1024 * 1024).read_to_end(&mut bytes);
     let payload = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
@@ -251,6 +278,8 @@ fn restart_daemon() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn ensure_daemon() -> Result<(), Box<dyn std::error::Error>> {
+    // The broker depends on the conductor, so bring it up first.
+    ensure_conductor()?;
     if UnixStream::connect(socket_path()).is_ok() {
         let response = send(
             &Request {
@@ -308,6 +337,140 @@ fn ensure_daemon() -> Result<(), Box<dyn std::error::Error>> {
     .into())
 }
 
+/// Ensures the durable conductor process is running and speaks our protocol.
+/// Unlike a stale broker, a stale conductor cannot be auto-restarted here: doing
+/// so would kill live agent sessions, so a version mismatch is surfaced for the
+/// user to resolve with `cb stop`.
+fn ensure_conductor() -> Result<(), Box<dyn std::error::Error>> {
+    use codebridge::conductor::{conductor_socket_path, ConductorClient, CONDUCTOR_VERSION};
+
+    let socket = conductor_socket_path();
+    let client = ConductorClient::new(socket.clone());
+    if UnixStream::connect(&socket).is_ok() {
+        if let Ok(response) = client.ping() {
+            if response.version == Some(CONDUCTOR_VERSION) {
+                return Ok(());
+            }
+            return Err(format!(
+                "a stale cb conductor is running (protocol v{}, want v{}, pid {}).\n\
+                 stop it with `cb stop` (this ends its live sessions) and retry",
+                response.version.unwrap_or_default(),
+                CONDUCTOR_VERSION,
+                response.pid.unwrap_or_default()
+            )
+            .into());
+        }
+    }
+
+    fs::create_dir_all(codebridge::daemon::state_dir())?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(codebridge::daemon::state_dir().join("conductor.log"))?;
+    let error_log = log.try_clone()?;
+    let executable = std::env::current_exe()?;
+    Command::new(executable)
+        .arg("conductor")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(error_log))
+        .spawn()?;
+
+    for _ in 0..100 {
+        if let Ok(response) = client.ping() {
+            if response.version == Some(CONDUCTOR_VERSION) {
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Err(format!(
+        "conductor did not become ready; inspect {}",
+        codebridge::daemon::state_dir()
+            .join("conductor.log")
+            .display()
+    )
+    .into())
+}
+
+/// Best-effort teardown of the conductor process (and its sessions). Returns
+/// whether a conductor was reachable.
+fn stop_conductor() -> bool {
+    let socket = codebridge::conductor::conductor_socket_path();
+    if UnixStream::connect(&socket).is_err() {
+        return false;
+    }
+    codebridge::conductor::ConductorClient::new(socket).stop();
+    true
+}
+
+/// Extracts the `--resume <path>` (or `--resume=<path>`) argument that the
+/// hot-upgrade successor is launched with.
+fn resume_stash_arg(args: &[String]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--resume" {
+            return iter.next().cloned();
+        }
+        if let Some(path) = arg.strip_prefix("--resume=") {
+            return Some(path.to_owned());
+        }
+    }
+    None
+}
+
+/// Hot-upgrades the running conductor in place: it snapshots its sessions and
+/// re-execs the current `cb` binary under the same pid, so its agents keep
+/// running on the new build with their scrollback intact. Success is confirmed
+/// by watching the conductor's boot id change (same pid, fresh `Conductor`).
+/// The broker dials the conductor per call, so it needs no restart; live panes
+/// briefly blip and reattach.
+fn upgrade_conductor() -> Result<(), Box<dyn std::error::Error>> {
+    use codebridge::conductor::{conductor_socket_path, ConductorClient, CONDUCTOR_VERSION};
+
+    let client = ConductorClient::new(conductor_socket_path());
+    let before = match client.ping() {
+        Ok(response) => response,
+        Err(_) => {
+            return Err("no conductor is running to upgrade (start one with `cb daemon`)".into())
+        }
+    };
+    if before.version != Some(CONDUCTOR_VERSION) {
+        return Err(format!(
+            "conductor speaks protocol v{} but this build wants v{}; run `cb stop` and start fresh",
+            before.version.unwrap_or_default(),
+            CONDUCTOR_VERSION
+        )
+        .into());
+    }
+    let boot_before = before.boot_id;
+
+    client.upgrade()?;
+
+    // The successor keeps the pid but mints a fresh boot id, so a changed boot
+    // id proves the new build took over. Poll across the brief window where the
+    // socket is unbound during the exec.
+    for _ in 0..250 {
+        if let Ok(response) = client.ping() {
+            if response.ok && !response.boot_id.is_empty() && response.boot_id != boot_before {
+                println!(
+                    "conductor upgraded (pid {})",
+                    response.pid.unwrap_or_default()
+                );
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Err(format!(
+        "conductor did not come back after upgrade; inspect {}",
+        codebridge::daemon::state_dir()
+            .join("conductor.log")
+            .display()
+    )
+    .into())
+}
+
 fn print_install(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
     let paths = integration::install(agent)?;
     println!(
@@ -358,9 +521,10 @@ fn usage() -> &'static str {
     "usage:
   cb [--all]
   cb daemon
+  cb conductor
   cb ctl ping|list|spawn|kill|rename|shutdown
   cb web [--port N] | token [rotate] | qr [--url URL]
-  cb stop | restart | version
+  cb stop | restart | upgrade | version
   cb hook <event>
   cb integration install|uninstall|status [claude|codex]
   cb install-hooks

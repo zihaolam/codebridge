@@ -463,6 +463,7 @@ mod tests {
             harness_session_id: String::new(),
             exited: false,
             status_since_unix_ms: since,
+            transcript_path: String::new(),
         }
     }
 

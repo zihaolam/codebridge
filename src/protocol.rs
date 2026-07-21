@@ -1,7 +1,7 @@
 use crate::task::Task;
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 16;
+pub const VERSION: u32 = 19;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +25,12 @@ pub struct SessionInfo {
     pub harness_session_id: String,
     pub exited: bool,
     pub status_since_unix_ms: u64,
+    /// Absolute path to the agent's own transcript, captured from Claude hook
+    /// payloads (`transcript_path`). Empty for agents that do not report one.
+    /// Used to confirm a user interrupt against the agent's ground truth rather
+    /// than guessing from a keystroke.
+    #[serde(default)]
+    pub transcript_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -143,7 +149,17 @@ pub struct TerminalFrame {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamDown {
-    Frame { frame: TerminalFrame },
-    Gone,
-    Error { message: String },
+    Frame {
+        frame: TerminalFrame,
+    },
+    /// The attached session is gone. `clean` is true when the agent exited
+    /// deliberately (e.g. `/exit`), signalling the client to auto-advance; a
+    /// crash sets it false so the ended session stays visible.
+    Gone {
+        #[serde(default)]
+        clean: bool,
+    },
+    Error {
+        message: String,
+    },
 }

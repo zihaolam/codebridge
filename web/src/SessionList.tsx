@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import type { SessionInfo } from './ws'
 import Spinner from './Spinner'
-import { IconPlus, IconX } from './icons'
+import { IconChevronDown, IconPlus, IconX } from './icons'
 
 // Status → glyph, mirroring the TUI sidebar's language (dashboard.go
 // indicator/statusStyle): working spinner, green ● turn-complete, yellow ●
@@ -74,9 +74,7 @@ export default function SessionList({
         return (
           <li key={g.key} className="scope-group">
             <div className="scope-header" onClick={() => toggle(g.key)}>
-              <span className="chevron">{closed ? '▸' : '▾'}</span>
               <span className="scope-name">{g.name}</span>
-              <span className="scope-count">{g.sessions.length}</span>
               <button
                 className="icon-btn scope-add"
                 title={`new session in ${g.name}`}
@@ -87,6 +85,10 @@ export default function SessionList({
               >
                 <IconPlus />
               </button>
+              <span className="scope-count">{g.sessions.length}</span>
+              <span className={`chevron ${closed ? 'closed' : ''}`}>
+                <IconChevronDown />
+              </span>
             </div>
             {!closed && (
               <ul>

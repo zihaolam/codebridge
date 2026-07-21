@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-const INTEGRATION_VERSION: u32 = 3;
+const INTEGRATION_VERSION: u32 = 4;
 const HOOK_NAME: &str = "codebridge-agent-state.sh";
 const MARKER: &str = "CODEBRIDGE_INTEGRATION_ID=lifecycle";
 
@@ -117,7 +117,7 @@ pub fn install_at(agent: Agent, dir: &Path, binary: &str) -> io::Result<InstallP
     };
     fs::create_dir_all(&hook_dir)?;
     let hook_path = hook_dir.join(HOOK_NAME);
-    write_atomic(&hook_path, hook_script(binary).as_bytes())?;
+    write_atomic(&hook_path, hook_script(agent, binary, dir).as_bytes())?;
     make_executable(&hook_path)?;
 
     let config_path = match agent {
@@ -258,7 +258,14 @@ pub fn uninstall_at(agent: Agent, dir: &Path) -> io::Result<()> {
     }
 }
 
-fn hook_script(binary: &str) -> String {
+fn hook_script(agent: Agent, binary: &str, config_dir: &Path) -> String {
+    let codex_config = match agent {
+        Agent::Claude => String::new(),
+        Agent::Codex => format!(
+            " --codex-config {}",
+            shell_quote(&config_dir.join("config.toml").display().to_string())
+        ),
+    };
     format!(
         "#!/bin/sh\n\
          # installed and managed by codebridge\n\
@@ -266,8 +273,9 @@ fn hook_script(binary: &str) -> String {
          # CODEBRIDGE_INTEGRATION_VERSION={INTEGRATION_VERSION}\n\
          event=\"${{1:-}}\"\n\
          [ -n \"$event\" ] || exit 0\n\
-         exec {} hook \"$event\"\n",
-        shell_quote(binary)
+         exec {} hook \"$event\"{}\n",
+        shell_quote(binary),
+        codex_config
     )
 }
 
@@ -475,6 +483,36 @@ fn codex_hooks_enabled(content: &str) -> bool {
     false
 }
 
+pub fn codex_handles_approvals_automatically(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .is_some_and(|content| codex_config_handles_approvals_automatically(&content))
+}
+
+fn codex_config_handles_approvals_automatically(content: &str) -> bool {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            break;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let value = value
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches(['"', '\'']);
+        match key.trim() {
+            "approvals_reviewer" if value == "auto_review" => return true,
+            "approval_policy" if value == "never" => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -562,6 +600,9 @@ mod tests {
         let installed = read_json_object(&dir.join("hooks.json")).expect("installed hooks");
         assert!(installed["hooks"].get("Notification").is_none());
         assert!(installed["hooks"]["PermissionRequest"].is_array());
+        let script = fs::read_to_string(dir.join(HOOK_NAME)).expect("managed hook");
+        assert!(script.contains("hook \"$event\" --codex-config '"));
+        assert!(script.contains(&dir.join("config.toml").display().to_string()));
         let config = fs::read_to_string(dir.join("config.toml")).expect("codex config");
         assert!(config.contains("[features]\nhooks = true\nother = true"));
         assert!(config.contains("[profiles.work.features]\nhooks = false\ncodex_hooks = false"));
@@ -595,5 +636,21 @@ mod tests {
                 expected: INTEGRATION_VERSION
             }
         );
+    }
+
+    #[test]
+    fn codex_auto_approval_detection_uses_only_top_level_effective_defaults() {
+        assert!(codex_config_handles_approvals_automatically(
+            "approvals_reviewer = \"auto_review\"\napproval_policy = \"on-request\"\n"
+        ));
+        assert!(codex_config_handles_approvals_automatically(
+            "approval_policy = 'never' # no user prompts\n"
+        ));
+        assert!(!codex_config_handles_approvals_automatically(
+            "approvals_reviewer = \"user\"\n\n[profiles.auto]\napprovals_reviewer = \"auto_review\"\n"
+        ));
+        assert!(!codex_config_handles_approvals_automatically(
+            "approval_policy = \"on-request\"\n"
+        ));
     }
 }

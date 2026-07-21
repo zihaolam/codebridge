@@ -1,4 +1,6 @@
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -32,7 +34,26 @@ struct Metadata {
     status: Status,
     last_message: String,
     harness_session_id: String,
+    transcript_path: String,
     status_since_unix_ms: u64,
+}
+
+/// How a session's PTY master is backed. A session Codebridge spawned owns
+/// portable_pty's master handle; a session adopted across a conductor
+/// hot-upgrade holds only the raw master fd that survived the `execve`, since
+/// portable_pty cannot rebuild its handle from a bare fd.
+enum Master {
+    Portable(Box<dyn MasterPty + Send>),
+    Raw(OwnedFd),
+}
+
+/// How a session's child is reaped. Spawned children reap through portable_pty;
+/// an adopted child is reaped by `waitpid` on its pid, which still yields the
+/// exit status because a hot-upgraded conductor keeps the same pid and so stays
+/// the child's parent.
+enum Reaper {
+    Child(Box<dyn Child + Send + Sync>),
+    Pid(libc::pid_t),
 }
 
 pub struct Session {
@@ -40,13 +61,14 @@ pub struct Session {
     argv: Vec<String>,
     cwd: String,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    child: Mutex<Box<dyn Child + Send + Sync>>,
-    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    master: Mutex<Master>,
+    reaper: Mutex<Reaper>,
+    killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
     process_id: Option<u32>,
     terminal: Arc<Mutex<Terminal>>,
     metadata: RwLock<Metadata>,
     exited: AtomicBool,
+    exit_clean: AtomicBool,
     sync_since_unix_ms: AtomicU64,
     generation: AtomicU64,
     subscribers: Mutex<Vec<mpsc::Sender<u64>>>,
@@ -60,6 +82,7 @@ impl Session {
         cwd: String,
         rows: u16,
         cols: u16,
+        host_theme: crate::terminal_theme::TerminalTheme,
     ) -> Result<Arc<Self>, SessionError> {
         let argv = if argv.is_empty() {
             vec!["claude".to_owned()]
@@ -89,7 +112,7 @@ impl Session {
         let reader = pair.master.try_clone_reader()?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let replies = Arc::clone(&writer);
-        let terminal = Terminal::new(
+        let mut terminal = Terminal::new(
             cols.max(1),
             rows.max(1),
             DEFAULT_SCROLLBACK_LINES,
@@ -100,15 +123,24 @@ impl Session {
                 }
             },
         )?;
+        // Seed the embedded terminal with the host terminal's default colors
+        // before the child produces any output, so libghostty answers the
+        // agent's `OSC 10/11 ;?` queries with the real terminal colors. This is
+        // what lets Codex derive an input box shade that contrasts with what
+        // Codebridge renders. Fed before `start_reader` so it is applied ahead
+        // of the child's own early color query.
+        if !host_theme.is_empty() {
+            terminal.feed(&host_theme.set_sequences());
+        }
         let now = unix_ms();
         let session = Arc::new(Self {
             id,
             argv,
             cwd,
             writer,
-            master: Mutex::new(pair.master),
-            child: Mutex::new(child),
-            killer: Mutex::new(killer),
+            master: Mutex::new(Master::Portable(pair.master)),
+            reaper: Mutex::new(Reaper::Child(child)),
+            killer: Mutex::new(Some(killer)),
             process_id,
             terminal: Arc::new(Mutex::new(terminal)),
             metadata: RwLock::new(Metadata {
@@ -116,15 +148,81 @@ impl Session {
                 status: Status::Starting,
                 last_message: String::new(),
                 harness_session_id: String::new(),
+                transcript_path: String::new(),
                 status_since_unix_ms: now,
             }),
             exited: AtomicBool::new(false),
+            exit_clean: AtomicBool::new(false),
             sync_since_unix_ms: AtomicU64::new(0),
             generation: AtomicU64::new(1),
             subscribers: Mutex::new(Vec::new()),
             pending_prefill: Mutex::new(None),
         });
         Self::start_reader(&session, reader);
+        Self::start_waiter(&session);
+        Ok(session)
+    }
+
+    /// Reconstructs a live session from a PTY master fd and child pid that
+    /// survived a conductor hot-upgrade (`execve`), replaying `vt_bytes` to
+    /// rebuild the terminal's scrollback, screen, cursor, and styles. The
+    /// predecessor conductor cleared CLOEXEC on `master_fd` so it outlived the
+    /// exec; `child_pid` is still our child because the exec kept the same pid.
+    /// Fresh reader/writer handles are duped from the surviving fd, so resize
+    /// and reaping run through raw libc rather than portable_pty.
+    pub fn adopt(
+        info: SessionInfo,
+        master_fd: RawFd,
+        child_pid: u32,
+        rows: u16,
+        cols: u16,
+        vt_bytes: &[u8],
+    ) -> Result<Arc<Self>, SessionError> {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        // SAFETY: master_fd is a live PTY master handed over by the predecessor
+        // conductor with CLOEXEC cleared; this process now owns it.
+        let owned = unsafe { OwnedFd::from_raw_fd(master_fd) };
+        let writer_fd = owned.try_clone()?;
+        let reader_fd = owned.try_clone()?;
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(File::from(writer_fd))));
+        let replies = Arc::clone(&writer);
+        let mut terminal = Terminal::new(cols, rows, DEFAULT_SCROLLBACK_LINES, move |bytes| {
+            if let Ok(mut writer) = replies.lock() {
+                let _ = writer.write_all(bytes);
+                let _ = writer.flush();
+            }
+        })?;
+        if !vt_bytes.is_empty() {
+            terminal.feed(vt_bytes);
+        }
+        let session = Arc::new(Self {
+            id: info.id,
+            argv: info.argv,
+            cwd: info.cwd,
+            writer,
+            master: Mutex::new(Master::Raw(owned)),
+            reaper: Mutex::new(Reaper::Pid(child_pid as libc::pid_t)),
+            killer: Mutex::new(None),
+            process_id: Some(child_pid),
+            terminal: Arc::new(Mutex::new(terminal)),
+            metadata: RwLock::new(Metadata {
+                name: info.name,
+                status: info.status,
+                last_message: info.last_message,
+                harness_session_id: info.harness_session_id,
+                transcript_path: info.transcript_path,
+                status_since_unix_ms: info.status_since_unix_ms,
+            }),
+            exited: AtomicBool::new(false),
+            exit_clean: AtomicBool::new(false),
+            sync_since_unix_ms: AtomicU64::new(0),
+            generation: AtomicU64::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            pending_prefill: Mutex::new(None),
+        });
+        Self::start_reader(&session, Box::new(File::from(reader_fd)));
         Self::start_waiter(&session);
         Ok(session)
     }
@@ -168,13 +266,47 @@ impl Session {
             let Some(session) = weak.upgrade() else {
                 return;
             };
-            if let Ok(mut child) = session.child.lock() {
-                let _ = child.wait();
-            }
+            // A zero exit code with no terminating signal is a deliberate quit
+            // (Claude/Codex `/exit`, a normal shutdown). Anything else — a
+            // crash, a signal, or a lost handle — is treated as unclean so the
+            // daemon leaves the session visible instead of auto-closing it.
+            let clean = session.wait_for_child_exit();
+            // Publish `exit_clean` before `exited`: any reader that observes
+            // `exited() == true` with an Acquire load then also sees the flag.
+            session.exit_clean.store(clean, Ordering::Release);
             session.exited.store(true, Ordering::Release);
             session.set_status(Status::Ended, String::new());
             session.mark_dirty();
         });
+    }
+
+    /// Blocks until the child exits and reports whether the exit was clean
+    /// (status 0, no signal). Spawned children reap through portable_pty; an
+    /// adopted child is reaped with `waitpid` on its pid. The reaper lock is held
+    /// across the blocking wait, but nothing else contends for it, so resize
+    /// (master) and kill (killer) stay responsive.
+    fn wait_for_child_exit(&self) -> bool {
+        let mut reaper = match self.reaper.lock() {
+            Ok(reaper) => reaper,
+            Err(_) => return false,
+        };
+        match &mut *reaper {
+            Reaper::Child(child) => child.wait().map(|status| status.success()).unwrap_or(false),
+            Reaper::Pid(pid) => waitpid_clean(*pid),
+        }
+    }
+
+    /// Feed the host terminal's default colors into an already-running
+    /// session's terminal so future agent color queries are answered with
+    /// them. Best-effort; an already-started agent will not re-query, so this
+    /// mainly benefits sessions that outlive the color detection.
+    pub fn apply_host_theme(&self, theme: &crate::terminal_theme::TerminalTheme) {
+        if theme.is_empty() {
+            return;
+        }
+        if let Ok(mut terminal) = self.terminal.lock() {
+            terminal.feed(&theme.set_sequences());
+        }
     }
 
     pub fn subscribe(&self) -> mpsc::Receiver<u64> {
@@ -286,15 +418,15 @@ impl Session {
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), SessionError> {
-        self.master
-            .lock()
-            .map_err(|_| SessionError::Poisoned)?
-            .resize(PtySize {
+        match &*self.master.lock().map_err(|_| SessionError::Poisoned)? {
+            Master::Portable(master) => master.resize(PtySize {
                 rows: rows.max(1),
                 cols: cols.max(1),
                 pixel_width: 0,
                 pixel_height: 0,
-            })?;
+            })?,
+            Master::Raw(fd) => set_winsize(fd.as_raw_fd(), rows.max(1), cols.max(1))?,
+        }
         self.terminal
             .lock()
             .map_err(|_| SessionError::Poisoned)?
@@ -320,6 +452,12 @@ impl Session {
     }
 
     pub fn kill(&self) -> Result<(), SessionError> {
+        // The waiter has already reaped a session that exited on its own, so
+        // its pid is free and may have been recycled. Never signal in that
+        // case; the process is gone and `-pid` could hit an unrelated group.
+        if self.exited() {
+            return Ok(());
+        }
         #[cfg(unix)]
         if let Some(process_id) = self.process_id {
             // forkpty makes the child a process-group/session leader. Signal
@@ -330,10 +468,17 @@ impl Session {
                 return Ok(());
             }
         }
-        self.killer
+        // Fall back to portable_pty's killer for spawned sessions whose group
+        // signal failed. Adopted sessions have no portable killer and rely
+        // solely on the pid path above.
+        if let Some(killer) = self
+            .killer
             .lock()
             .map_err(|_| SessionError::Poisoned)?
-            .kill()?;
+            .as_mut()
+        {
+            killer.kill()?;
+        }
         Ok(())
     }
 
@@ -360,8 +505,49 @@ impl Session {
         self.mark_dirty();
     }
 
+    pub fn set_transcript_path(&self, path: String) {
+        if let Ok(mut metadata) = self.metadata.write() {
+            metadata.transcript_path = path;
+        }
+    }
+
     pub fn exited(&self) -> bool {
         self.exited.load(Ordering::Acquire)
+    }
+
+    /// Whether the child exited deliberately (status 0, no signal). Only
+    /// meaningful once `exited()` is true.
+    pub fn exit_clean(&self) -> bool {
+        self.exit_clean.load(Ordering::Acquire)
+    }
+
+    /// The raw PTY master fd. The conductor clears CLOEXEC on it and hands it to
+    /// its `execve` successor so the session survives a hot-upgrade. Valid only
+    /// while this session is alive.
+    pub fn master_raw_fd(&self) -> Option<RawFd> {
+        match &*self.master.lock().ok()? {
+            Master::Portable(master) => master.as_raw_fd(),
+            Master::Raw(fd) => Some(fd.as_raw_fd()),
+        }
+    }
+
+    /// The child's pid, preserved verbatim across a hot-upgrade so the successor
+    /// can keep reaping it.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.process_id
+    }
+
+    /// Serializes the terminal state as replayable VT bytes so it can be carried
+    /// across a conductor hot-upgrade and fed into a fresh terminal.
+    pub fn vt_snapshot(&self) -> Option<Vec<u8>> {
+        self.terminal.lock().ok()?.snapshot_vt().ok()
+    }
+
+    /// Current PTY window size as `(rows, cols)`, read from the master fd. The
+    /// terminal and PTY are kept in lockstep by `resize`, so this is also the
+    /// terminal's size — the size a VT snapshot must be replayed into.
+    pub fn winsize(&self) -> Option<(u16, u16)> {
+        get_winsize(self.master_raw_fd()?)
     }
 
     pub fn snapshot(&self) -> SessionInfo {
@@ -390,6 +576,10 @@ impl Session {
             status_since_unix_ms: metadata
                 .as_ref()
                 .map(|value| value.status_since_unix_ms)
+                .unwrap_or_default(),
+            transcript_path: metadata
+                .as_ref()
+                .map(|value| value.transcript_path.clone())
                 .unwrap_or_default(),
         }
     }
@@ -464,6 +654,54 @@ fn unix_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Sets a PTY master's window size directly, for adopted sessions where there
+/// is no portable_pty handle to resize through.
+fn set_winsize(fd: RawFd, rows: u16, cols: u16) -> std::io::Result<()> {
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: fd is a live PTY master and `ws` is valid for the call.
+    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as _, &ws) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Reads a PTY master's window size as `(rows, cols)`.
+fn get_winsize(fd: RawFd) -> Option<(u16, u16)> {
+    // SAFETY: zeroed winsize is a valid initial value; fd is a live PTY master.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut ws) } == 0 {
+        Some((ws.ws_row, ws.ws_col))
+    } else {
+        None
+    }
+}
+
+/// Reaps an adopted child by pid and reports whether it exited cleanly (code 0,
+/// no terminating signal). `ECHILD` (already reaped, or not our child) counts as
+/// unclean so a mystery disappearance stays visible rather than auto-closing.
+fn waitpid_clean(pid: libc::pid_t) -> bool {
+    let mut status: libc::c_int = 0;
+    loop {
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if result == pid {
+            return libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+        }
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return false;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +724,81 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn adopt_reconstructs_a_live_session_from_a_surviving_fd() {
+        // Stand in for a hot-upgrade: build a PTY + child and a terminal with
+        // known content, snapshot the terminal to VT, then adopt a fresh session
+        // from a dup of the master fd + the child pid and confirm the screen and
+        // live I/O both survived.
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 4,
+                cols: 40,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let child = pair
+            .slave
+            .spawn_command(CommandBuilder::new("/bin/cat"))
+            .expect("spawn cat");
+        let pid = child.process_id().expect("pid");
+        drop(pair.slave);
+        std::mem::forget(child); // the adopted session's waiter reaps the pid.
+
+        let mut terminal =
+            Terminal::new(40, 4, DEFAULT_SCROLLBACK_LINES, |_| {}).expect("terminal");
+        terminal.feed(b"hello world");
+        let vt = terminal.snapshot_vt().expect("snapshot");
+
+        // Dup so the adopted session owns an fd independent of `pair.master`.
+        let dup = unsafe { libc::dup(pair.master.as_raw_fd().expect("raw fd")) };
+        assert!(dup >= 0, "dup failed");
+
+        let info = SessionInfo {
+            id: "adopted".to_owned(),
+            name: "restored".to_owned(),
+            argv: vec!["/bin/cat".to_owned()],
+            cwd: "/tmp".to_owned(),
+            status: Status::Working,
+            last_message: String::new(),
+            harness_session_id: "sess-keep".to_owned(),
+            exited: false,
+            status_since_unix_ms: 0,
+            transcript_path: String::new(),
+        };
+        let session = Session::adopt(info, dup, pid, 4, 40, &vt).expect("adopt");
+        drop(pair.master); // only the adopted session's dup remains.
+
+        // The replayed VT put "hello world" back on the screen, and metadata
+        // rode across the adopt.
+        let screen = session.extract_text((0, 0), (39, 3)).expect("extract");
+        assert!(
+            screen.contains("hello world"),
+            "restored screen: {screen:?}"
+        );
+        assert_eq!(session.snapshot().harness_session_id, "sess-keep");
+        assert_eq!(session.snapshot().name, "restored");
+
+        // Live I/O still works: cat echoes what we write through the adopted fd.
+        session.write_input(b"ping\n").expect("write");
+        let deadline = SystemTime::now() + Duration::from_secs(2);
+        loop {
+            let screen = session.extract_text((0, 0), (39, 3)).expect("extract");
+            if screen.contains("ping") {
+                break;
+            }
+            assert!(
+                SystemTime::now() < deadline,
+                "adopted session never echoed input: {screen:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        session.kill().expect("kill");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn kill_terminates_the_child_process_group() {
         let session = Session::spawn(
             "group-test".to_owned(),
@@ -497,6 +810,7 @@ mod tests {
             "/tmp".to_owned(),
             4,
             40,
+            crate::terminal_theme::TerminalTheme::default(),
         )
         .expect("spawn");
         let deadline = SystemTime::now() + Duration::from_secs(2);

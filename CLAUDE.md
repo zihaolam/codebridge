@@ -96,6 +96,28 @@ complete, yellow `●` for newly idle, cyan `…` for starting, red `⚑` for
 approval, and grey `✗` for ended. Toast and native notification transitions
 occur only when a previously observed session enters approval or turn-complete.
 
+Interrupting a Claude turn with Escape fires no hook, so a working session
+would otherwise spin forever. The TUI sends an `interrupt_check` stream message
+just before the Escape byte; the conductor confirms the interrupt against
+Claude's own transcript (`transcript_path`, captured from every hook payload)
+rather than guessing from the keystroke. It snapshots the transcript length
+first, then briefly polls for a `[Request interrupted by user]` marker in the
+bytes appended afterwards; only a fresh marker clears the spinner to
+`waiting_user`. This is positive-only and scans solely the newly appended
+bytes, so a still-running turn or a stale marker never produces a false
+turn-complete — the worst case is the unchanged (stuck) spinner. Codex is
+unaffected (it may already `Stop` on interrupt; untested).
+
+A session whose agent exits deliberately (`/exit`, a normal quit — exit code
+`0`, no signal) is auto-closed: the daemon reaps it exactly like an explicit
+`kill` (removed from the map, its run parked and resumable via `prefix h`), and
+the attached client advances to a neighbouring session. A session that crashes
+(non-zero exit or a terminating signal) is left in place with its grey `✗` row
+so the failure stays visible; it can still be killed or resumed. The waiter
+captures the child's exit status to make this distinction; `reap_exited_sessions`
+runs on every `list`/`watch` snapshot and never signals a reaped (possibly
+recycled) pid.
+
 ## Workspace and tasks
 
 The launch repo is the default flat scope. A repo's main checkout and linked

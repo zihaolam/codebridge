@@ -342,6 +342,65 @@ impl Terminal {
         Ok(text)
     }
 
+    /// Serializes the full terminal state — screen contents, scrollback,
+    /// cursor, SGR style, hyperlinks, palette, modes, scrolling region,
+    /// tabstops, pwd, and charsets — as replayable VT sequences. Feeding the
+    /// result into a fresh `Terminal` of the same size reconstructs the state
+    /// losslessly, so it can carry a session's screen across a conductor
+    /// hot-upgrade (execve) where in-memory emulator state does not survive.
+    ///
+    /// The formatter serializes the *active* screen. When the alternate screen
+    /// is in use, the alternate screen and its state are captured; the primary
+    /// screen hidden behind it is not, which is acceptable for full-screen
+    /// agents that own the alternate screen and redraw it.
+    pub fn snapshot_vt(&self) -> Result<Vec<u8>, TerminalError> {
+        let options = ffi::GhosttyFormatterTerminalOptions {
+            size: mem::size_of::<ffi::GhosttyFormatterTerminalOptions>(),
+            emit: ffi::GhosttyFormatterFormat_GHOSTTY_FORMATTER_FORMAT_VT,
+            unwrap: false,
+            trim: false,
+            extra: ffi::GhosttyFormatterTerminalExtra {
+                size: mem::size_of::<ffi::GhosttyFormatterTerminalExtra>(),
+                palette: true,
+                modes: true,
+                scrolling_region: true,
+                tabstops: true,
+                pwd: true,
+                keyboard: true,
+                screen: ffi::GhosttyFormatterScreenExtra {
+                    size: mem::size_of::<ffi::GhosttyFormatterScreenExtra>(),
+                    cursor: true,
+                    style: true,
+                    hyperlink: true,
+                    protection: true,
+                    kitty_keyboard: true,
+                    charsets: true,
+                },
+            },
+            selection: ptr::null(),
+        };
+        let mut formatter = ptr::null_mut();
+        result(unsafe {
+            ffi::ghostty_formatter_terminal_new(ptr::null(), &mut formatter, self.raw, options)
+        })?;
+        let mut output = ptr::null_mut();
+        let mut length = 0;
+        let code = unsafe {
+            ffi::ghostty_formatter_format_alloc(formatter, ptr::null(), &mut output, &mut length)
+        };
+        unsafe { ffi::ghostty_formatter_free(formatter) };
+        result(code)?;
+        let bytes = if length == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: on success the library allocated `length` bytes at `output`.
+            unsafe { slice::from_raw_parts(output.cast_const(), length) }.to_vec()
+        };
+        // SAFETY: frees the buffer the library allocated with the default allocator.
+        unsafe { ffi::ghostty_free(ptr::null(), output, length) };
+        Ok(bytes)
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), TerminalError> {
         // Cell pixel size is irrelevant to the terminal TUI renderer but must
         // be non-zero for XTWINOPS and pixel-coordinate invariants.
@@ -831,6 +890,67 @@ mod tests {
         assert_eq!(row_text(&terminal.render().unwrap(), 0), "alternate");
         terminal.feed(b"\x1b[?1049l");
         assert_eq!(row_text(&terminal.render().unwrap(), 0), "primary");
+    }
+
+    #[test]
+    fn vt_snapshot_round_trips_scrollback_and_styles() {
+        // Viewport of 3 rows with room for scrollback; feed more lines than fit
+        // so the earliest lines are pushed above the viewport into history.
+        let mut terminal = Terminal::new(10, 3, 100, |_| {}).expect("terminal");
+        for line in 0..9 {
+            terminal.feed(format!("line{line:02}\r\n").as_bytes());
+        }
+        // A styled run to confirm SGR state survives the round trip.
+        terminal.feed(b"\x1b[31mRED\x1b[0m");
+
+        let snapshot = terminal.snapshot_vt().expect("snapshot");
+        assert!(!snapshot.is_empty(), "snapshot produced no bytes");
+
+        let mut restored = Terminal::new(10, 3, 100, |_| {}).expect("restored");
+        restored.feed(&snapshot);
+
+        // The live viewport must match byte-for-cell, including styles.
+        let original_live = terminal.render().expect("original live");
+        let restored_live = restored.render().expect("restored live");
+        assert_eq!(
+            original_live.buffer, restored_live.buffer,
+            "live viewport (symbols + styles) survived the round trip"
+        );
+
+        // Scrollback above the viewport must be recoverable in the restored
+        // terminal — this is the zero-loss guarantee the design depends on.
+        terminal.set_scroll_row(0);
+        restored.set_scroll_row(0);
+        let original_top = terminal.render().expect("original top");
+        let restored_top = restored.render().expect("restored top");
+        assert_eq!(
+            original_top.buffer, restored_top.buffer,
+            "scrollback top row survived the round trip"
+        );
+        assert_eq!(
+            row_text(&restored_top, 0),
+            "line00",
+            "earliest scrollback line is present after restore"
+        );
+    }
+
+    #[test]
+    fn vt_snapshot_round_trips_alternate_screen() {
+        let mut terminal = Terminal::new(12, 3, 100, |_| {}).expect("terminal");
+        terminal.feed(b"primary");
+        // Full-screen agents live on the alternate screen; the snapshot must
+        // capture the alternate screen's contents and mode.
+        terminal.feed(b"\x1b[?1049h\x1b[H\x1b[32malt-content\x1b[0m");
+
+        let snapshot = terminal.snapshot_vt().expect("snapshot");
+        let mut restored = Terminal::new(12, 3, 100, |_| {}).expect("restored");
+        restored.feed(&snapshot);
+
+        assert_eq!(
+            terminal.render().expect("orig").buffer,
+            restored.render().expect("restored").buffer,
+            "alternate-screen contents survived the round trip"
+        );
     }
 
     #[test]
