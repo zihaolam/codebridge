@@ -86,7 +86,11 @@ export function b64(text: string): string {
   return btoa(bin)
 }
 
-const RETRY_MS = 2000
+// Reconnect backoff: start quick so a `cb restart` blip recovers almost
+// immediately, then back off exponentially (with jitter) up to a cap so a
+// genuinely-down bridge is not hammered. Reset to the base on a clean reconnect.
+const BASE_RETRY_MS = 500
+const MAX_RETRY_MS = 15_000
 
 export class CbClient {
   onState?: (s: ClientState) => void
@@ -105,6 +109,7 @@ export class CbClient {
   private stopped = false
   private attachedId: string | null = null
   private viewportSize: { rows: number; cols: number } | null = null
+  private retryMs = BASE_RETRY_MS
 
   constructor(token: string) {
     this.token = token
@@ -127,9 +132,13 @@ export class CbClient {
         return
       }
       this.onState?.('closed')
+      // ±30% jitter so multiple tabs don't reconnect in lockstep; advance the
+      // backoff toward the cap for the next attempt.
+      const delay = this.retryMs * (0.7 + Math.random() * 0.6)
+      this.retryMs = Math.min(this.retryMs * 2, MAX_RETRY_MS)
       setTimeout(() => {
         if (!this.stopped) this.connect()
-      }, RETRY_MS)
+      }, delay)
     }
   }
 
@@ -141,6 +150,8 @@ export class CbClient {
   private handle(m: Down) {
     switch (m.type) {
       case 'hello':
+        // A clean handshake resets the backoff so the next drop retries fast.
+        this.retryMs = BASE_RETRY_MS
         this.onState?.('open')
         this.onHello?.(m.protocol ?? 0, m.daemon ?? false)
         this.onAgents?.(m.agents ?? [])
