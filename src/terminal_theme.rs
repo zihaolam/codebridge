@@ -139,12 +139,16 @@ fn find_osc_terminator(text: &str) -> Option<usize> {
 fn parse_rgb_color(value: &str) -> Option<RgbColor> {
     if let Some(rgb) = value.strip_prefix("rgb:") {
         let mut parts = rgb.split('/');
-        return Some(RgbColor {
-            r: parse_hex_component(parts.next()?)?,
-            g: parse_hex_component(parts.next()?)?,
-            b: parse_hex_component(parts.next()?)?,
-        })
-        .filter(|_| parts.next().is_none());
+        // Consume exactly three components in order, then reject any trailing
+        // one. Kept as sequential lets (not `Some(..).filter(..)`) so the
+        // trailing-part check runs *after* r/g/b are parsed off `parts`.
+        let r = parse_hex_component(parts.next()?)?;
+        let g = parse_hex_component(parts.next()?)?;
+        let b = parse_hex_component(parts.next()?)?;
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some(RgbColor { r, g, b });
     }
 
     if let Some(hex) = value.strip_prefix('#') {
