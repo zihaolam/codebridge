@@ -814,6 +814,38 @@ mod tests {
     }
 
     #[test]
+    fn answers_default_background_query_with_the_configured_color() {
+        // The whole host-theme fix relies on this: after setting the default
+        // background via OSC 11, libghostty must answer an agent's OSC 11 `?`
+        // query with that color (not its own built-in default), so an agent like
+        // Codex derives a contrasting input-box shade.
+        let replies = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let captured = Arc::clone(&replies);
+        let mut terminal = Terminal::new(20, 4, 100, move |bytes| {
+            captured
+                .lock()
+                .expect("reply lock")
+                .extend_from_slice(bytes);
+        })
+        .expect("terminal");
+
+        terminal.feed(b"\x1b]11;rgb:2828/2a2a/3636\x1b\\");
+        terminal.feed(b"\x1b]11;?\x1b\\");
+
+        let reply = String::from_utf8_lossy(&replies.lock().expect("reply lock")).into_owned();
+        let (_, color) = crate::terminal_theme::parse_default_color_response(reply.trim_end())
+            .unwrap_or_else(|| panic!("no parseable OSC 11 reply: {reply:?}"));
+        assert_eq!(
+            color,
+            crate::terminal_theme::RgbColor {
+                r: 0x28,
+                g: 0x2a,
+                b: 0x36,
+            },
+        );
+    }
+
+    #[test]
     fn exposes_synchronized_output_mode_for_frame_suppression() {
         let mut terminal = Terminal::new(8, 3, 100, |_| {}).expect("terminal");
 

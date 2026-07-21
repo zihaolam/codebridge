@@ -31,6 +31,7 @@ use uuid::Uuid;
 use crate::protocol::{SessionInfo, Status, StreamDown, StreamUp, TerminalFrame};
 use crate::session::Session;
 use crate::terminal::MouseAction;
+use crate::terminal_theme::TerminalTheme;
 
 /// The conductor's wire protocol version. It is deliberately decoupled from the
 /// client-facing `protocol::VERSION`: the broker can be rebuilt and restarted
@@ -113,6 +114,13 @@ pub enum ConductorRequest {
     /// (clean or crash), so the broker can reap/park and refresh promptly instead
     /// of only on its polling cadence.
     WatchLifecycle,
+    /// Set the host terminal's default colors. Applied to every session's
+    /// embedded terminal so agents (e.g. Codex) answer their `OSC 10/11` color
+    /// query with the real host colors; retro-applied to running sessions and
+    /// used as the spawn seed for new ones.
+    SetHostTheme {
+        theme: TerminalTheme,
+    },
 }
 
 /// A conductor→broker lifecycle notification. It is a bare "something changed"
@@ -207,6 +215,10 @@ pub struct Conductor {
     /// Broker subscribers to lifecycle pokes. Each `WatchLifecycle` stream holds
     /// one sender; a per-session monitor pokes them when a session exits.
     event_subscribers: Mutex<Vec<mpsc::Sender<()>>>,
+    /// The host terminal's default colors, seeded into each session's terminal
+    /// so agents answer their color query with the real host colors. Empty until
+    /// a client detects and pushes them via `SetHostTheme`.
+    host_theme: Mutex<TerminalTheme>,
 }
 
 impl Conductor {
@@ -218,7 +230,20 @@ impl Conductor {
             shutdown: AtomicBool::new(false),
             boot_id: Uuid::new_v4().to_string(),
             event_subscribers: Mutex::new(Vec::new()),
+            host_theme: Mutex::new(TerminalTheme::default()),
         })
+    }
+
+    /// Records the host terminal's default colors and retro-applies them to every
+    /// running session, so agents answer their `OSC 10/11` color query with the
+    /// real host colors. New sessions pick the theme up at spawn.
+    pub fn set_host_theme(&self, theme: TerminalTheme) {
+        if let Ok(mut current) = self.host_theme.lock() {
+            *current = theme;
+        }
+        for session in self.all_sessions() {
+            session.apply_host_theme(&theme);
+        }
     }
 
     /// Registers a lifecycle subscriber, returning the receiver end. Each poke
@@ -283,17 +308,15 @@ impl Conductor {
         };
         let cwd_string = cwd.to_string_lossy().into_owned();
         let spawned_at = SystemTime::now();
-        // The host terminal theme is discovered client-side and applied later
-        // via `Session::apply_host_theme`; the conductor has no host terminal of
-        // its own, so it spawns with an empty theme.
-        match Session::spawn(
-            id.clone(),
-            argv,
-            cwd_string,
-            rows,
-            cols,
-            crate::terminal_theme::TerminalTheme::default(),
-        ) {
+        // Seed the new session with the latest host theme a client pushed, so
+        // the child's early `OSC 10/11` color query is answered with the host's
+        // real colors (empty until a client detects them, a graceful no-op).
+        let host_theme = self
+            .host_theme
+            .lock()
+            .map(|theme| *theme)
+            .unwrap_or_default();
+        match Session::spawn(id.clone(), argv, cwd_string, rows, cols, host_theme) {
             Ok(session) => {
                 Session::queue_prefill(&session, prefill);
                 if is_codex {
@@ -976,6 +999,13 @@ impl Conductor {
                 error: "watch_lifecycle must be the terminal request on a connection".to_owned(),
                 ..ConductorResponse::default()
             },
+            ConductorRequest::SetHostTheme { theme } => {
+                self.set_host_theme(theme);
+                ConductorResponse {
+                    ok: true,
+                    ..ConductorResponse::default()
+                }
+            }
         }
     }
 }
@@ -1098,6 +1128,8 @@ pub trait Engine: Send + Sync {
     /// park, and refresh promptly rather than only on its poll. `None` if this
     /// engine offers no push channel.
     fn lifecycle_events(&self) -> Option<mpsc::Receiver<()>>;
+    /// Set the host terminal's default colors for current and future sessions.
+    fn set_host_theme(&self, theme: TerminalTheme);
 }
 
 impl Engine for Arc<Conductor> {
@@ -1147,6 +1179,9 @@ impl Engine for Arc<Conductor> {
     fn lifecycle_events(&self) -> Option<mpsc::Receiver<()>> {
         Some(Conductor::subscribe_events(self))
     }
+    fn set_host_theme(&self, theme: TerminalTheme) {
+        Conductor::set_host_theme(self, theme)
+    }
 }
 
 /// A broker-side client for the conductor's socket. Control ops dial the socket
@@ -1155,11 +1190,18 @@ impl Engine for Arc<Conductor> {
 /// conductor socket.
 pub struct ConductorClient {
     socket: PathBuf,
+    /// The last host theme pushed, cached so the lifecycle forwarder can
+    /// re-apply it to a fresh conductor (e.g. after a `cb upgrade`, which resets
+    /// the conductor's theme to empty). Shared with that forwarder thread.
+    theme: Arc<Mutex<TerminalTheme>>,
 }
 
 impl ConductorClient {
     pub fn new(socket: PathBuf) -> Self {
-        Self { socket }
+        Self {
+            socket,
+            theme: Arc::new(Mutex::new(TerminalTheme::default())),
+        }
     }
 
     pub fn ping(&self) -> io::Result<ConductorResponse> {
@@ -1315,7 +1357,32 @@ impl Engine for ConductorClient {
         // events resume after a conductor hot-upgrade or a transient disconnect.
         let (sender, receiver) = mpsc::channel();
         let socket = self.socket.clone();
+        let theme = Arc::clone(&self.theme);
         thread::spawn(move || loop {
+            // On every (re)connect, re-apply the cached host theme so a fresh
+            // conductor (e.g. after `cb upgrade`, which starts with an empty
+            // theme) re-adopts it before new sessions spawn. Empty and skipped
+            // until a client has pushed one; idempotent on the same conductor.
+            let cached = theme.lock().map(|theme| *theme).unwrap_or_default();
+            if !cached.is_empty() {
+                if let Ok(mut control) = UnixStream::connect(&socket) {
+                    let sent = serde_json::to_writer(
+                        &mut control,
+                        &ConductorRequest::SetHostTheme { theme: cached },
+                    )
+                    .is_ok()
+                        && control.write_all(b"\n").is_ok()
+                        && control.flush().is_ok();
+                    // Read the ack so the conductor stores the theme before this
+                    // connection closes; a fire-and-forget write can race the
+                    // close and be dropped before it is processed.
+                    if sent {
+                        let _ = control.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut ack = String::new();
+                        let _ = BufReader::new(&control).read_line(&mut ack);
+                    }
+                }
+            }
             if let Ok(mut stream) = UnixStream::connect(&socket) {
                 let subscribed =
                     serde_json::to_writer(&mut stream, &ConductorRequest::WatchLifecycle).is_ok()
@@ -1338,6 +1405,13 @@ impl Engine for ConductorClient {
             thread::sleep(Duration::from_millis(500));
         });
         Some(receiver)
+    }
+
+    fn set_host_theme(&self, theme: TerminalTheme) {
+        if let Ok(mut cached) = self.theme.lock() {
+            *cached = theme;
+        }
+        let _ = self.call(&ConductorRequest::SetHostTheme { theme });
     }
 }
 

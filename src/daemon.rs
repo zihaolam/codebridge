@@ -184,6 +184,16 @@ impl Daemon {
             "kill" => self.kill(&request.id),
             "rename" => self.rename(&request.id, request.name),
             "extract" => self.extract(request),
+            "set_host_theme" => {
+                // Forward the host terminal's default colors to the conductor so
+                // sessions answer agents' OSC 10/11 query with the real colors.
+                let theme = serde_json::from_value(request.payload).unwrap_or_default();
+                self.conductor.set_host_theme(theme);
+                Response {
+                    ok: true,
+                    ..Response::default()
+                }
+            }
             kind if kind.starts_with("task_") => self.task_dispatch(request),
             "hook" => self.hook(request),
             "shutdown" => {

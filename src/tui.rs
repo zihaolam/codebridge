@@ -240,6 +240,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         EnableFocusChange,
         EnableMouseCapture
     )?;
+    // Detect the host terminal's default colors (now that raw mode is on) and
+    // push them to the daemon, so each session answers an agent's OSC 10/11
+    // color query with the real host colors — fixing e.g. Codex's invisible
+    // input-box background. A no-op if the terminal does not reply in time.
+    let host_theme = detect_host_theme(&mut stdout);
+    if !host_theme.is_empty() {
+        let _ = request(Request {
+            kind: "set_host_theme".to_owned(),
+            payload: serde_json::to_value(host_theme).unwrap_or_default(),
+            ..Request::default()
+        });
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -2113,6 +2125,58 @@ fn request(value: Request) -> io::Result<Response> {
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
     serde_json::from_str(&line).map_err(io::Error::other)
+}
+
+/// Queries the host terminal for its default foreground/background colors and
+/// reads the `OSC 10/11` replies straight off fd 0 under a short deadline. Must
+/// run in raw mode and before the crossterm event loop starts consuming stdin.
+/// Returns an empty theme if the terminal does not reply (common — many do not),
+/// which the caller treats as a graceful no-op.
+fn detect_host_theme(stdout: &mut impl Write) -> crate::terminal_theme::TerminalTheme {
+    use crate::terminal_theme::{absorb_color_responses, TerminalTheme, HOST_COLOR_QUERY_SEQUENCE};
+
+    let mut theme = TerminalTheme::default();
+    if stdout
+        .write_all(HOST_COLOR_QUERY_SEQUENCE.as_bytes())
+        .and_then(|()| stdout.flush())
+        .is_err()
+    {
+        return theme;
+    }
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 256];
+    while theme.foreground.is_none() || theme.background.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut poll_fd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: polling a single fd with a valid pollfd pointer.
+        if unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) } <= 0 {
+            break; // timeout or error — stop and keep whatever we have
+        }
+        // SAFETY: reading into a buffer we own; `n` bounds the initialized range.
+        let n = unsafe {
+            libc::read(
+                libc::STDIN_FILENO,
+                chunk.as_mut_ptr() as *mut libc::c_void,
+                chunk.len(),
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..n as usize]);
+        let consumed = absorb_color_responses(&buffer, &mut theme);
+        buffer.drain(..consumed);
+    }
+    theme
 }
 
 struct View {
