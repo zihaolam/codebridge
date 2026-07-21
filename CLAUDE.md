@@ -138,7 +138,10 @@ Hooks are no-op observers; never scrape terminal text for status.
 Sidebar indicators are a green spinner for working, green `●` for turn
 complete, yellow `●` for newly idle, cyan `…` for starting, red `⚑` for
 approval, and grey `✗` for ended. Toast and native notification transitions
-occur only when a previously observed session enters approval or turn-complete.
+occur only when a previously observed session enters approval or turn-complete,
+and only for sessions in the launch workspace scope unless the accordion (global
+view, `prefix a`) is on. Status tracking stays unconditional, so a transition
+dropped as out-of-scope never misfires once the accordion is later toggled on.
 
 Interrupting a Claude turn with Escape fires no hook, so a working session
 would otherwise spin forever. The TUI sends an `interrupt_check` stream message
@@ -154,7 +157,7 @@ unaffected (it may already `Stop` on interrupt; untested).
 
 A session whose agent exits deliberately (`/exit`, a normal quit — exit code
 `0`, no signal) is auto-closed: the daemon reaps it exactly like an explicit
-`kill` (removed from the map, its run parked and resumable via `prefix h`), and
+`kill` (removed from the map, its run parked and resumable via `prefix m`), and
 the attached client advances to a neighbouring session. A session that crashes
 (non-zero exit or a terminating signal) is left in place with its grey `✗` row
 so the failure stays visible; it can still be killed or resumed. The waiter
@@ -181,10 +184,12 @@ run, so any killed session stays resumable without keeping its process resident.
 Killing frees the process group and immediately parks the run as paused,
 capturing the agent-native resume id off the session first. The run's
 `first_message` is captured from the first `UserPromptSubmit` hook (or seeded
-from a task prefill). Prefix `h` (`session_history`) opens a scope-filtered
-picker of paused runs labelled by first message; entering one runs the native
-resume in a fresh PTY. Auto tasks are hidden from the backlog and surfaced only
-in that picker.
+from a task prefill). Prefix `m` (`session_history`) opens a scope-filtered
+picker of every session in the workspace labelled by first message — both live
+runs and paused ones. Entering a paused run runs the native resume in a fresh
+PTY; entering a live run jumps to the already-running session (resuming it would
+spawn a duplicate). Auto tasks are hidden from the backlog and surfaced only in
+that picker.
 
 ## Hard-won invariants
 

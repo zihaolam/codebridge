@@ -81,7 +81,7 @@ pub const ACTIONS: &[Action] = &[
     Action {
         id: "session_history",
         label: "resume past session",
-        default: "h",
+        default: "m",
     },
     Action {
         id: "config",

@@ -164,14 +164,18 @@ struct HistoryModal {
     cursor: usize,
 }
 
-/// One resumable past session, flattened from a task run for the historical
-/// picker. `first_message` is the human-readable label.
+/// One session surfaced by the historical picker, flattened from a task run.
+/// `first_message` is the human-readable label. A `live` run is currently
+/// running — selecting it jumps to that session by `cb_session_id`; otherwise
+/// the run is paused and resumable via its agent-native identity.
 struct HistoryEntry {
     task_id: String,
     run_id: String,
     agent: String,
     first_message: String,
     auto: bool,
+    live: bool,
+    cb_session_id: String,
     updated_at: OffsetDateTime,
 }
 
@@ -197,6 +201,11 @@ struct Model {
     palette: Palette,
     config_menu: Option<ConfigMenu>,
     selection: Option<Selection>,
+    /// Time and cell of the last left-button press, for double-click detection.
+    last_click: Option<(Instant, u16, u16)>,
+    /// A double-click selected a word; the following button-up copies without
+    /// letting the drag handler collapse the word back to the clicked cell.
+    word_selecting: bool,
     tasks: Vec<Task>,
     task_modal: Option<TaskModal>,
     history_modal: Option<HistoryModal>,
@@ -284,6 +293,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         palette,
         config_menu: None,
         selection: None,
+        last_click: None,
+        word_selecting: false,
         tasks: Vec::new(),
         history_modal: None,
         task_modal: None,
@@ -539,6 +550,13 @@ fn detect_transitions(model: &mut Model, sessions: &[SessionInfo]) {
             .find(|session| session.id == *id)
             .is_some_and(|session| session.status == pending.toast.status)
     });
+    // Notify only for the launch workspace unless the accordion (global view) is
+    // on. Both are stable across snapshots, so reading them before the sidebar
+    // update below is safe. `transition_toasts` still records every session's new
+    // status unconditionally, so an out-of-scope transition we drop here cannot
+    // misfire once the accordion is later toggled on.
+    let accordion = model.sidebar.accordion();
+    let current_scope = model.sidebar.current_scope().to_owned();
     let transitions = transition_toasts(&mut model.previous_status, sessions);
     for toast in transitions {
         let allowed = match toast.status {
@@ -547,6 +565,13 @@ fn detect_transitions(model: &mut Model, sessions: &[SessionInfo]) {
             _ => false,
         };
         if !allowed {
+            continue;
+        }
+        let cwd = sessions
+            .iter()
+            .find(|session| session.id == toast.session_id)
+            .map(|session| session.cwd.as_str());
+        if !toast_in_scope(accordion, &current_scope, cwd) {
             continue;
         }
         let delay = Duration::from_secs(model.config.notifications.bounded_delay_seconds());
@@ -611,6 +636,14 @@ fn deliver_notification(model: &mut Model, toast: Toast) {
         let (title, body) = notification_text(model, &toast);
         crate::notify::send(delivery, &title, &body);
     }
+}
+
+/// Whether a session's transition should notify given the current view. In the
+/// default flat view only the launch workspace notifies; the accordion (global
+/// view, `prefix a`) opts into cross-workspace notifications. A session with no
+/// known cwd (already gone from the snapshot) never notifies when scoped.
+fn toast_in_scope(accordion: bool, current_scope: &str, session_cwd: Option<&str>) -> bool {
+    accordion || session_cwd.is_some_and(|cwd| crate::sidebar::scope_key(cwd) == current_scope)
 }
 
 fn notification_channels(
@@ -792,9 +825,9 @@ fn handle_key(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
 
 fn handle_prefix(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
     match key.code {
-        // `Left` still focuses the sidebar; `h` falls through to the action
-        // table so it can drive `session_history` (or any user rebinding).
-        KeyCode::Left => {
+        // `Left` and `h` focus the sidebar; both are reserved keys (see
+        // `reserved_binding`) so no action ever rebinds over them.
+        KeyCode::Left | KeyCode::Char('h') => {
             model.focus = Focus::Sidebar;
             return Ok(false);
         }
@@ -1484,9 +1517,10 @@ fn apply_task_response(model: &mut Model, response: Response) {
     }
 }
 
-/// Paused (resumable) runs in the current workspace scope, most recent first.
-/// These are the "historical sessions" surfaced by the `session_history`
-/// action — both ad-hoc auto sessions and paused task runs.
+/// Every session in the current workspace scope, most recent first — both live
+/// (running) runs and paused, resumable ones. These are the sessions surfaced
+/// by the `session_history` action, covering ad-hoc auto sessions and task
+/// runs. Pending runs carry no session and never appear.
 fn history_entries(model: &Model) -> Vec<HistoryEntry> {
     let scope = model.sidebar.current_scope();
     let mut entries: Vec<HistoryEntry> = model
@@ -1496,13 +1530,15 @@ fn history_entries(model: &Model) -> Vec<HistoryEntry> {
         .flat_map(|task| {
             task.runs
                 .iter()
-                .filter(|run| run.status == TaskStatus::Paused)
+                .filter(|run| matches!(run.status, TaskStatus::InProgress | TaskStatus::Paused))
                 .map(|run| HistoryEntry {
                     task_id: task.id.clone(),
                     run_id: run.id.clone(),
                     agent: run.agent.clone(),
                     first_message: run.first_message.clone(),
                     auto: task.auto,
+                    live: run.status == TaskStatus::InProgress,
+                    cb_session_id: run.cb_session_id.clone(),
                     updated_at: run.updated_at,
                 })
         })
@@ -1529,23 +1565,33 @@ fn handle_history_modal(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
         }
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
             if let Some(entry) = entries.get(modal.cursor) {
-                let response = request(Request {
-                    kind: "task_resume".to_owned(),
-                    id: entry.task_id.clone(),
-                    run_id: entry.run_id.clone(),
-                    cwd: model.launch_cwd.display().to_string(),
-                    rows: model.pane.height,
-                    cols: model.pane.width,
-                    ..Request::default()
-                })?;
-                apply_task_response(model, response);
+                if entry.live {
+                    // A running session is already in the sidebar; resuming it
+                    // would spawn a duplicate, so jump to the live one instead.
+                    jump_to_session(model, &entry.cb_session_id);
+                } else {
+                    let response = request(Request {
+                        kind: "task_resume".to_owned(),
+                        id: entry.task_id.clone(),
+                        run_id: entry.run_id.clone(),
+                        cwd: model.launch_cwd.display().to_string(),
+                        rows: model.pane.height,
+                        cols: model.pane.width,
+                        ..Request::default()
+                    })?;
+                    apply_task_response(model, response);
+                }
                 keep_open = false;
             }
         }
         KeyCode::Char('x') => {
-            // Only auto sessions are deletable here; real backlog tasks are
-            // managed from the task modal, so leave those untouched.
-            if let Some(entry) = entries.get(modal.cursor).filter(|entry| entry.auto) {
+            // Only paused auto sessions are deletable here; live sessions must
+            // be killed first, and real backlog tasks are managed from the task
+            // modal, so leave both untouched.
+            if let Some(entry) = entries
+                .get(modal.cursor)
+                .filter(|entry| entry.auto && !entry.live)
+            {
                 let response = request(Request {
                     kind: "task_delete".to_owned(),
                     id: entry.task_id.clone(),
@@ -1877,6 +1923,15 @@ fn handle_mouse(model: &mut Model, mouse: MouseEvent) -> io::Result<()> {
             let Some(session_id) = model.attach.as_ref().map(|attach| attach.id.clone()) else {
                 return Ok(());
             };
+            let double = model.last_click.take().is_some_and(|(at, col, row)| {
+                col == mouse.column && row == mouse.row && at.elapsed() <= DOUBLE_CLICK
+            });
+            if double && select_word(model, &session_id, mouse.column, mouse.row) {
+                model.word_selecting = true;
+                return Ok(());
+            }
+            model.word_selecting = false;
+            model.last_click = Some((Instant::now(), mouse.column, mouse.row));
             if let Some(point) = selection_point(model, mouse.column, mouse.row) {
                 model.selection = Some(Selection {
                     session_id,
@@ -1887,10 +1942,13 @@ fn handle_mouse(model: &mut Model, mouse: MouseEvent) -> io::Result<()> {
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            model.word_selecting = false;
             update_selection_drag(model, mouse.column, mouse.row)?;
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            update_selection_drag(model, mouse.column, mouse.row)?;
+            if !std::mem::take(&mut model.word_selecting) {
+                update_selection_drag(model, mouse.column, mouse.row)?;
+            }
             copy_selection(model)?;
         }
         _ => {}
@@ -1954,7 +2012,10 @@ fn mouse_button(button: MouseButton) -> u8 {
 /// clicks always match what is drawn.
 const TOAST_MAX_WIDTH: u16 = 46;
 const TOAST_HEIGHT: u16 = 3;
-const TOAST_GAP: u16 = 1;
+// Stack toast cards flush against each other: a terminal cell is far taller
+// than the few-pixel gap we want, so the tightest look is zero blank rows,
+// letting each card's own border draw the thin seam between them.
+const TOAST_GAP: u16 = 0;
 const TOAST_MARGIN_X: u16 = 2;
 const TOAST_MARGIN_Y: u16 = 1;
 const TOAST_VISIBLE: usize = 5;
@@ -2033,6 +2094,93 @@ fn update_selection_drag(model: &mut Model, column: u16, row: u16) -> io::Result
         selection.dragging |= selection.cursor != selection.anchor;
     }
     Ok(())
+}
+
+/// A second left-press on the same cell within this window is a double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// The three cell categories a double-click extends over: a word grows over
+/// word chars, whitespace over blanks, and any other run (e.g. `->`, `===`)
+/// over its own punctuation. Matching iTerm's default, paths and flags stay
+/// whole by treating `_-./+~` as word characters.
+#[derive(Debug, PartialEq, Eq)]
+enum CharClass {
+    Word,
+    Space,
+    Other,
+}
+
+fn char_class(symbol: &str) -> CharClass {
+    let mut chars = symbol.chars();
+    match (chars.next(), chars.next()) {
+        // A blank or empty cell counts as whitespace.
+        (None, _) => CharClass::Space,
+        // A multi-codepoint grapheme (emoji, combined glyph) is one word cell.
+        (Some(_), Some(_)) => CharClass::Word,
+        (Some(c), None) => {
+            if c.is_whitespace() {
+                CharClass::Space
+            } else if c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '+' | '~') {
+                CharClass::Word
+            } else {
+                CharClass::Other
+            }
+        }
+    }
+}
+
+/// The inclusive `[start, end]` cell range of the same-class run around `x`,
+/// or `None` when the cell is blank (double-clicking whitespace selects
+/// nothing). Word and other-punctuation runs both extend over their own class.
+fn word_run(classes: &[CharClass], x: usize) -> Option<(usize, usize)> {
+    let target = classes.get(x)?;
+    if *target == CharClass::Space {
+        return None;
+    }
+    let mut start = x;
+    while start > 0 && classes[start - 1] == *target {
+        start -= 1;
+    }
+    let mut end = x;
+    while end + 1 < classes.len() && classes[end + 1] == *target {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+/// Select the run of same-class cells under a double-click, reading the word
+/// straight off the visible frame. Returns whether a word (not blank) was
+/// selected — a double-click on whitespace makes no selection.
+fn select_word(model: &mut Model, session_id: &str, column: u16, row: u16) -> bool {
+    let Some(frame) = model.frame.as_ref() else {
+        return false;
+    };
+    let cols = usize::from(frame.cols);
+    if cols == 0 {
+        return false;
+    }
+    let x = usize::from(column.saturating_sub(model.pane.x));
+    let y = usize::from(row.saturating_sub(model.pane.y));
+    if x >= cols || y >= usize::from(frame.rows) {
+        return false;
+    }
+    let Some(cells) = frame.cells.get(y * cols..y * cols + cols) else {
+        return false;
+    };
+    let classes: Vec<CharClass> = cells.iter().map(|cell| char_class(&cell.symbol)).collect();
+    let Some((start, end)) = word_run(&classes, x) else {
+        return false;
+    };
+    let Some((line, _)) = selection_point(model, column, row) else {
+        return false;
+    };
+    model.selection = Some(Selection {
+        session_id: session_id.to_owned(),
+        anchor: (line, start as u16),
+        cursor: (line, end as u16),
+        dragging: true,
+    });
+    true
 }
 
 fn selection_point(model: &Model, column: u16, row: u16) -> Option<(u32, u16)> {
@@ -2238,7 +2386,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
         let mut lines = Vec::new();
         if entries.is_empty() {
             lines.push(Line::styled(
-                "no past sessions in this workspace",
+                "no sessions in this workspace",
                 Style::default().fg(model.palette.overlay0),
             ));
         }
@@ -2251,11 +2399,19 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
             } else {
                 label.chars().take(64).collect()
             };
+            // A live session shows the working glyph; a paused one the parked
+            // glyph, matching the task modal's vocabulary.
+            let (glyph, glyph_color) = if entry.live {
+                ('●', model.palette.green)
+            } else {
+                ('‖', model.palette.yellow)
+            };
             lines.push(Line::from(vec![
                 Span::styled(
                     if selected { "▌ " } else { "  " },
                     Style::default().fg(model.palette.accent),
                 ),
+                Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
                 Span::styled(
                     format!("{:<8} ", entry.agent),
                     Style::default().fg(model.palette.overlay1),
@@ -2264,7 +2420,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
             ]));
         }
         lines.push(Line::styled(
-            "enter resume · x delete · esc close",
+            "enter open/resume · x delete · esc close",
             Style::default().fg(model.palette.overlay0),
         ));
         let title = format!(
@@ -3285,6 +3441,12 @@ fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
             _ => {}
         }
     }
+    // A Cmd/Super-modified character (Cmd+C, Cmd+V, Cmd+A, …) is a host- or
+    // terminal-level shortcut, never literal text. Swallow it so the bare
+    // character can't leak into the agent's input box.
+    if super_key && matches!(key.code, KeyCode::Char(_)) {
+        return None;
+    }
     if let Some(parameter) = xterm_modifier_parameter(key.modifiers) {
         let sequence = match key.code {
             KeyCode::Up => Some(format!("\x1b[1;{parameter}A")),
@@ -3403,6 +3565,16 @@ mod tests {
         assert_eq!(
             encode_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL)),
             Some(vec![0x1d])
+        );
+        // Cmd/Super shortcuts must never leak their bare character into the
+        // agent PTY (e.g. Cmd+C appending "c" while copying a selection).
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER)),
+            None
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER)),
+            None
         );
     }
 
@@ -3527,6 +3699,26 @@ mod tests {
     }
 
     #[test]
+    fn toasts_scoped_to_current_workspace_unless_accordion() {
+        let here = crate::sidebar::scope_key("/tmp");
+        let elsewhere = crate::sidebar::scope_key("/");
+        assert_ne!(
+            here, elsewhere,
+            "test paths must resolve to distinct scopes"
+        );
+
+        // Flat view: only the current workspace notifies.
+        assert!(toast_in_scope(false, &here, Some("/tmp")));
+        assert!(!toast_in_scope(false, &here, Some("/")));
+        // A session already gone from the snapshot has no cwd and never notifies.
+        assert!(!toast_in_scope(false, &here, None));
+
+        // Accordion (global view) notifies regardless of scope.
+        assert!(toast_in_scope(true, &here, Some("/")));
+        assert!(toast_in_scope(true, &here, None));
+    }
+
+    #[test]
     fn selection_uses_absolute_rows_and_reading_order() {
         let selection = Selection {
             session_id: "session".to_owned(),
@@ -3540,5 +3732,43 @@ mod tests {
         assert!(selection.contains(12, 8));
         assert!(!selection.contains(10, 3));
         assert!(!selection.contains(12, 9));
+    }
+
+    #[test]
+    fn char_class_keeps_path_and_flag_chars_in_words() {
+        assert_eq!(char_class("a"), CharClass::Word);
+        assert_eq!(char_class("7"), CharClass::Word);
+        assert_eq!(char_class("_"), CharClass::Word);
+        assert_eq!(char_class("-"), CharClass::Word);
+        assert_eq!(char_class("."), CharClass::Word);
+        assert_eq!(char_class("/"), CharClass::Word);
+        assert_eq!(char_class(" "), CharClass::Space);
+        assert_eq!(char_class(""), CharClass::Space);
+        assert_eq!(char_class("="), CharClass::Other);
+        assert_eq!(char_class(">"), CharClass::Other);
+        // A multi-codepoint grapheme is treated as one word cell.
+        assert_eq!(char_class("👍🏽"), CharClass::Word);
+    }
+
+    fn classes(row: &str) -> Vec<CharClass> {
+        row.chars().map(|c| char_class(&c.to_string())).collect()
+    }
+
+    #[test]
+    fn word_run_extends_over_same_class() {
+        // "cd src/main.rs" — path chars stay one word.
+        let row = classes("cd src/main.rs");
+        assert_eq!(word_run(&row, 0), Some((0, 1))); // "cd"
+        assert_eq!(word_run(&row, 5), Some((3, 13))); // "src/main.rs"
+        assert_eq!(word_run(&row, 13), Some((3, 13))); // last char of the path
+        assert_eq!(word_run(&row, 2), None); // the space
+
+        // A run of the same "other" punctuation selects together.
+        let arrow = classes("a => b");
+        assert_eq!(word_run(&arrow, 2), Some((2, 3))); // "=>"
+
+        // Single-cell word at the very end.
+        let tail = classes("go");
+        assert_eq!(word_run(&tail, 1), Some((0, 1)));
     }
 }
