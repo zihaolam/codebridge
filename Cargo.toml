@@ -1,6 +1,6 @@
 [package]
 name = "codebridge"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 build = "build.rs"
 description = "An agent-session multiplexer and manager"

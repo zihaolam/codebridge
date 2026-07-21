@@ -590,6 +590,16 @@ impl Daemon {
         } else {
             run.cwd.clone()
         };
+        // The origin directory can be gone by resume time — most often a deleted
+        // worktree. Spawning there would fail deep in the PTY layer with a cryptic
+        // "No such file or directory"; surface a resume-specific error instead so
+        // the paused run stays intact and the user knows why.
+        if !cwd.is_empty() && !Path::new(&cwd).is_dir() {
+            return Response {
+                error: format!("cannot resume: directory no longer exists: {cwd}"),
+                ..Response::default()
+            };
+        }
         let session_id =
             match self
                 .conductor
