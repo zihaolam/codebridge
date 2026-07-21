@@ -179,14 +179,17 @@ reuses a selected paused run and the agent-native resume identity. Claude uses
 OpenCode uses `--continue`. Prefill is queued until the first hook or a bounded
 fallback timer.
 
-Spawning a known agent auto-records the session as an `auto` task carrying one
-run, so any killed session stays resumable without keeping its process resident.
-Killing frees the process group and immediately parks the run as paused,
-capturing the agent-native resume id off the session first. The run's
-`first_message` is captured from the first `UserPromptSubmit` hook (or seeded
-from a task prefill). Prefix `m` (`session_history`) opens a scope-filtered
-picker of every session in the workspace labelled by first message — both live
-runs and paused ones. Entering a paused run runs the native resume in a fresh
+Spawning a known agent does not record it immediately; the session is
+auto-recorded as an `auto` task carrying one run only on its first user turn
+(the first `UserPromptSubmit` hook, via `ensure_auto_session`), so an untouched
+spawn never clutters the picker and a session killed before any prompt leaves no
+record (there is nothing to resume). Once recorded, any killed session stays
+resumable without keeping its process resident. Killing frees the process group
+and immediately parks the run as paused, capturing the agent-native resume id
+off the session first. The run's `first_message` is captured from that same
+first `UserPromptSubmit` hook (or seeded from a task prefill). Prefix `m`
+(`session_history`) opens a scope-filtered picker of every session in the
+workspace labelled by first message — both live runs and paused ones. Entering a paused run runs the native resume in a fresh
 PTY; entering a live run jumps to the already-running session (resuming it would
 spawn a duplicate). Auto tasks are hidden from the backlog and surfaced only in
 that picker.

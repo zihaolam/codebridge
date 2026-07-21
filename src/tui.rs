@@ -312,6 +312,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let size = terminal.size()?;
         compute_view(&mut model, Rect::new(0, 0, size.width, size.height));
         sync_attach(&mut model, sender.clone())?;
+        // Focusing a session's screen clears any toast still standing for it,
+        // however focus arrived — keyboard, a click into the pane, or a jump.
+        // Run it here (after `sync_attach` reconciles `attach` with the current
+        // selection) rather than only after a keypress, so it always targets the
+        // session actually on screen and never a stale attachment.
+        if model.focus == Focus::Screen {
+            dismiss_attached_toast(&mut model);
+        }
         terminal.draw(|frame| render(&model, frame))?;
         if model.pane != previous_pane {
             resize_attached(&mut model)?;
@@ -324,9 +332,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                     let quit = handle_key(&mut model, key)?;
-                    if model.focus == Focus::Screen {
-                        dismiss_attached_toast(&mut model);
-                    }
                     if quit {
                         break;
                     }
@@ -855,7 +860,6 @@ fn handle_prefix(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
         Some("jump_pending") => {
             if model.sidebar.jump_to_attention().is_some() {
                 model.focus = Focus::Screen;
-                dismiss_attached_toast(model);
             }
         }
         Some("rename") => {
@@ -1514,6 +1518,33 @@ fn apply_task_response(model: &mut Model, response: Response) {
         }
     } else {
         model.error = response.error;
+    }
+}
+
+/// A compact "time ago" label (`now`, `5m`, `2h`, `3d`, `1w`, `4M`, `2y`) for a
+/// past instant, capped at the largest whole unit so a row stays short.
+fn relative_time(then: OffsetDateTime) -> String {
+    let secs = (OffsetDateTime::now_utc() - then).whole_seconds().max(0);
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+    const MONTH: i64 = 30 * DAY;
+    const YEAR: i64 = 365 * DAY;
+    if secs < MINUTE {
+        "now".to_owned()
+    } else if secs < HOUR {
+        format!("{}m", secs / MINUTE)
+    } else if secs < DAY {
+        format!("{}h", secs / HOUR)
+    } else if secs < WEEK {
+        format!("{}d", secs / DAY)
+    } else if secs < MONTH {
+        format!("{}w", secs / WEEK)
+    } else if secs < YEAR {
+        format!("{}M", secs / MONTH)
+    } else {
+        format!("{}y", secs / YEAR)
     }
 }
 
@@ -2415,6 +2446,10 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 Span::styled(
                     format!("{:<8} ", entry.agent),
                     Style::default().fg(model.palette.overlay1),
+                ),
+                Span::styled(
+                    format!("{:>4} ", relative_time(entry.updated_at)),
+                    Style::default().fg(model.palette.overlay0),
                 ),
                 Span::raw(label),
             ]));

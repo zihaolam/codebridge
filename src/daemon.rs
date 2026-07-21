@@ -211,19 +211,11 @@ impl Daemon {
         }
     }
 
-    /// Spawns a session and, when it launches a known agent, records it as an
-    /// auto task so it can later be listed and resumed from the historical
-    /// picker. `task_start`/`task_resume` bypass this by calling
-    /// `spawn_session` directly, since they manage their own runs.
+    /// Spawns a session. A known-agent session is not recorded as an auto task
+    /// here; that happens lazily on its first user turn (see `ensure_auto_session`)
+    /// so an untouched spawn never clutters the historical picker.
+    /// `task_start`/`task_resume` manage their own runs and are unaffected.
     fn spawn(&self, request: Request) -> Response {
-        let agent = agent_name(&request.argv);
-        let cwd = if request.cwd.is_empty() {
-            std::env::current_dir()
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        } else {
-            request.cwd.clone()
-        };
         match self.conductor.spawn_session(
             request.argv,
             request.cwd,
@@ -232,13 +224,6 @@ impl Daemon {
             request.prefill,
         ) {
             Ok(id) => {
-                if let Some(agent) = agent {
-                    let scope = crate::sidebar::scope_key(&cwd);
-                    if let Ok(mut tasks) = self.tasks.lock() {
-                        tasks.add_auto_session(scope, agent.to_owned(), cwd, id.clone());
-                        let _ = tasks.save();
-                    }
-                }
                 self.notify_watchers();
                 Response {
                     ok: true,
@@ -251,6 +236,39 @@ impl Daemon {
                 ..Response::default()
             },
         }
+    }
+
+    /// Records an ad-hoc spawn as an auto task the first time it takes a user
+    /// turn, unless a run is already bound to it (a `task_start`/`task_resume`
+    /// session, or one already recorded). The agent and cwd are recovered from
+    /// the live session; only known agents are recorded, since resume depends on
+    /// the agent's own `--resume`/`resume`, matching the spawn-time contract.
+    fn ensure_auto_session(&self, session_id: &str) {
+        let Some(info) = self
+            .conductor
+            .snapshot()
+            .into_iter()
+            .find(|session| session.id == session_id)
+        else {
+            return;
+        };
+        let Some(agent) = agent_name(&info.argv) else {
+            return;
+        };
+        let scope = crate::sidebar::scope_key(&info.cwd);
+        let Ok(mut tasks) = self.tasks.lock() else {
+            return;
+        };
+        if tasks
+            .tasks()
+            .iter()
+            .flat_map(|task| &task.runs)
+            .any(|run| run.cb_session_id == session_id)
+        {
+            return;
+        }
+        tasks.add_auto_session(scope, agent.to_owned(), info.cwd, session_id.to_owned());
+        let _ = tasks.save();
     }
 
     fn kill(&self, id: &str) -> Response {
@@ -746,6 +764,16 @@ impl Daemon {
                 ..Response::default()
             };
         }
+        // The first real user turn is what promotes an ad-hoc spawn into a
+        // recorded, resumable auto session — so the historical picker lists only
+        // sessions the user actually prompted. A no-op once a run is bound.
+        if first_message
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|message| !message.is_empty())
+        {
+            self.ensure_auto_session(&request.session);
+        }
         // Task-store side (broker-owned): fold the harness id and first message
         // into the bound run.
         if harness_id.is_some() || first_message.is_some() {
@@ -1043,6 +1071,24 @@ mod tests {
         });
         assert!(spawned.ok);
 
+        // An untouched spawn is not yet recorded — the historical picker lists
+        // only sessions that took a user turn.
+        let before = daemon.dispatch(Request {
+            kind: "task_list".to_owned(),
+            ..Request::default()
+        });
+        assert!(before.tasks.is_empty());
+
+        // The first user turn promotes it into a recorded auto session and
+        // delivers the agent-native resume id and first prompt.
+        daemon.dispatch(Request {
+            kind: "hook".to_owned(),
+            event: "UserPromptSubmit".to_owned(),
+            session: spawned.id.clone(),
+            payload: json!({"session_id": "sess-123", "prompt": "hello world"}),
+            ..Request::default()
+        });
+
         let listed = daemon.dispatch(Request {
             kind: "task_list".to_owned(),
             ..Request::default()
@@ -1055,15 +1101,6 @@ mod tests {
         assert_eq!(task.runs[0].agent, "claude");
         assert_eq!(task.runs[0].status, TaskStatus::InProgress);
 
-        // A hook delivers the agent-native resume id and first prompt.
-        daemon.dispatch(Request {
-            kind: "hook".to_owned(),
-            event: "UserPromptSubmit".to_owned(),
-            session: spawned.id.clone(),
-            payload: json!({"session_id": "sess-123", "prompt": "hello world"}),
-            ..Request::default()
-        });
-
         // Killing frees the process but the run is immediately resumable.
         assert!(daemon.kill(&spawned.id).ok);
         let parked = daemon.dispatch(Request {
@@ -1075,6 +1112,41 @@ mod tests {
         assert_eq!(run.agent_session_id, "sess-123");
         assert_eq!(run.first_message, "hello world");
         assert!(run.cb_session_id.is_empty());
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(&bindir);
+    }
+
+    #[test]
+    fn a_spawn_never_prompted_leaves_no_history_record_after_kill() {
+        let path =
+            std::env::temp_dir().join(format!("cb-daemon-noturn-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let bindir = std::env::temp_dir().join(format!("cb-noturnbin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&bindir);
+        fs::create_dir_all(&bindir).unwrap();
+        let claude = bindir.join("claude");
+        std::os::unix::fs::symlink("/bin/cat", &claude).unwrap();
+
+        let daemon = Daemon::new_with_task_path(path.clone());
+        let spawned = daemon.dispatch(Request {
+            kind: "spawn".to_owned(),
+            argv: vec![claude.to_string_lossy().into_owned()],
+            cwd: "/tmp".to_owned(),
+            rows: 4,
+            cols: 40,
+            ..Request::default()
+        });
+        assert!(spawned.ok);
+
+        // Killed before ever taking a user turn: there is nothing to resume, so
+        // no auto task is recorded and the historical picker stays empty.
+        assert!(daemon.kill(&spawned.id).ok);
+        let listed = daemon.dispatch(Request {
+            kind: "task_list".to_owned(),
+            ..Request::default()
+        });
+        assert!(listed.tasks.is_empty());
 
         let _ = fs::remove_file(path);
         let _ = fs::remove_dir_all(&bindir);
