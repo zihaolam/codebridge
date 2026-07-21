@@ -579,10 +579,16 @@ impl Daemon {
             ("opencode", _) => vec!["opencode".to_owned(), "--continue".to_owned()],
             (agent, _) => vec![agent.to_owned()],
         };
-        let cwd = if request.cwd.is_empty() {
-            run.cwd.clone()
-        } else {
+        // Always resume in the run's origin directory. Agent-native resume
+        // (`claude --resume <id>`, `codex resume <id>`) is scoped to the project
+        // derived from cwd, so a session first started in a worktree can only be
+        // resumed from that same worktree path — resuming it from the client's
+        // launch directory yields "session does not exist". The client-supplied
+        // cwd is only a fallback for the (rare) run with no recorded origin.
+        let cwd = if run.cwd.is_empty() {
             request.cwd
+        } else {
+            run.cwd.clone()
         };
         let session_id =
             match self
