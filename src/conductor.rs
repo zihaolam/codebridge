@@ -1049,13 +1049,18 @@ fn check_user_interrupt(session: Arc<Session>) {
     {
         return;
     }
-    // Establish the baseline synchronously, before the caller processes the
+    // Establish the baselines synchronously, before the caller processes the
     // Escape input byte, so a stale interrupt earlier in the transcript can
-    // never match and a fast interrupt can never slip in below the baseline.
+    // never match and a fast interrupt can never slip in below the baseline. The
+    // working-seq baseline lets us tell a still-stuck interrupted turn from a
+    // fresh turn started right after the interrupt: with a queued message,
+    // Claude tears the interrupted turn down *and* immediately submits the
+    // queued prompt, which fires its own `Working` hook and advances the seq.
     let Ok(meta) = fs::metadata(&info.transcript_path) else {
         return;
     };
     let baseline = meta.len();
+    let baseline_seq = session.working_seq();
     let path = info.transcript_path;
     thread::spawn(move || {
         // ~3s of 200ms polls: Claude records the marker within a few hundred ms
@@ -1065,14 +1070,30 @@ fn check_user_interrupt(session: Arc<Session>) {
             thread::sleep(Duration::from_millis(200));
             if interrupt_recorded_after(&path, baseline) {
                 // A real hook may have already advanced the session; only clear
-                // if it is still sitting in the stuck working state.
-                if session.snapshot().status == Status::Working {
+                // if it is still sitting in the *same* stuck working turn.
+                if should_clear_after_interrupt(
+                    session.snapshot().status,
+                    session.working_seq(),
+                    baseline_seq,
+                ) {
                     session.set_status(Status::WaitingUser, String::new());
                 }
                 return;
             }
         }
     });
+}
+
+/// Whether a confirmed interrupt should clear the spinner to `WaitingUser`.
+///
+/// The interrupt marker is only meaningful for the turn that was interrupted. A
+/// queued steering message makes Claude tear that turn down and immediately
+/// start a new one, whose `UserPromptSubmit` hook re-sets `Working` and advances
+/// `working_seq` past the `baseline_seq` captured at Escape time. So we clear
+/// only while the session is still sitting in the very turn we interrupted:
+/// status unchanged from `Working` and no fresh `Working` observation since.
+fn should_clear_after_interrupt(status: Status, working_seq: u64, baseline_seq: u64) -> bool {
+    status == Status::Working && working_seq == baseline_seq
 }
 
 /// Whether the interrupt marker appears in `path`'s content past byte offset
@@ -1484,6 +1505,35 @@ mod tests {
         assert!(!interrupt_recorded_after(
             "/nonexistent/cb-transcript.jsonl",
             0
+        ));
+    }
+
+    #[test]
+    fn interrupt_clears_only_the_same_stuck_working_turn() {
+        // Baseline captured at Escape time; the marker later confirms.
+        let baseline_seq = 7;
+
+        // Still the interrupted turn: same seq, still Working -> clear it.
+        assert!(should_clear_after_interrupt(
+            Status::Working,
+            baseline_seq,
+            baseline_seq
+        ));
+
+        // A queued steering message started a fresh turn after the interrupt:
+        // its `UserPromptSubmit` hook advanced the seq. Even though the status is
+        // Working again, it is a *new* turn, so the spinner must stay.
+        assert!(!should_clear_after_interrupt(
+            Status::Working,
+            baseline_seq + 1,
+            baseline_seq
+        ));
+
+        // A real hook already moved the session off Working -> nothing to clear.
+        assert!(!should_clear_after_interrupt(
+            Status::WaitingUser,
+            baseline_seq,
+            baseline_seq
         ));
     }
 

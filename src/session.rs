@@ -71,6 +71,13 @@ pub struct Session {
     exit_clean: AtomicBool,
     sync_since_unix_ms: AtomicU64,
     generation: AtomicU64,
+    /// Monotonic count of turns that entered `Working`. Bumped on every
+    /// `Working` hook (each `UserPromptSubmit`/`PreToolUse`/... observation), so
+    /// the interrupt confirmation can tell a still-stuck interrupted turn from a
+    /// fresh turn that started right after the interrupt (queued-message
+    /// steering: Claude tears the turn down *and* immediately submits the queued
+    /// prompt). See `check_user_interrupt`.
+    working_seq: AtomicU64,
     subscribers: Mutex<Vec<mpsc::Sender<u64>>>,
     pending_prefill: Mutex<Option<Vec<u8>>>,
 }
@@ -155,6 +162,7 @@ impl Session {
             exit_clean: AtomicBool::new(false),
             sync_since_unix_ms: AtomicU64::new(0),
             generation: AtomicU64::new(1),
+            working_seq: AtomicU64::new(0),
             subscribers: Mutex::new(Vec::new()),
             pending_prefill: Mutex::new(None),
         });
@@ -219,6 +227,7 @@ impl Session {
             exit_clean: AtomicBool::new(false),
             sync_since_unix_ms: AtomicU64::new(0),
             generation: AtomicU64::new(1),
+            working_seq: AtomicU64::new(0),
             subscribers: Mutex::new(Vec::new()),
             pending_prefill: Mutex::new(None),
         });
@@ -490,12 +499,27 @@ impl Session {
     }
 
     pub fn set_status(&self, status: Status, message: String) {
+        // Every observation that keeps or puts the session in `Working` counts as
+        // turn activity. The interrupt confirmation captures this counter as a
+        // baseline and only clears a stuck spinner if it has not advanced, so a
+        // fresh turn started by a queued steering message (which fires its own
+        // `Working` hook) is never mistaken for the interrupted turn.
+        if status == Status::Working {
+            self.working_seq.fetch_add(1, Ordering::AcqRel);
+        }
         if let Ok(mut metadata) = self.metadata.write() {
             metadata.status = status;
             metadata.last_message = message;
             metadata.status_since_unix_ms = unix_ms();
         }
         self.mark_dirty();
+    }
+
+    /// Monotonic count of `Working` observations for this session. Used by the
+    /// interrupt confirmation to distinguish a still-stuck interrupted turn from
+    /// a fresh turn started right after the interrupt (queued-message steering).
+    pub fn working_seq(&self) -> u64 {
+        self.working_seq.load(Ordering::Acquire)
     }
 
     pub fn set_harness_session_id(&self, id: String) {

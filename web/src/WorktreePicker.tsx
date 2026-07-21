@@ -3,6 +3,7 @@
 // chosen every time, never remembered.
 import { useEffect, useState } from 'react'
 import type { WorktreeEntry } from './ws'
+import { basename } from './format'
 import { IconChevronLeft } from './icons'
 
 const AGENT_LABELS: Record<string, string> = {
@@ -15,10 +16,6 @@ export type PickerData = {
   cwd: string
   worktrees: WorktreeEntry[] | null // null = reply not in yet
   agents: string[]
-}
-
-function basename(p: string): string {
-  return p.replace(/\/+$/, '').split('/').pop() ?? p
 }
 
 function tag(w: WorktreeEntry): string {

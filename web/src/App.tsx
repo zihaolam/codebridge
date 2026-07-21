@@ -5,7 +5,9 @@ import TaskList from './TaskList'
 import Term from './Term'
 import WorktreePicker, { type PickerData } from './WorktreePicker'
 import KeyBar from './KeyBar'
-import { IconChevronLeft, IconList, IconMaximize, IconX } from './icons'
+import StatusDot from './StatusDot'
+import { basename, sessionLabel } from './format'
+import { IconChevronLeft, IconMaximize, IconX } from './icons'
 
 const TOKEN_KEY = 'cb-token'
 
@@ -31,7 +33,8 @@ function TokenGate({ onSubmit }: { onSubmit: (t: string) => void }) {
   const [val, setVal] = useState('')
   return (
     <div className="gate">
-      <h1>cb</h1>
+      <span className="brand-tile">cb</span>
+      <h1>codebridge</h1>
       <p>
         Paste the pairing token from <code>cb web token</code>
       </p>
@@ -103,21 +106,33 @@ function Dashboard({ token, onAuthFailed }: { token: string; onAuthFailed: () =>
     return () => client.close()
   }, [client, onAuthFailed])
 
+  // Agent-summarised titles, joined from the task snapshot: a live run's
+  // cb_session_id names its session, its title is the broker-resolved summary
+  // (Claude's ai-title / Codex's thread_name). Parked runs have the id
+  // cleared, so this only ever labels running sessions — same rule as the TUI
+  // sidebar.
+  const titles = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const t of tasks) {
+      for (const r of t.runs ?? []) {
+        const title = r.title?.trim()
+        if (r.cb_session_id && title) map.set(r.cb_session_id, title)
+      }
+    }
+    return map
+  }, [tasks])
+
   const current = sessions.find((s) => s.id === selected)
-  const workspace = current
-    ? current.scope_name || (current.cwd.replace(/\/+$/, '').split('/').pop() ?? '')
-    : ''
-  const currentLabel = current ? `${workspace} · ${current.name || current.argv[0]}` : ''
+  const workspace = current ? current.scope_name || basename(current.cwd) : ''
 
   const kill = (id: string) => {
     const s = sessions.find((x) => x.id === id)
-    if (s && confirm(`Kill ${s.name || s.argv.join(' ')}?`)) client.kill(id)
+    if (s && confirm(`Kill ${sessionLabel(s, titles)}?`)) client.kill(id)
   }
 
   const killCurrent = () => {
     if (!current) return
-    const name = current.name || current.argv.join(' ')
-    if (!confirm(`Kill ${name}?`)) return
+    if (!confirm(`Kill ${sessionLabel(current, titles)}?`)) return
     client.kill(current.id)
     setSelected(null)
     setView('list')
@@ -127,18 +142,21 @@ function Dashboard({ token, onAuthFailed }: { token: string; onAuthFailed: () =>
     <div className={`app view-${view}`}>
       <aside>
         <header>
-          <span className="brand">cb</span>
-          <div className="header-right">
-            <button
-              className={`icon-btn header-toggle ${screen === 'tasks' ? 'active' : ''}`}
-              title={screen === 'tasks' ? 'show sessions' : 'show task list'}
-              onClick={() => setScreen((s) => (s === 'tasks' ? 'sessions' : 'tasks'))}
-            >
-              <IconList />
-            </button>
-            <span className={`conn-dot conn-${state}`} title={state} />
-          </div>
+          <span className="brand-tile">cb</span>
+          <span className="brand-name">codebridge</span>
+          <span className={`conn-dot conn-${state}`} title={state} />
         </header>
+        <nav className="seg">
+          <button
+            className={screen === 'sessions' ? 'on' : ''}
+            onClick={() => setScreen('sessions')}
+          >
+            Sessions
+          </button>
+          <button className={screen === 'tasks' ? 'on' : ''} onClick={() => setScreen('tasks')}>
+            Tasks
+          </button>
+        </nav>
         {screen === 'tasks' ? (
           <TaskList
             tasks={tasks}
@@ -160,6 +178,7 @@ function Dashboard({ token, onAuthFailed }: { token: string; onAuthFailed: () =>
         ) : (
           <SessionList
             sessions={sessions}
+            titles={titles}
             selected={selected}
             onSelect={(id) => {
               setSelected(id)
@@ -178,20 +197,32 @@ function Dashboard({ token, onAuthFailed }: { token: string; onAuthFailed: () =>
           <button className="icon-btn back" onClick={() => setView('list')}>
             <IconChevronLeft />
           </button>
-          <span className="topbar-label">{currentLabel}</span>
-          {current && (
-            <div className="topbar-actions">
-              <button
-                className="icon-btn"
-                title="resize session to this screen"
-                onClick={() => window.dispatchEvent(new Event('cb-resize-session'))}
-              >
-                <IconMaximize />
-              </button>
-              <button className="icon-btn topbar-x" title="kill this session" onClick={killCurrent}>
-                <IconX />
-              </button>
-            </div>
+          {current ? (
+            <>
+              <StatusDot status={current.status} />
+              <div className="topbar-title">
+                <span className="topbar-name">{sessionLabel(current, titles)}</span>
+                <span className="topbar-scope">{workspace}</span>
+              </div>
+              <div className="topbar-actions">
+                <button
+                  className="icon-btn"
+                  title="resize session to this screen"
+                  onClick={() => window.dispatchEvent(new Event('cb-resize-session'))}
+                >
+                  <IconMaximize />
+                </button>
+                <button
+                  className="icon-btn topbar-x"
+                  title="kill this session"
+                  onClick={killCurrent}
+                >
+                  <IconX />
+                </button>
+              </div>
+            </>
+          ) : (
+            <span className="topbar-scope">no session</span>
           )}
         </div>
         {state === 'closed' && (
@@ -205,7 +236,10 @@ function Dashboard({ token, onAuthFailed }: { token: string; onAuthFailed: () =>
         {selected ? (
           <Term client={client} sessionId={selected} />
         ) : (
-          <div className="empty">select a session</div>
+          <div className="empty">
+            <div className="empty-title">No session selected</div>
+            <div className="empty-sub">Pick a session from the list</div>
+          </div>
         )}
         {selected && <KeyBar client={client} />}
       </main>

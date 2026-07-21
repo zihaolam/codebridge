@@ -1,26 +1,17 @@
 import { useMemo, useState } from 'react'
 import type { SessionInfo } from './ws'
-import Spinner from './Spinner'
+import StatusDot from './StatusDot'
+import { agentOf, ago, basename, sessionLabel } from './format'
 import { IconChevronDown, IconPlus, IconX } from './icons'
 
-// Status → glyph, mirroring the TUI sidebar's language (dashboard.go
-// indicator/statusStyle): working spinner, green ● turn-complete, yellow ●
-// fresh, red ⚑ needs approval, cyan … starting, grey ✗ ended.
-const GLYPH: Record<string, { g: string; cls: string }> = {
-  starting: { g: '…', cls: 'st-starting' },
-  idle: { g: '●', cls: 'st-idle' },
-  waiting_user: { g: '●', cls: 'st-waiting' },
-  needs_approval: { g: '⚑', cls: 'st-approval' },
-  ended: { g: '✗', cls: 'st-ended' },
-}
-
-function label(s: SessionInfo): string {
-  if (s.name) return s.name
-  return s.argv[0] ?? '?'
-}
-
-function basename(p: string): string {
-  return p.replace(/\/+$/, '').split('/').pop() ?? p
+// Status → the word shown in a session's meta line.
+const STATUS_WORD: Record<string, string> = {
+  starting: 'starting',
+  working: 'working',
+  idle: 'idle',
+  waiting_user: 'done',
+  needs_approval: 'needs approval',
+  ended: 'exited',
 }
 
 type Group = { key: string; name: string; sessions: SessionInfo[] }
@@ -44,12 +35,14 @@ function groupSessions(sessions: SessionInfo[]): Group[] {
 
 export default function SessionList({
   sessions,
+  titles,
   selected,
   onSelect,
   onKill,
   onSpawn,
 }: {
   sessions: SessionInfo[]
+  titles: Map<string, string>
   selected: string | null
   onSelect: (id: string) => void
   onKill: (id: string) => void
@@ -66,7 +59,14 @@ export default function SessionList({
       return next
     })
 
-  if (sessions.length === 0) return <div className="empty">no sessions</div>
+  if (sessions.length === 0) {
+    return (
+      <div className="empty">
+        <div className="empty-title">No sessions yet</div>
+        <div className="empty-sub">Spawn an agent from the desktop TUI to see it here</div>
+      </div>
+    )
+  }
   return (
     <ul className="session-list">
       {groups.map((g) => {
@@ -75,6 +75,7 @@ export default function SessionList({
           <li key={g.key} className="scope-group">
             <div className="scope-header" onClick={() => toggle(g.key)}>
               <span className="scope-name">{g.name}</span>
+              <span className="scope-count">{g.sessions.length}</span>
               <button
                 className="icon-btn scope-add"
                 title={`new session in ${g.name}`}
@@ -85,7 +86,6 @@ export default function SessionList({
               >
                 <IconPlus />
               </button>
-              <span className="scope-count">{g.sessions.length}</span>
               <span className={`chevron ${closed ? 'closed' : ''}`}>
                 <IconChevronDown />
               </span>
@@ -93,19 +93,33 @@ export default function SessionList({
             {!closed && (
               <ul>
                 {g.sessions.map((s) => {
-                  const st = GLYPH[s.status] ?? { g: '·', cls: '' }
+                  // A worktree checkout is visible as a cwd that isn't the
+                  // repo's main directory; surface which one in the meta line.
+                  const dir = basename(s.cwd)
+                  const meta = [agentOf(s), STATUS_WORD[s.status] ?? s.status]
+                  const when = ago(s.status_since_unix_ms)
+                  if (when) meta.push(when)
                   return (
                     <li
                       key={s.id}
-                      className={`session-row ${s.id === selected ? 'selected' : ''}`}
+                      className={`session-row ${s.id === selected ? 'selected' : ''} ${
+                        s.status === 'needs_approval' ? 'attn' : ''
+                      }`}
                       onClick={() => onSelect(s.id)}
                     >
-                      {s.status === 'working' ? (
-                        <Spinner />
-                      ) : (
-                        <span className={`glyph ${st.cls}`}>{st.g}</span>
-                      )}
-                      <span className="name">{label(s)}</span>
+                      <StatusDot status={s.status} />
+                      <div className="session-text">
+                        <span className="session-title">{sessionLabel(s, titles)}</span>
+                        <span className="session-meta">
+                          {meta.join(' · ')}
+                          {dir !== g.name && (
+                            <>
+                              {' · '}
+                              <span className="mono">⎇ {dir}</span>
+                            </>
+                          )}
+                        </span>
+                      </div>
                       <button
                         className="icon-btn row-x"
                         title="kill session"

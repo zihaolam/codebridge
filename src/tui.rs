@@ -398,7 +398,10 @@ fn ensure_daemon() -> io::Result<()> {
     ))
 }
 
-fn start_watch(sender: Sender<UiEvent>) -> io::Result<()> {
+/// Opens a watch stream to the broker: connects to `daemon.sock` and issues the
+/// streaming `watch` request. Shared by the initial connection and every
+/// reconnect after the broker cycles.
+fn watch_connect() -> io::Result<UnixStream> {
     let mut stream = UnixStream::connect(socket_path())?;
     write_json(
         &mut stream,
@@ -407,25 +410,55 @@ fn start_watch(sender: Sender<UiEvent>) -> io::Result<()> {
             ..Request::default()
         },
     )?;
+    Ok(stream)
+}
+
+fn start_watch(sender: Sender<UiEvent>) -> io::Result<()> {
+    // Establish the first connection synchronously so startup fails fast if the
+    // broker never comes up; reconnects thereafter live inside the thread.
+    let initial = watch_connect()?;
     thread::spawn(move || {
-        for line in BufReader::new(stream).lines() {
-            match line
-                .ok()
-                .and_then(|line| serde_json::from_str::<Response>(&line).ok())
-            {
-                Some(response) if response.ok => {
-                    if sender
-                        .send(UiEvent::Snapshot(response.sessions, response.tasks))
-                        .is_err()
-                    {
-                        break;
+        let mut stream = initial;
+        loop {
+            // Drain snapshots until the broker closes the stream. `cb restart`
+            // cycles the broker, EOF-ing this control-plane connection even
+            // though the conductor — and the live pane attached straight to it —
+            // keep running, so the sidebar would otherwise freeze forever.
+            for line in BufReader::new(&stream).lines() {
+                match line
+                    .ok()
+                    .and_then(|line| serde_json::from_str::<Response>(&line).ok())
+                {
+                    Some(response) if response.ok => {
+                        if sender
+                            .send(UiEvent::Snapshot(response.sessions, response.tasks))
+                            .is_err()
+                        {
+                            return; // Receiver dropped: the TUI is shutting down.
+                        }
+                    }
+                    Some(response) => {
+                        let _ = sender.send(UiEvent::Error(response.error));
+                    }
+                    None => break,
+                }
+            }
+            // The broker went away (a `cb restart`, or a crash). Reconnect to its
+            // replacement — resurrecting it if needed — with a capped backoff so a
+            // slow restart never hot-loops. The bind guard in `Daemon::run` makes
+            // racing `cb restart`'s own spawn safe: the loser gets `AddrInUse` and
+            // exits. The fresh `watch` snapshot is a full state dump, so the
+            // sidebar simply repopulates.
+            let mut backoff = Duration::from_millis(50);
+            stream = loop {
+                thread::sleep(backoff);
+                if ensure_daemon().is_ok() {
+                    if let Ok(fresh) = watch_connect() {
+                        break fresh;
                     }
                 }
-                Some(response) => {
-                    let _ = sender.send(UiEvent::Error(response.error));
-                }
-                None => break,
-            }
+                backoff = (backoff * 2).min(Duration::from_secs(2));
+            };
         }
     });
     Ok(())
@@ -512,6 +545,9 @@ fn drain_events(model: &mut Model, receiver: &Receiver<UiEvent>) {
     while let Ok(event) = receiver.try_recv() {
         match event {
             UiEvent::Snapshot(sessions, tasks) => {
+                // Update tasks before detecting transitions so toast labels join
+                // against this snapshot's freshly-resolved agent titles.
+                model.tasks = tasks;
                 detect_transitions(model, &sessions);
                 model.worktree_cwds = sessions
                     .iter()
@@ -519,7 +555,6 @@ fn drain_events(model: &mut Model, receiver: &Receiver<UiEvent>) {
                     .map(|session| session.cwd.clone())
                     .collect();
                 model.sidebar.update(sessions);
-                model.tasks = tasks;
                 if let Some(id) = model.pending_jump.clone() {
                     if model.sidebar.select_session(&id) {
                         model.pending_jump = None;
@@ -564,7 +599,7 @@ fn detect_transitions(model: &mut Model, sessions: &[SessionInfo]) {
     // misfire once the accordion is later toggled on.
     let accordion = model.sidebar.accordion();
     let current_scope = model.sidebar.current_scope().to_owned();
-    let transitions = transition_toasts(&mut model.previous_status, sessions);
+    let transitions = transition_toasts(&mut model.previous_status, sessions, &model.tasks);
     for toast in transitions {
         let allowed = match toast.status {
             Status::NeedsApproval => model.config.notifications.notify_approval,
@@ -688,7 +723,7 @@ fn notification_text(model: &Model, toast: &Toast) -> (String, String) {
         format!("{agent} {event}"),
         format!(
             "{} · {}",
-            session_label(session),
+            session_label(session, &model.tasks),
             scope_display_name(&session.cwd)
         ),
     )
@@ -697,6 +732,7 @@ fn notification_text(model: &Model, toast: &Toast) -> (String, String) {
 fn transition_toasts(
     previous: &mut HashMap<String, Status>,
     sessions: &[SessionInfo],
+    tasks: &[Task],
 ) -> Vec<Toast> {
     let mut toasts = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -714,13 +750,13 @@ fn transition_toasts(
                     toasts.push(Toast {
                         session_id: session.id.clone(),
                         status: Status::NeedsApproval,
-                        text: format!("⚑ {} — {detail}", session_label(session)),
+                        text: format!("⚑ {} — {detail}", session_label(session, tasks)),
                     });
                 }
                 Status::WaitingUser => toasts.push(Toast {
                     session_id: session.id.clone(),
                     status: Status::WaitingUser,
-                    text: format!("● {} — turn completed", session_label(session)),
+                    text: format!("● {} — turn completed", session_label(session, tasks)),
                 }),
                 _ => {}
             }
@@ -873,7 +909,7 @@ fn handle_prefix(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
             let target = model
                 .selected()
                 .or_else(|| model.attached_session())
-                .map(|session| (session.id.clone(), session_label(session)));
+                .map(|session| (session.id.clone(), session_label(session, &model.tasks)));
             if let Some((id, input)) = target {
                 model.rename = Some(Rename { id, input });
             }
@@ -3214,7 +3250,7 @@ fn sidebar_row(model: &Model, row: &Row, index: usize, width: u16) -> Line<'stat
                 Span::styled(glyph.to_string(), Style::default().fg(color)),
                 Span::raw(" "),
                 Span::styled(
-                    session_label(session),
+                    session_label(session, &model.tasks),
                     Style::default()
                         .fg(model.palette.text)
                         .bg(if selected {
@@ -3381,9 +3417,16 @@ fn indicator(session: &SessionInfo, spin: usize, palette: &Palette) -> (char, Co
     }
 }
 
-fn session_label(session: &SessionInfo) -> String {
+fn session_label(session: &SessionInfo, tasks: &[Task]) -> String {
+    // An explicit rename always wins over the agent's own summary.
     if !session.name.is_empty() {
         return session.name.clone();
+    }
+    // Then the agent-summarised conversation title (Claude's `ai-title`,
+    // Codex's `thread_name`), resolved by the broker onto this session's live
+    // run — the same title the history picker shows.
+    if let Some(title) = session_title(tasks, &session.id) {
+        return title.to_owned();
     }
     std::path::Path::new(&session.cwd)
         .file_name()
@@ -3392,6 +3435,21 @@ fn session_label(session: &SessionInfo) -> String {
             (!session.id.is_empty()).then(|| session.id.chars().take(8).collect::<String>())
         })
         .unwrap_or_else(|| "session".to_owned())
+}
+
+/// The agent-summarised title for a live session, if the broker has resolved
+/// one. A run's `cb_session_id` is cleared when it parks, so a non-empty match
+/// only ever hits the currently-running run for this session.
+fn session_title<'a>(tasks: &'a [Task], session_id: &str) -> Option<&'a str> {
+    if session_id.is_empty() {
+        return None;
+    }
+    tasks
+        .iter()
+        .flat_map(|task| &task.runs)
+        .find(|run| run.cb_session_id == session_id)
+        .map(|run| run.title.trim())
+        .filter(|title| !title.is_empty())
 }
 
 fn decode_color(value: u32) -> Color {
@@ -3705,17 +3763,69 @@ mod tests {
             transcript_path: String::new(),
         };
         let mut previous = HashMap::new();
-        assert!(transition_toasts(&mut previous, &[session(Status::Working, "")]).is_empty());
+        assert!(transition_toasts(&mut previous, &[session(Status::Working, "")], &[]).is_empty());
         let approval = transition_toasts(
             &mut previous,
             &[session(Status::NeedsApproval, "approve command?")],
+            &[],
         );
         assert_eq!(approval.len(), 1);
         assert_eq!(approval[0].status, Status::NeedsApproval);
         assert!(approval[0].text.contains("approve command?"));
-        let waiting = transition_toasts(&mut previous, &[session(Status::WaitingUser, "")]);
+        let waiting = transition_toasts(&mut previous, &[session(Status::WaitingUser, "")], &[]);
         assert_eq!(waiting.len(), 1);
         assert_eq!(waiting[0].status, Status::WaitingUser);
+    }
+
+    #[test]
+    fn session_label_prefers_rename_then_agent_title_then_cwd() {
+        let run = |cb_session_id: &str, title: &str| crate::task::TaskRun {
+            id: "run".to_owned(),
+            agent: "claude".to_owned(),
+            cwd: String::new(),
+            cb_session_id: cb_session_id.to_owned(),
+            agent_session_id: String::new(),
+            first_message: String::new(),
+            transcript_path: String::new(),
+            title: title.to_owned(),
+            status: TaskStatus::InProgress,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let task = crate::task::Task {
+            id: "task".to_owned(),
+            scope: String::new(),
+            title: String::new(),
+            desc: String::new(),
+            status: TaskStatus::InProgress,
+            runs: vec![run("sess", "Fix the login bug")],
+            auto: true,
+            agent: "claude".to_owned(),
+            cwd: String::new(),
+            cb_session_id: String::new(),
+            agent_session_id: String::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let base = |name: &str| SessionInfo {
+            id: "sess".to_owned(),
+            name: name.to_owned(),
+            argv: vec!["claude".to_owned()],
+            cwd: "/tmp/my-project".to_owned(),
+            status: Status::Idle,
+            last_message: String::new(),
+            harness_session_id: String::new(),
+            exited: false,
+            status_since_unix_ms: 0,
+            transcript_path: String::new(),
+        };
+        let tasks = std::slice::from_ref(&task);
+        // An explicit rename wins over everything.
+        assert_eq!(session_label(&base("Renamed"), tasks), "Renamed");
+        // No rename -> the agent-summarised title.
+        assert_eq!(session_label(&base(""), tasks), "Fix the login bug");
+        // No matching live run -> fall back to the cwd basename.
+        assert_eq!(session_label(&base(""), &[]), "my-project");
     }
 
     #[test]

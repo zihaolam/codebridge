@@ -11,7 +11,6 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import type { CbClient, Down } from './ws'
 
-const SCROLL_STEP = 3
 const RESIZE_DEBOUNCE_MS = 250
 // Below these the agent TUIs degrade into garbage; don't claim less.
 const MIN_COLS = 40
@@ -73,7 +72,7 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
       scrollback: 0, // scrollback lives in the daemon; browse it via scroll offsets
       fontSize: 13,
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-      theme: { background: '#0d1117' },
+      theme: { background: '#0b0b0e' },
       cursorBlink: false,
     })
     const fit = new FitAddon()
@@ -178,6 +177,31 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client])
 
+  // Track the visual viewport so the software keyboard shrinks the app
+  // instead of covering it: `--vvh` drives the .app height, keeping the agent
+  // input line and the key bar visible above the keyboard. On shrink, pin the
+  // pane to its bottom, where the input line lives.
+  useEffect(() => {
+    const vv = window.visualViewport
+    if (!vv) return
+    let lastH = vv.height
+    const apply = () => {
+      document.documentElement.style.setProperty('--vvh', `${Math.round(vv.height)}px`)
+      // iOS sometimes scrolls the page to reveal a focused input; the layout
+      // handles the keyboard itself, so undo that.
+      if (window.scrollY !== 0) window.scrollTo(0, 0)
+      const el = holder.current
+      if (el && vv.height < lastH) el.scrollTop = el.scrollHeight
+      lastH = vv.height
+    }
+    apply()
+    vv.addEventListener('resize', apply)
+    return () => {
+      vv.removeEventListener('resize', apply)
+      document.documentElement.style.removeProperty('--vvh')
+    }
+  }, [])
+
   const lineHeightPx = 17
 
   const setOffset = (next: number) => {
@@ -209,6 +233,10 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
   // scroll offset. Drag down (dy>0) reveals earlier output (offset up). A
   // horizontal-dominant drag falls through to native pan for any line still
   // wider than the pane. Non-passive so we can preventDefault the vertical case.
+  //
+  // Smoothness: sends are rAF-throttled (a 120Hz touch stream would otherwise
+  // queue round-trips and lag the finger), and lift-off continues with a
+  // decaying momentum fling like a native scroll view.
   useEffect(() => {
     const el = holder.current
     if (!el) return
@@ -216,29 +244,76 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
     let startX = 0
     let startOffset = 0
     let active = false
+    let lastY = 0
+    let lastT = 0
+    let velocity = 0 // px/ms, smoothed; >0 = dragging down = back into history
+    let moveRaf = 0
+    let pendingOffset = 0
+    let flingRaf = 0
+    const stopFling = () => {
+      if (flingRaf) cancelAnimationFrame(flingRaf)
+      flingRaf = 0
+    }
     const onStart = (e: TouchEvent) => {
+      stopFling()
       active = e.touches.length === 1
       if (!active) return
-      startY = e.touches[0].clientY
+      startY = lastY = e.touches[0].clientY
       startX = e.touches[0].clientX
+      lastT = performance.now()
+      velocity = 0
       startOffset = scrollRef.current.offset
     }
     const onMove = (e: TouchEvent) => {
       if (!active || e.touches.length !== 1) return
-      const dy = e.touches[0].clientY - startY
+      const y = e.touches[0].clientY
+      const dy = y - startY
       const dx = e.touches[0].clientX - startX
       if (Math.abs(dy) <= Math.abs(dx)) return // horizontal → leave native pan
       e.preventDefault()
-      setOffset(startOffset + Math.round(dy / lineHeightPx))
+      const now = performance.now()
+      const dt = now - lastT
+      if (dt > 0) velocity = 0.6 * ((y - lastY) / dt) + 0.4 * velocity
+      lastY = y
+      lastT = now
+      pendingOffset = startOffset + Math.round(dy / lineHeightPx)
+      if (!moveRaf) {
+        moveRaf = requestAnimationFrame(() => {
+          moveRaf = 0
+          setOffset(pendingOffset)
+        })
+      }
     }
     const onEnd = () => {
+      if (!active) return
       active = false
+      // Momentum: keep scrolling with exponential decay until it fades or a
+      // scrollback edge clamps the offset.
+      let acc = scrollRef.current.offset
+      let last = performance.now()
+      const step = (now: number) => {
+        flingRaf = 0
+        const dt = Math.min(now - last, 64)
+        last = now
+        velocity *= Math.pow(0.95, dt / 8)
+        acc += (velocity * dt) / lineHeightPx
+        const next = Math.round(acc)
+        const s = scrollRef.current
+        const clamped = Math.min(Math.max(next, 0), s.max)
+        if (clamped !== s.offset) setOffset(clamped)
+        if (Math.abs(velocity) > 0.02 && clamped === next) {
+          flingRaf = requestAnimationFrame(step)
+        }
+      }
+      flingRaf = requestAnimationFrame(step)
     }
     el.addEventListener('touchstart', onStart, { passive: true })
     el.addEventListener('touchmove', onMove, { passive: false })
     el.addEventListener('touchend', onEnd, { passive: true })
     el.addEventListener('touchcancel', onEnd, { passive: true })
     return () => {
+      stopFling()
+      if (moveRaf) cancelAnimationFrame(moveRaf)
       el.removeEventListener('touchstart', onStart)
       el.removeEventListener('touchmove', onMove)
       el.removeEventListener('touchend', onEnd)
@@ -248,10 +323,17 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
   }, [client])
 
   // Wheel browses daemon-side scrollback: offset lines up from live bottom.
-  // (Desktop only in practice — the frame fits the pane there, so there is no
-  // native scroll to compete with; phones use the keybar buttons.)
+  // Proportional to the wheel delta (with a fractional accumulator) so a
+  // trackpad glides instead of jumping in fixed steps.
+  const wheelAcc = useRef(0)
   const onWheel = (e: React.WheelEvent) => {
-    setOffset(scrollRef.current.offset + (e.deltaY < 0 ? SCROLL_STEP : -SCROLL_STEP))
+    const px = e.deltaMode === 1 ? e.deltaY * lineHeightPx : e.deltaY
+    wheelAcc.current += px
+    const lines = Math.trunc(wheelAcc.current / lineHeightPx)
+    if (lines !== 0) {
+      wheelAcc.current -= lines * lineHeightPx
+      setOffset(scrollRef.current.offset - lines)
+    }
   }
 
   return <div className="term-holder" ref={holder} onWheel={onWheel} />

@@ -10,7 +10,7 @@ export type SessionInfo = {
   status: string
   last_message?: string
   exited: boolean
-  status_since?: number
+  status_since_unix_ms?: number
   // Sidebar grouping, computed bridge-side (repo common-dir semantics).
   scope?: string
   scope_name?: string
@@ -35,6 +35,9 @@ export type TaskInfo = {
   desc?: string
   status: string
   runs?: TaskRun[]
+  // Synthesized to record an ad-hoc agent session rather than authored in the
+  // backlog; hidden from the task list, mirroring the TUI.
+  auto?: boolean
   agent?: string
   cwd?: string
   cb_session_id?: string
@@ -49,6 +52,10 @@ export type TaskRun = {
   cwd?: string
   cb_session_id?: string
   agent_session_id?: string
+  first_message?: string
+  // Agent-summarised conversation title (Claude's ai-title / Codex's
+  // thread_name), resolved lazily by the broker. Empty until generated.
+  title?: string
   status: string
   created_at: string
   updated_at: string

@@ -1,29 +1,15 @@
 import { useMemo, useState } from 'react'
 import type { SessionInfo, TaskInfo } from './ws'
-import Spinner from './Spinner'
+import StatusDot from './StatusDot'
+import { basename } from './format'
 import { IconPlus, IconCheck, IconPlay, IconPencil, IconTrash, IconX } from './icons'
 
-// Status → glyph for a task, mirroring the TUI's taskGlyph (internal/tui
-// task.go): an in_progress task borrows its linked session's live indicator; the
-// resting states get their own marks.
+// Status → glyph for a resting task, mirroring the TUI's task marks. An
+// in_progress task borrows its linked session's live status dot instead.
 const REST_GLYPH: Record<string, { g: string; cls: string }> = {
   paused: { g: '‖', cls: 'st-idle' },
   completed: { g: '✓', cls: 'st-ended' },
   pending: { g: '○', cls: 'st-pending' },
-}
-
-// Session status → glyph, matching SessionList so an in_progress task reads the
-// same as its session in the sidebar.
-const SESSION_GLYPH: Record<string, { g: string; cls: string }> = {
-  starting: { g: '…', cls: 'st-starting' },
-  idle: { g: '●', cls: 'st-idle' },
-  waiting_user: { g: '●', cls: 'st-waiting' },
-  needs_approval: { g: '⚑', cls: 'st-approval' },
-  ended: { g: '✗', cls: 'st-ended' },
-}
-
-function basename(p: string): string {
-  return p.replace(/\/+$/, '').split('/').pop() ?? p
 }
 
 // repoCwd resolves a scope key to a real launch directory for task_start /
@@ -39,6 +25,7 @@ type Group = { key: string; name: string; cwd: string; tasks: TaskInfo[] }
 
 // groupTasks buckets the backlog by scope, seeded with every active repo (from
 // the session list) so you can add the first task to a repo that has none yet.
+// Auto tasks (synthesized session records) are hidden, mirroring the TUI.
 function groupTasks(tasks: TaskInfo[], sessions: SessionInfo[]): Group[] {
   const map = new Map<string, Group>()
   const ensure = (key: string, name: string, cwd: string): Group => {
@@ -54,6 +41,7 @@ function groupTasks(tasks: TaskInfo[], sessions: SessionInfo[]): Group[] {
     ensure(key, s.scope_name || basename(s.cwd), s.cwd)
   }
   for (const t of tasks) {
+    if (t.auto) continue
     const g = ensure(t.scope, t.scope_name || basename(t.scope), repoCwd(t.scope, sessions))
     g.tasks.push(t)
   }
@@ -123,23 +111,17 @@ export default function TaskList({
                   {sorted.map((t) => {
                     const liveRuns = (t.runs ?? []).filter((r) => r.status === 'in_progress')
                     const live = sessionById(liveRuns[0]?.cb_session_id)
-                    const working = t.status === 'in_progress' && live?.status === 'working'
-                    const glyph =
-                      t.status === 'in_progress'
-                        ? live
-                          ? (SESSION_GLYPH[live.status] ?? { g: '◐', cls: 'st-waiting' })
-                          : { g: '◐', cls: 'st-waiting' }
-                        : (REST_GLYPH[t.status] ?? { g: '·', cls: '' })
+                    const rest = REST_GLYPH[t.status] ?? { g: '·', cls: '' }
                     const canStart = t.status !== 'completed'
                     return (
                       <li
                         key={t.id}
                         className={`task-row ${t.status === 'completed' ? 'done' : ''}`}
                       >
-                        {working ? (
-                          <Spinner />
+                        {t.status === 'in_progress' ? (
+                          <StatusDot status={live?.status ?? 'waiting_user'} />
                         ) : (
-                          <span className={`glyph ${glyph.cls}`}>{glyph.g}</span>
+                          <span className={`glyph ${rest.cls}`}>{rest.g}</span>
                         )}
                         <button
                           className="task-title"
