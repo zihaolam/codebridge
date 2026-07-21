@@ -19,6 +19,7 @@ use base64::Engine;
 use ratatui::style::Modifier;
 use serde::{Deserialize, Serialize};
 
+use crate::conductor::{conductor_socket_path, ConductorRequest};
 use crate::daemon::{socket_path, state_dir};
 use crate::protocol::{
     Request, Response, SessionInfo, StreamDown, StreamUp, TerminalFrame, VERSION,
@@ -561,7 +562,11 @@ fn attach_browser(
     if id.is_empty() {
         return;
     }
-    let mut stream = match UnixStream::connect(socket_path()) {
+    // Attach the browser straight to the conductor's data plane rather than
+    // hopping through the broker (which is this same process). Rows/cols stay 0
+    // so the conductor does not resize the canonical PTY — a phone viewport is
+    // presentation-only; only the explicit resize action resizes the shared PTY.
+    let mut stream = match UnixStream::connect(conductor_socket_path()) {
         Ok(stream) => stream,
         Err(error) => {
             send_latest(out, WsDown::error(format!("attach: {error}")));
@@ -570,10 +575,10 @@ fn attach_browser(
     };
     if let Err(error) = write_line(
         &mut stream,
-        &Request {
-            kind: "attach".to_owned(),
+        &ConductorRequest::Attach {
             id: id.clone(),
-            ..Request::default()
+            rows: 0,
+            cols: 0,
         },
     ) {
         send_latest(out, WsDown::error(format!("attach: {error}")));

@@ -147,15 +147,10 @@ impl Daemon {
                 return Ok(());
             }
             match request.kind.as_str() {
-                "attach" => {
-                    return self.conductor.attach(
-                        stream,
-                        reader,
-                        &request.id,
-                        request.rows,
-                        request.cols,
-                    )
-                }
+                // Attach is a data-plane op and no longer flows through the
+                // broker: clients (TUI and web) open the frame stream straight
+                // on the conductor socket, so a broker restart never interrupts
+                // a live pane. The broker owns only the control plane below.
                 "watch" => return self.watch(stream),
                 _ => write_json(
                     &mut BufWriter::new(stream.try_clone()?),

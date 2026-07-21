@@ -1006,14 +1006,6 @@ pub trait Engine: Send + Sync {
         harness: &str,
         transcript: &str,
     ) -> bool;
-    fn attach(
-        &self,
-        stream: UnixStream,
-        reader: BufReader<UnixStream>,
-        id: &str,
-        rows: u16,
-        cols: u16,
-    ) -> io::Result<()>;
 }
 
 impl Engine for Arc<Conductor> {
@@ -1060,21 +1052,12 @@ impl Engine for Arc<Conductor> {
     ) -> bool {
         Conductor::apply_hook(self, id, status, message, harness, transcript)
     }
-    fn attach(
-        &self,
-        stream: UnixStream,
-        reader: BufReader<UnixStream>,
-        id: &str,
-        rows: u16,
-        cols: u16,
-    ) -> io::Result<()> {
-        Conductor::attach(self, stream, reader, id, rows, cols)
-    }
 }
 
 /// A broker-side client for the conductor's socket. Control ops dial the socket
-/// per call (connects are cheap and this keeps the client stateless); `attach`
-/// opens a dedicated connection and splices it to the client's stream.
+/// per call — connects are cheap and this keeps the client stateless. The broker
+/// never proxies the attach data plane: clients stream frames straight from the
+/// conductor socket.
 pub struct ConductorClient {
     socket: PathBuf,
 }
@@ -1229,42 +1212,6 @@ impl Engine for ConductorClient {
         })
         .map(|response| response.applied)
         .unwrap_or(false)
-    }
-
-    fn attach(
-        &self,
-        stream: UnixStream,
-        mut reader: BufReader<UnixStream>,
-        id: &str,
-        rows: u16,
-        cols: u16,
-    ) -> io::Result<()> {
-        // Open a dedicated conductor connection, send the attach op, then splice
-        // it to the client: uplink carries StreamUp, downlink carries StreamDown.
-        // The broker is a transparent relay for the streaming phase.
-        let mut uplink = UnixStream::connect(&self.socket)?;
-        serde_json::to_writer(
-            &mut uplink,
-            &ConductorRequest::Attach {
-                id: id.to_owned(),
-                rows,
-                cols,
-            },
-        )?;
-        uplink.write_all(b"\n")?;
-        uplink.flush()?;
-
-        let downlink = uplink.try_clone()?;
-        let mut client_write = stream.try_clone()?;
-        let pump = thread::spawn(move || {
-            let _ = io::copy(&mut reader, &mut uplink);
-            let _ = uplink.shutdown(std::net::Shutdown::Write);
-        });
-        let mut downlink = BufReader::new(downlink);
-        let _ = io::copy(&mut downlink, &mut client_write);
-        let _ = client_write.shutdown(std::net::Shutdown::Write);
-        let _ = pump.join();
-        Ok(())
     }
 }
 

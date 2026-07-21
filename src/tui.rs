@@ -25,6 +25,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::{Frame, Terminal};
 use time::OffsetDateTime;
 
+use crate::conductor::{conductor_socket_path, ConductorRequest};
 use crate::config::Config;
 use crate::daemon::socket_path;
 use crate::protocol::{
@@ -401,15 +402,16 @@ fn start_watch(sender: Sender<UiEvent>) -> io::Result<()> {
 }
 
 fn start_attach(id: String, pane: Rect, sender: Sender<UiEvent>) -> io::Result<Attach> {
-    let mut stream = UnixStream::connect(socket_path())?;
+    // The data plane goes straight to the conductor, not through the broker, so
+    // the live pane keeps streaming across a broker restart (`cb restart`). The
+    // broker is only used for the control plane (sidebar/tasks/watch).
+    let mut stream = UnixStream::connect(conductor_socket_path())?;
     write_json(
         &mut stream,
-        &Request {
-            kind: "attach".to_owned(),
+        &ConductorRequest::Attach {
             id: id.clone(),
             rows: pane.height.max(1),
             cols: pane.width.max(1),
-            ..Request::default()
         },
     )?;
     let reader = stream.try_clone()?;

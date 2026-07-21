@@ -1,10 +1,11 @@
 # Codebridge repository guide
 
 `codebridge` is a Rust TUI (`cb`) for managing Claude Code, Codex, and other
-coding-agent sessions. A long-lived daemon owns every agent PTY and its
-libghostty-vt terminal state. A Ratatui client renders the Codebridge sidebar
-and one selected live session. It is intentionally an agent-session manager,
-not a general-purpose shell or tmux replacement.
+coding-agent sessions. A durable **conductor** process owns every agent PTY and
+its libghostty-vt terminal state; a restartable **broker** process owns the
+control plane (tasks, status, hooks, web). A Ratatui client renders the
+Codebridge sidebar and one selected live session. It is intentionally an
+agent-session manager, not a general-purpose shell or tmux replacement.
 
 ## Build, test, and run
 
@@ -34,8 +35,11 @@ Interactive checks require a real PTY:
 ./target/debug/cb
 ```
 
-Use `cb restart` after a protocol-changing rebuild. A stale daemon is rejected
-by protocol version.
+Use `cb restart` after a broker-protocol-changing rebuild (it cycles the broker
+only; the conductor and its PTYs keep running). A stale broker is rejected by
+protocol version. To move the conductor itself onto new code without dropping
+sessions, use `cb upgrade` (in-place `execve`, sessions preserved). `cb stop`
+tears down both processes.
 
 ## Architecture
 
@@ -46,12 +50,28 @@ by protocol version.
 - `src/session.rs` owns one child process group under a PTY. Its reader drains
   output continuously even without clients, feeds Ghostty, and notifies dirty
   subscribers. The waiter reaps the child. Killing a session signals the whole
-  Unix process group.
-- `src/daemon.rs` owns sessions, tasks, status, Unix-socket request/watch/attach
-  streams, and per-attachment absolute scroll anchors. The daemon sends an
-  immediate semantic frame and then only changed frames.
-- `src/protocol.rs` is line-delimited JSON for one-shot requests and streaming
-  messages. Bump `VERSION` on every wire-shape or semantic wire change.
+  Unix process group. A session is either spawned fresh or `adopt`ed from a
+  surviving PTY master fd + child pid across a conductor hot-upgrade; adopted
+  sessions resize via raw `TIOCSWINSZ` and reap via `waitpid` (portable_pty
+  cannot rebuild its handles from a bare fd).
+- `src/conductor.rs` is the durable session engine on its own socket
+  (`conductor.sock`, own `CONDUCTOR_VERSION`). It owns the session map, spawn/
+  kill/reap, extract, status/name/harness metadata, the semantic attach frame
+  stream, and per-attachment absolute scroll anchors (immediate frame, then only
+  changed frames). It survives a broker restart and can hot-upgrade itself in
+  place (`cb upgrade`): snapshot each terminal to replayable VT, clear CLOEXEC on
+  the master fds, `execve` the new binary in the same pid, then adopt every
+  session. The broker reaches it through the `Engine` trait — `ConductorClient`
+  over the socket in production, an in-process `Conductor` in tests.
+- `src/daemon.rs` is the broker: the control plane on `daemon.sock`. It owns
+  tasks, hook→status mapping, watchers, and web spawn, and delegates every
+  session fact to the conductor via the `Engine` trait. It is never in the data
+  path — clients attach straight to the conductor — so it can restart freely.
+- `src/protocol.rs` is line-delimited JSON between clients and the broker (one-
+  shot requests and streaming messages). Bump `VERSION` on every wire-shape or
+  semantic wire change. The conductor's socket protocol carries its own
+  `CONDUCTOR_VERSION` (in `src/conductor.rs`), deliberately decoupled so a broker
+  restart never disturbs a running conductor.
 - `src/tui.rs` is client presentation state: sidebar focus and grouping,
   prefix/config/help modals, worktree and task pickers, toasts, selection,
   OSC52, and input forwarding. Rendering is pure; `compute_view` mutates
@@ -67,10 +87,11 @@ by protocol version.
   product-owned hook scripts, structural JSON edits, preservation of user
   hooks, current/outdated status, safe uninstall, and Codex's top-level
   `[features] hooks = true` migration.
-- `src/web.rs` is a daemon client that serves the embedded PWA and one
-  authenticated multiplexed WebSocket per browser. It enriches snapshots with
-  filesystem scope data and adapts semantic frames to the PWA's ANSI/xterm
-  contract. Normal phone attaches never resize the canonical PTY.
+- `src/web.rs` serves the embedded PWA and one authenticated multiplexed
+  WebSocket per browser. It talks to the broker for enriched snapshots (with
+  filesystem scope data) and attaches straight to the conductor for the frame
+  stream, adapting semantic frames to the PWA's ANSI/xterm contract. Normal phone
+  attaches never resize the canonical PTY.
 - `src/config.rs`, `src/worktree.rs`, and `src/notify.rs` provide persistent
   bindings, per-launch worktree/agent selection, and delayed/focus-aware
   notification delivery through Codebridge, terminal OSC, or native services.
@@ -78,6 +99,27 @@ by protocol version.
   xterm outside React state.
 - `vendor/libghostty-vt` is pinned terminal-engine source. Keep its provenance
   metadata intact when updating it.
+
+## Process model
+
+Two long-lived processes plus short-lived clients:
+
+- **Conductor** (`cb conductor`, `conductor.sock`): the durable data plane — PTYs,
+  child process groups, terminal state, and the attach frame stream. Spawned on
+  demand by `ensure_conductor`, it outlives broker restarts. A stale conductor is
+  never auto-restarted (that would kill live sessions); a version mismatch is
+  surfaced for the user to resolve with `cb stop`.
+- **Broker** (`cb daemon`, `daemon.sock`): the control plane — tasks, status,
+  hooks, watchers, web — talking to the conductor via the `Engine` trait.
+- **Clients** (`cb` TUI, `cb web` browsers): use the broker for sidebar/tasks/
+  status and attach directly to the conductor for frames/input.
+
+Lifecycle: `cb restart` cycles the broker only (conductor + PTYs survive);
+`cb upgrade` hot-upgrades the conductor in place via `execve` (same pid → agents
+stay its children → `waitpid` still yields exit codes), snapshotting each
+terminal to replayable VT, handing the surviving PTY fds to the successor, and
+adopting them, confirmed by the `boot_id` changing while the pid holds; `cb stop`
+tears down both.
 
 ## Status model
 
@@ -162,6 +204,16 @@ in that picker.
 - Do not disable Codex's shared `features.hooks` flag during uninstall; remove
   only Codebridge's entries and owned script.
 - Preserve unrelated user configuration and dirty-worktree changes.
+- Keep the conductor's socket protocol decoupled from the client `VERSION`: a
+  broker rebuild must not force a conductor restart. Bump `CONDUCTOR_VERSION`
+  only for a real conductor-wire change, and never auto-restart a mismatched
+  conductor (it would kill live sessions).
+- Conductor hot-upgrade preserves the pid, so it stays the child's parent and
+  `waitpid` still yields exit codes; re-parenting to init would lose the clean/
+  crash distinction. Clear CLOEXEC on the master fds before `execve`, and snapshot
+  the terminal to replayable VT as late as possible — output the old reader
+  consumes in the tiny window before `execve` is the only thing that can be lost
+  (unread kernel PTY bytes survive for the successor to drain).
 
 ## Release
 
@@ -197,4 +249,7 @@ git push origin main vX.Y.Z
 
 CI runs the same fmt/clippy/test gate, so make it green locally first. A
 protocol-version bump (`src/protocol.rs`) means users must `cb restart` after
-upgrading; call that out in release notes.
+upgrading; call that out in release notes. If the release also changes conductor
+code (`src/conductor.rs`, `src/session.rs`, `src/terminal/`), tell users to run
+`cb upgrade` to move running sessions onto the new build without losing them —
+`cb restart` alone leaves the old conductor (and its sessions) in place.
