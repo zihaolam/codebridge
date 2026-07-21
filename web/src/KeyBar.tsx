@@ -1,7 +1,7 @@
 // Mobile key strip: the keys a phone keyboard doesn't have, sent as raw
-// bytes into the attached session, plus scrollback controls. A finger drag
-// pans the canonical frame natively, so daemon-side scrollback (history above
-// the live screen) lives here instead: ↑/↓ page through it and ⤓ jumps back
+// bytes into the attached session, plus explicit scrollback controls. A
+// vertical finger drag also browses daemon scrollback (see Term.tsx); these
+// buttons page it by a screenful: ↑/↓ step through history and ⤓ jumps back
 // to live. Term.tsx owns the offset, so ↑/↓ dispatch a window event it clamps.
 import type { CbClient } from './ws'
 import { KEYS } from './keys'

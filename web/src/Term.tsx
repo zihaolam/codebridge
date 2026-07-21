@@ -31,6 +31,13 @@ function measureCols(lines: string[]): number {
   return max
 }
 
+// Phones use the swappable list/term layout below this width (see the CSS
+// `@media (max-width: 768px)` breakpoint). Only there do we auto-claim the PTY
+// size — a desktop browser leaves the canonical size to the host TUI.
+function isMobile(): boolean {
+  return window.matchMedia('(max-width: 768px)').matches
+}
+
 function writeFrame(term: Terminal, f: Down, lines: string[]) {
   // Home + repaint each line with clear-to-EOL (avoids a full-screen clear,
   // which flickers), clear below, then park the cursor where the frame says.
@@ -46,6 +53,10 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
   const idRef = useRef<string | null>(null)
   const scrollRef = useRef({ offset: 0, max: 0 })
   const sentRef = useRef({ rows: 0, cols: 0 })
+  // Whether this phone has already claimed the PTY size for the current
+  // session. One-shot per attach so a later desktop `prefix z` reclaim isn't
+  // immediately fought back on the next viewport tick.
+  const claimedRef = useRef(false)
 
   // proposeGrid asks FitAddon what grid fills the pane; undefined while the
   // holder is hidden or unmeasured (e.g. mobile list view).
@@ -99,10 +110,17 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
       clearTimeout(timer)
       timer = setTimeout(() => {
         const g = proposeGrid()
+        if (!g || !idRef.current) return
         const sent = sentRef.current
-        if (g && idRef.current && (g.rows !== sent.rows || g.cols !== sent.cols)) {
+        if (g.rows !== sent.rows || g.cols !== sent.cols) {
           sentRef.current = g
           client.viewport(g.rows, g.cols)
+        }
+        // Fallback auto-claim for when the pane wasn't measurable at attach
+        // time (mobile list→term transition): claim once it has a real size.
+        if (isMobile() && !claimedRef.current) {
+          claimedRef.current = true
+          client.resize(g.rows, g.cols)
         }
       }, RESIZE_DEBOUNCE_MS)
     })
@@ -132,8 +150,20 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
       termRef.current?.reset()
       const g = proposeGrid()
       sentRef.current = g ?? { rows: 0, cols: 0 }
+      claimedRef.current = false
       client.attach(sessionId)
-      if (g) client.viewport(g.rows, g.cols)
+      if (g) {
+        client.viewport(g.rows, g.cols)
+        // On phones, claim the PTY at this screen's grid on load so the agent
+        // reflows to the phone width and vertical history (keybar ↑/↓) pages
+        // readably. Desktop stays presentation-only. If the pane isn't measured
+        // yet the ResizeObserver claims once it is; `prefix z` on the terminal
+        // reclaims the desktop size.
+        if (isMobile()) {
+          claimedRef.current = true
+          client.resize(g.rows, g.cols)
+        }
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, sessionId])
@@ -159,11 +189,8 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
     }
   }
 
-  // Daemon-side scrollback is now an explicit control (the keybar ↑/↓ buttons),
-  // not a drag gesture — a finger drag pans the canonical frame natively (both
-  // axes), so overloading vertical drag with scrollback would fight the native
-  // pan. A tap pages by roughly one screenful; dir +1 goes back in history
-  // (offset up from the live bottom), -1 toward live.
+  // Keybar ↑/↓ page daemon-side scrollback explicitly; dir +1 goes back in
+  // history (offset up from the live bottom), -1 toward live.
   useEffect(() => {
     const onScrollback = (e: Event) => {
       const dir = (e as CustomEvent<{ dir: number }>).detail?.dir ?? 0
@@ -173,6 +200,50 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
     }
     window.addEventListener('cb-scrollback', onScrollback)
     return () => window.removeEventListener('cb-scrollback', onScrollback)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [client])
+
+  // A vertical finger drag browses that same daemon scrollback. After the mobile
+  // auto-resize the frame fits the pane, so there is no native pan to fight (the
+  // reason this used to be button-only) — map drag distance straight to the
+  // scroll offset. Drag down (dy>0) reveals earlier output (offset up). A
+  // horizontal-dominant drag falls through to native pan for any line still
+  // wider than the pane. Non-passive so we can preventDefault the vertical case.
+  useEffect(() => {
+    const el = holder.current
+    if (!el) return
+    let startY = 0
+    let startX = 0
+    let startOffset = 0
+    let active = false
+    const onStart = (e: TouchEvent) => {
+      active = e.touches.length === 1
+      if (!active) return
+      startY = e.touches[0].clientY
+      startX = e.touches[0].clientX
+      startOffset = scrollRef.current.offset
+    }
+    const onMove = (e: TouchEvent) => {
+      if (!active || e.touches.length !== 1) return
+      const dy = e.touches[0].clientY - startY
+      const dx = e.touches[0].clientX - startX
+      if (Math.abs(dy) <= Math.abs(dx)) return // horizontal → leave native pan
+      e.preventDefault()
+      setOffset(startOffset + Math.round(dy / lineHeightPx))
+    }
+    const onEnd = () => {
+      active = false
+    }
+    el.addEventListener('touchstart', onStart, { passive: true })
+    el.addEventListener('touchmove', onMove, { passive: false })
+    el.addEventListener('touchend', onEnd, { passive: true })
+    el.addEventListener('touchcancel', onEnd, { passive: true })
+    return () => {
+      el.removeEventListener('touchstart', onStart)
+      el.removeEventListener('touchmove', onMove)
+      el.removeEventListener('touchend', onEnd)
+      el.removeEventListener('touchcancel', onEnd)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client])
 

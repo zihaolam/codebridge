@@ -165,13 +165,15 @@ struct HistoryModal {
 }
 
 /// One session surfaced by the historical picker, flattened from a task run.
-/// `first_message` is the human-readable label. A `live` run is currently
-/// running — selecting it jumps to that session by `cb_session_id`; otherwise
-/// the run is paused and resumable via its agent-native identity.
+/// The row is labelled by the agent-summarised `title` when present, falling
+/// back to `first_message`. A `live` run is currently running — selecting it
+/// jumps to that session by `cb_session_id`; otherwise the run is paused and
+/// resumable via its agent-native identity.
 struct HistoryEntry {
     task_id: String,
     run_id: String,
     agent: String,
+    title: String,
     first_message: String,
     auto: bool,
     live: bool,
@@ -850,6 +852,11 @@ fn handle_prefix(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
     let action = model.config.action_for_key(&name).map(str::to_owned);
     match action.as_deref() {
         Some("focus_screen") => model.focus = Focus::Screen,
+        // Re-claim the shared PTY at this terminal's pane size. A phone that
+        // resized the session down to its own viewport leaves the desktop
+        // rendering a tiny grid; this is the one-key reclaim (the phone's
+        // equivalent is the top-bar resize button).
+        Some("resize_pane") => resize_attached(model)?,
         Some("scroll") => {
             model.scroll_mode = true;
             scroll(model, model.pane.height.saturating_sub(1).max(1) as isize)?;
@@ -1566,6 +1573,7 @@ fn history_entries(model: &Model) -> Vec<HistoryEntry> {
                     task_id: task.id.clone(),
                     run_id: run.id.clone(),
                     agent: run.agent.clone(),
+                    title: run.title.clone(),
                     first_message: run.first_message.clone(),
                     auto: task.auto,
                     live: run.status == TaskStatus::InProgress,
@@ -2423,7 +2431,14 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
         }
         for (cursor, entry) in entries.iter().enumerate() {
             let selected = cursor == modal.cursor;
-            let label = entry.first_message.replace(['\n', '\t'], " ");
+            // Prefer the agent-summarised title; fall back to the first prompt
+            // until (or unless) the agent generates one.
+            let raw = if entry.title.trim().is_empty() {
+                &entry.first_message
+            } else {
+                &entry.title
+            };
+            let label = raw.replace(['\n', '\t'], " ");
             let label = label.trim();
             let label: String = if label.is_empty() {
                 "(no message yet)".to_owned()

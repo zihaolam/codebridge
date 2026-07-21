@@ -6,6 +6,7 @@ pub mod integration;
 pub mod notify;
 pub mod protocol;
 pub mod session;
+pub mod session_title;
 pub mod sidebar;
 pub mod task;
 pub mod terminal;

@@ -64,6 +64,11 @@ pub const ACTIONS: &[Action] = &[
         default: "l",
     },
     Action {
+        id: "resize_pane",
+        label: "resize session to this pane",
+        default: "z",
+    },
+    Action {
         id: "scroll",
         label: "enter scroll mode",
         default: "[",

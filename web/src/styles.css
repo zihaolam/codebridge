@@ -334,11 +334,12 @@ main {
   overflow-x: auto;
   overflow-y: auto;
   overscroll-behavior: contain;
-  /* Single scroll surface: a finger pans the canonical frame natively in both
-     axes. Daemon scrollback (history) is an explicit control (keybar ↑/↓), so
-     no gesture is overloaded. pan-x pan-y keeps native scroll but blocks
-     pinch/double-tap zoom, which would fight the fixed grid. */
-  touch-action: pan-x pan-y;
+  /* A vertical finger drag browses daemon scrollback (handled in Term.tsx,
+     which preventDefaults it); pan-x is left to the browser so any line wider
+     than the reflowed pane can still be panned horizontally. Withholding pan-y
+     hands the vertical gesture to our listener; blocking pinch/double-tap zoom
+     keeps the fixed grid from fighting a zoom. */
+  touch-action: pan-x;
   padding: 6px;
   background: #0d1117;
 }

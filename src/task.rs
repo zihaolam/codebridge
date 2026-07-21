@@ -28,10 +28,21 @@ pub struct TaskRun {
     #[serde(default)]
     pub agent_session_id: String,
     /// First prompt sent in this session, captured from the agent's
-    /// `UserPromptSubmit` hook (or seeded from a task prefill). Used as the
-    /// human-readable label in the historical-session picker.
+    /// `UserPromptSubmit` hook (or seeded from a task prefill). The
+    /// historical-session picker labels a run by its `title` and falls back to
+    /// this when no agent-generated title exists yet.
     #[serde(default)]
     pub first_message: String,
+    /// Absolute path to the agent's own transcript, captured from Claude hook
+    /// payloads (`transcript_path`). Empty for agents that do not report one
+    /// (e.g. Codex). Lets the broker read the agent-summarised title later.
+    #[serde(default)]
+    pub transcript_path: String,
+    /// Agent-summarised conversation title — Claude's `ai-title`, Codex's
+    /// `thread_name` — resolved lazily by the broker and shown in the picker in
+    /// preference to `first_message`. Empty until the agent generates one.
+    #[serde(default)]
+    pub title: String,
     pub status: TaskStatus,
     #[serde(default = "epoch", with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -160,6 +171,8 @@ impl TaskStore {
                 cb_session_id,
                 agent_session_id: String::new(),
                 first_message: String::new(),
+                transcript_path: String::new(),
+                title: String::new(),
                 status: TaskStatus::InProgress,
                 created_at: now,
                 updated_at: now,
@@ -204,6 +217,8 @@ impl TaskStore {
                     cb_session_id: task.cb_session_id.clone(),
                     agent_session_id: task.agent_session_id.clone(),
                     first_message: String::new(),
+                    transcript_path: String::new(),
+                    title: String::new(),
                     status: task.status,
                     created_at: task.created_at,
                     updated_at: task.updated_at,
@@ -282,6 +297,8 @@ mod tests {
             cb_session_id: "session".to_owned(),
             agent_session_id: String::new(),
             first_message: String::new(),
+            transcript_path: String::new(),
+            title: String::new(),
             status: TaskStatus::InProgress,
             created_at: now,
             updated_at: now,

@@ -38,6 +38,7 @@ pub struct Daemon {
     conductor: Box<dyn Engine>,
     watchers: Mutex<Vec<mpsc::Sender<()>>>,
     tasks: Mutex<TaskStore>,
+    titles: crate::session_title::TitleCache,
     shutdown: AtomicBool,
 }
 
@@ -55,6 +56,7 @@ impl Daemon {
             conductor,
             watchers: Mutex::new(Vec::new()),
             tasks: Mutex::new(TaskStore::load(task_path)),
+            titles: crate::session_title::TitleCache::default(),
             shutdown: AtomicBool::new(false),
         })
     }
@@ -528,6 +530,8 @@ impl Daemon {
                 cb_session_id: session_id.clone(),
                 agent_session_id: String::new(),
                 first_message: prefill,
+                transcript_path: String::new(),
+                title: String::new(),
                 status: TaskStatus::InProgress,
                 created_at: now,
                 updated_at: now,
@@ -708,6 +712,24 @@ impl Daemon {
         let mut dirty = false;
         for task in tasks.tasks_mut() {
             for run in &mut task.runs {
+                // Refresh the agent-summarised title for rows the historical
+                // picker can surface (live or paused). Resolution is source-
+                // mtime cached, and a `None` means no title yet — keep whatever
+                // was persisted rather than clearing it. Recency is untouched so
+                // a title landing does not reorder the picker.
+                if matches!(run.status, TaskStatus::InProgress | TaskStatus::Paused) {
+                    if let Some(title) = self.titles.resolve(
+                        &run.agent,
+                        &run.transcript_path,
+                        &run.agent_session_id,
+                        &run.cwd,
+                    ) {
+                        if run.title != title {
+                            run.title = title;
+                            dirty = true;
+                        }
+                    }
+                }
                 if run.status != TaskStatus::InProgress {
                     continue;
                 }
@@ -790,9 +812,10 @@ impl Daemon {
         {
             self.ensure_auto_session(&request.session);
         }
-        // Task-store side (broker-owned): fold the harness id and first message
-        // into the bound run.
-        if harness_id.is_some() || first_message.is_some() {
+        // Task-store side (broker-owned): fold the harness id, first message,
+        // and transcript path into the bound run. The transcript path lets the
+        // historical-session picker read the agent-summarised title later.
+        if harness_id.is_some() || first_message.is_some() || !transcript.is_empty() {
             self.update_run_for_session(&request.session, |run| {
                 let mut changed = false;
                 if let Some(id) = &harness_id {
@@ -806,6 +829,10 @@ impl Daemon {
                         run.first_message = message.clone();
                         changed = true;
                     }
+                }
+                if !transcript.is_empty() && run.transcript_path != transcript {
+                    run.transcript_path = transcript.to_owned();
+                    changed = true;
                 }
                 changed
             });
