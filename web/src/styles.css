@@ -541,8 +541,14 @@ main {
 .arrow-pad .key {
   padding: 7px 0;
 }
+.arrow-pad .k-pgup {
+  grid-area: 1 / 1;
+}
 .arrow-pad .k-up {
   grid-area: 1 / 2;
+}
+.arrow-pad .k-pgdn {
+  grid-area: 1 / 3;
 }
 .arrow-pad .k-left {
   grid-area: 2 / 1;
@@ -553,22 +559,56 @@ main {
 .arrow-pad .k-right {
   grid-area: 2 / 3;
 }
-.key-rows {
+/* The non-scrolling frame around the key rows: hosts the edge fades that
+   hint "more keys this way" without a scrollbar. */
+.key-rows-wrap {
   flex: 1;
   min-width: 0;
+  position: relative;
+}
+.key-rows-wrap::before,
+.key-rows-wrap::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 20px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 150ms ease;
+  z-index: 1;
+}
+.key-rows-wrap::before {
+  left: 0;
+  background: linear-gradient(to right, var(--panel), transparent);
+}
+.key-rows-wrap::after {
+  right: 0;
+  background: linear-gradient(to left, var(--panel), transparent);
+}
+.key-rows-wrap.fade-l::before {
+  opacity: 1;
+}
+.key-rows-wrap.fade-r::after {
+  opacity: 1;
+}
+.key-rows {
+  height: 100%;
   display: flex;
   flex-direction: column;
   gap: 6px;
   overflow-x: auto;
   overscroll-behavior: contain;
+  /* Scrollable, but no scrollbar: the edge fades are the affordance. */
+  scrollbar-width: none;
+}
+.key-rows::-webkit-scrollbar {
+  display: none;
 }
 .key-row {
   display: flex;
   gap: 6px;
   flex: 1;
-}
-.keybar .key-nav {
-  margin-left: auto;
 }
 .keybar .key-nav,
 .keybar .key-live {

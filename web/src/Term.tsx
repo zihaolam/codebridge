@@ -50,7 +50,12 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
   const idRef = useRef<string | null>(null)
-  const scrollRef = useRef({ offset: 0, max: 0 })
+  // Scrollback state. `target` is the client's intent and is authoritative:
+  // server frames echo the offset they were rendered at, which lags several
+  // frames behind during a fast swipe — adopting it would snap the view back.
+  // Frames may only update `max` (and clamp the target to it). `sent` dedupes
+  // the wire traffic.
+  const scrollRef = useRef({ target: 0, sent: 0, max: 0 })
   const sentRef = useRef({ rows: 0, cols: 0 })
   // Whether this phone has already claimed the PTY size for the current
   // session. One-shot per attach so a later desktop `prefix z` reclaim isn't
@@ -134,11 +139,13 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
 
   useEffect(() => {
     idRef.current = sessionId
-    scrollRef.current = { offset: 0, max: 0 }
+    scrollRef.current = { target: 0, sent: 0, max: 0 }
     client.onFrame = (f) => {
       const term = termRef.current
       if (!term || f.id !== idRef.current) return
-      scrollRef.current = { offset: f.offset ?? 0, max: f.max_offset ?? 0 }
+      const s = scrollRef.current
+      s.max = f.max_offset ?? 0
+      if (s.target > s.max) s.target = s.max
       const lines = (f.screen ?? '').split('\n')
       const cols = f.cols || measureCols(lines)
       const rows = f.rows || lines.length
@@ -204,28 +211,19 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
 
   const lineHeightPx = 17
 
+  // Clamp, record the client's intent, and send only genuine changes.
+  // Returns the applied (clamped) offset so callers can detect hitting an
+  // edge of the available history.
   const setOffset = (next: number) => {
     const s = scrollRef.current
-    next = Math.min(Math.max(next, 0), s.max)
-    if (next !== s.offset) {
-      s.offset = next
-      client.scroll(next)
+    const clamped = Math.min(Math.max(Math.round(next), 0), s.max)
+    s.target = clamped
+    if (clamped !== s.sent) {
+      s.sent = clamped
+      client.scroll(clamped)
     }
+    return clamped
   }
-
-  // Keybar ↑/↓ page daemon-side scrollback explicitly; dir +1 goes back in
-  // history (offset up from the live bottom), -1 toward live.
-  useEffect(() => {
-    const onScrollback = (e: Event) => {
-      const dir = (e as CustomEvent<{ dir: number }>).detail?.dir ?? 0
-      const visible = Math.floor((holder.current?.clientHeight ?? 0) / lineHeightPx)
-      const page = Math.max(1, visible - 1)
-      setOffset(scrollRef.current.offset + dir * page)
-    }
-    window.addEventListener('cb-scrollback', onScrollback)
-    return () => window.removeEventListener('cb-scrollback', onScrollback)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client])
 
   // A vertical finger drag browses that same daemon scrollback. After the mobile
   // auto-resize the frame fits the pane, so there is no native pan to fight (the
@@ -235,8 +233,9 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
   // wider than the pane. Non-passive so we can preventDefault the vertical case.
   //
   // Smoothness: sends are rAF-throttled (a 120Hz touch stream would otherwise
-  // queue round-trips and lag the finger), and lift-off continues with a
-  // decaying momentum fling like a native scroll view.
+  // queue round-trips and lag the finger), and lift-off continues with an
+  // iOS-like decaying momentum fling. The keybar's paging/live events share
+  // this closure so they can cancel a fling in flight.
   useEffect(() => {
     const el = holder.current
     if (!el) return
@@ -262,7 +261,7 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
       startX = e.touches[0].clientX
       lastT = performance.now()
       velocity = 0
-      startOffset = scrollRef.current.offset
+      startOffset = scrollRef.current.target
     }
     const onMove = (e: TouchEvent) => {
       if (!active || e.touches.length !== 1) return
@@ -276,7 +275,7 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
       if (dt > 0) velocity = 0.6 * ((y - lastY) / dt) + 0.4 * velocity
       lastY = y
       lastT = now
-      pendingOffset = startOffset + Math.round(dy / lineHeightPx)
+      pendingOffset = startOffset + dy / lineHeightPx
       if (!moveRaf) {
         moveRaf = requestAnimationFrame(() => {
           moveRaf = 0
@@ -287,26 +286,43 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
     const onEnd = () => {
       if (!active) return
       active = false
-      // Momentum: keep scrolling with exponential decay until it fades or a
-      // scrollback edge clamps the offset.
-      let acc = scrollRef.current.offset
+      // A finger held still before lifting means "stop here", not "fling with
+      // the speed from half a second ago".
+      if (performance.now() - lastT > 100) velocity = 0
+      if (Math.abs(velocity) < 0.05) return
+      // Momentum: continue from the drag's own target (never the laggy server
+      // echo) with iOS-like exponential decay, until it fades or a scrollback
+      // edge clamps the offset.
+      let acc = scrollRef.current.target
       let last = performance.now()
       const step = (now: number) => {
         flingRaf = 0
         const dt = Math.min(now - last, 64)
         last = now
-        velocity *= Math.pow(0.95, dt / 8)
+        velocity *= Math.pow(0.998, dt)
         acc += (velocity * dt) / lineHeightPx
-        const next = Math.round(acc)
-        const s = scrollRef.current
-        const clamped = Math.min(Math.max(next, 0), s.max)
-        if (clamped !== s.offset) setOffset(clamped)
-        if (Math.abs(velocity) > 0.02 && clamped === next) {
+        const applied = setOffset(acc)
+        if (Math.abs(velocity) > 0.02 && applied === Math.round(acc)) {
           flingRaf = requestAnimationFrame(step)
         }
       }
       flingRaf = requestAnimationFrame(step)
     }
+    // Keybar events: ⇞/⇟ page by a screenful (dir +1 = back into history),
+    // ⤓ jumps to live. Routed through here so they cancel a fling and keep
+    // the target authoritative.
+    const onScrollback = (e: Event) => {
+      stopFling()
+      const detail = (e as CustomEvent<{ dir?: number; live?: boolean }>).detail ?? {}
+      if (detail.live) {
+        setOffset(0)
+        return
+      }
+      const visible = Math.floor((holder.current?.clientHeight ?? 0) / lineHeightPx)
+      const page = Math.max(1, visible - 1)
+      setOffset(scrollRef.current.target + (detail.dir ?? 0) * page)
+    }
+    window.addEventListener('cb-scrollback', onScrollback)
     el.addEventListener('touchstart', onStart, { passive: true })
     el.addEventListener('touchmove', onMove, { passive: false })
     el.addEventListener('touchend', onEnd, { passive: true })
@@ -314,6 +330,7 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
     return () => {
       stopFling()
       if (moveRaf) cancelAnimationFrame(moveRaf)
+      window.removeEventListener('cb-scrollback', onScrollback)
       el.removeEventListener('touchstart', onStart)
       el.removeEventListener('touchmove', onMove)
       el.removeEventListener('touchend', onEnd)
@@ -332,7 +349,7 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
     const lines = Math.trunc(wheelAcc.current / lineHeightPx)
     if (lines !== 0) {
       wheelAcc.current -= lines * lineHeightPx
-      setOffset(scrollRef.current.offset - lines)
+      setOffset(scrollRef.current.target - lines)
     }
   }
 
