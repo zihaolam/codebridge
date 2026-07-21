@@ -20,7 +20,7 @@ use std::os::unix::io::RawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -108,6 +108,20 @@ pub enum ConductorRequest {
     /// agents. The conductor acknowledges before re-exec'ing; confirm success
     /// by observing the `boot_id` change on a later `Ping`.
     Upgrade,
+    /// Subscribe to lifecycle pokes. After acknowledging with an initial poke,
+    /// the connection carries one `LifecycleEvent` line whenever a session exits
+    /// (clean or crash), so the broker can reap/park and refresh promptly instead
+    /// of only on its polling cadence.
+    WatchLifecycle,
+}
+
+/// A conductor→broker lifecycle notification. It is a bare "something changed"
+/// poke: the broker reconciles by reaping and re-snapshotting, exactly as it
+/// does on its poll, so the payload stays minimal and forward-compatible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum LifecycleEvent {
+    Dirty,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -190,6 +204,9 @@ pub struct Conductor {
     codex_claimed: Arc<Mutex<HashSet<String>>>,
     shutdown: AtomicBool,
     boot_id: String,
+    /// Broker subscribers to lifecycle pokes. Each `WatchLifecycle` stream holds
+    /// one sender; a per-session monitor pokes them when a session exits.
+    event_subscribers: Mutex<Vec<mpsc::Sender<()>>>,
 }
 
 impl Conductor {
@@ -200,7 +217,44 @@ impl Conductor {
             codex_claimed: Arc::new(Mutex::new(HashSet::new())),
             shutdown: AtomicBool::new(false),
             boot_id: Uuid::new_v4().to_string(),
+            event_subscribers: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Registers a lifecycle subscriber, returning the receiver end. Each poke
+    /// signals that a session exited; the broker reconciles by reaping.
+    pub fn subscribe_events(&self) -> mpsc::Receiver<()> {
+        let (sender, receiver) = mpsc::channel();
+        if let Ok(mut subscribers) = self.event_subscribers.lock() {
+            subscribers.push(sender);
+        }
+        receiver
+    }
+
+    /// Pokes every live lifecycle subscriber, dropping any whose receiver is
+    /// gone (broker disconnected).
+    fn notify_events(&self) {
+        if let Ok(mut subscribers) = self.event_subscribers.lock() {
+            subscribers.retain(|subscriber| subscriber.send(()).is_ok());
+        }
+    }
+
+    /// Spawns a thread that pokes lifecycle subscribers the moment `session`
+    /// exits (clean or crash), so the broker reaps/parks and refreshes without
+    /// waiting for its poll. The thread holds the session alive only until it
+    /// exits — every session is eventually killed or exits, so it never leaks.
+    fn monitor_session_exit(self: &Arc<Self>, session: Arc<Session>) {
+        let conductor = Arc::clone(self);
+        let changes = session.subscribe();
+        thread::spawn(move || {
+            while !session.exited() {
+                if conductor.shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                Session::wait_for_change(&changes, Duration::from_millis(500));
+            }
+            conductor.notify_events();
+        });
     }
 
     /// Spawns a session on a fresh PTY and records it in the engine. Returns the
@@ -208,7 +262,7 @@ impl Conductor {
     /// is queued for the first hook or the bounded fallback timer. Recording the
     /// session as a task and notifying watchers are the caller's concern.
     pub fn spawn_session(
-        &self,
+        self: &Arc<Self>,
         argv: Vec<String>,
         cwd: String,
         rows: u16,
@@ -250,6 +304,7 @@ impl Conductor {
                         Arc::clone(&self.codex_claimed),
                     );
                 }
+                self.monitor_session_exit(Arc::clone(&session));
                 if let Ok(mut sessions) = self.sessions.write() {
                     sessions.insert(id.clone(), session);
                 }
@@ -492,7 +547,7 @@ impl Conductor {
     /// from its surviving master fd + child pid with its terminal replayed from
     /// the stashed VT bytes. Called by `cb conductor --resume <path>` before
     /// `run`, so the socket only comes up once the sessions are restored.
-    pub fn resume_from(&self, path: &Path) -> io::Result<()> {
+    pub fn resume_from(self: &Arc<Self>, path: &Path) -> io::Result<()> {
         let bytes = fs::read(path)?;
         let _ = fs::remove_file(path);
         let stash: ResumeStash = serde_json::from_slice(&bytes)
@@ -518,6 +573,7 @@ impl Conductor {
                 &vt,
             ) {
                 Ok(session) => {
+                    self.monitor_session_exit(Arc::clone(&session));
                     if let Ok(mut sessions) = self.sessions.write() {
                         sessions.insert(id.clone(), session);
                     }
@@ -531,6 +587,28 @@ impl Conductor {
             }
         }
         Ok(())
+    }
+
+    /// Streams lifecycle pokes to a subscribed broker. Sends an initial poke so
+    /// the broker reconciles immediately on (re)subscribe — catching any exits
+    /// that happened while it was disconnected (e.g. across a conductor
+    /// hot-upgrade) — then one poke per session exit. A stale subscriber whose
+    /// broker has gone is dropped on the next poke, when the write fails.
+    fn stream_lifecycle(self: &Arc<Self>, stream: UnixStream) -> io::Result<()> {
+        let events = self.subscribe_events();
+        let mut writer = BufWriter::new(stream);
+        write_json(&mut writer, &LifecycleEvent::Dirty)?;
+        loop {
+            match events.recv_timeout(Duration::from_secs(30)) {
+                Ok(()) => write_json(&mut writer, &LifecycleEvent::Dirty)?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self.shutdown.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        }
     }
 
     /// Streams semantic terminal frames for one session to an attached client
@@ -754,6 +832,11 @@ impl Conductor {
             if let ConductorRequest::Attach { id, rows, cols } = request {
                 return self.attach(stream, reader, &id, rows, cols);
             }
+            // WatchLifecycle likewise takes over the connection for its life,
+            // streaming pokes to the broker.
+            if matches!(request, ConductorRequest::WatchLifecycle) {
+                return self.stream_lifecycle(stream);
+            }
             // Upgrade acks first so `cb upgrade` learns the request landed, then
             // re-execs in place. On success the exec never returns; on failure
             // we log and keep serving on the current build with sessions intact.
@@ -888,6 +971,11 @@ impl Conductor {
                 error: "upgrade must be handled before control dispatch".to_owned(),
                 ..ConductorResponse::default()
             },
+            // WatchLifecycle is intercepted before dispatch; reaching here is a bug.
+            ConductorRequest::WatchLifecycle => ConductorResponse {
+                error: "watch_lifecycle must be the terminal request on a connection".to_owned(),
+                ..ConductorResponse::default()
+            },
         }
     }
 }
@@ -1006,6 +1094,10 @@ pub trait Engine: Send + Sync {
         harness: &str,
         transcript: &str,
     ) -> bool;
+    /// A stream of lifecycle pokes (a session exited) so the broker can reap,
+    /// park, and refresh promptly rather than only on its poll. `None` if this
+    /// engine offers no push channel.
+    fn lifecycle_events(&self) -> Option<mpsc::Receiver<()>>;
 }
 
 impl Engine for Arc<Conductor> {
@@ -1051,6 +1143,9 @@ impl Engine for Arc<Conductor> {
         transcript: &str,
     ) -> bool {
         Conductor::apply_hook(self, id, status, message, harness, transcript)
+    }
+    fn lifecycle_events(&self) -> Option<mpsc::Receiver<()>> {
+        Some(Conductor::subscribe_events(self))
     }
 }
 
@@ -1213,6 +1308,37 @@ impl Engine for ConductorClient {
         .map(|response| response.applied)
         .unwrap_or(false)
     }
+
+    fn lifecycle_events(&self) -> Option<mpsc::Receiver<()>> {
+        // A dedicated forwarder thread holds a `WatchLifecycle` stream and
+        // relays each poke onto the channel. It reconnects on drop, so lifecycle
+        // events resume after a conductor hot-upgrade or a transient disconnect.
+        let (sender, receiver) = mpsc::channel();
+        let socket = self.socket.clone();
+        thread::spawn(move || loop {
+            if let Ok(mut stream) = UnixStream::connect(&socket) {
+                let subscribed =
+                    serde_json::to_writer(&mut stream, &ConductorRequest::WatchLifecycle).is_ok()
+                        && stream.write_all(b"\n").is_ok()
+                        && stream.flush().is_ok();
+                if subscribed {
+                    // Any line is a poke; parsing is unnecessary.
+                    for line in BufReader::new(stream).lines() {
+                        if line.is_err() || sender.send(()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            // Unreachable or dropped (e.g. a conductor hot-upgrade): back off,
+            // then resubscribe. Exits if the broker dropped the receiver.
+            if sender.send(()).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(500));
+        });
+        Some(receiver)
+    }
 }
 
 #[cfg(test)]
@@ -1371,6 +1497,27 @@ mod tests {
         assert_eq!(reaped, vec![(clean.clone(), "sess-clean".to_owned())]);
         assert!(conductor.lookup(&clean).is_none(), "clean exit reaped");
         assert!(conductor.lookup(&crash).is_some(), "crash stays visible");
+    }
+
+    #[test]
+    fn session_exit_pokes_lifecycle_subscribers() {
+        let conductor = Conductor::new();
+        let events = conductor.subscribe_events();
+        conductor
+            .spawn_session(
+                vec!["/bin/sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
+                "/tmp".to_owned(),
+                4,
+                40,
+                String::new(),
+            )
+            .expect("spawn");
+        // The per-session monitor pokes subscribers the moment the child exits,
+        // so the broker can reap/park without waiting for its poll.
+        assert!(
+            events.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "no lifecycle poke on session exit"
+        );
     }
 
     #[test]

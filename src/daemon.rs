@@ -80,6 +80,7 @@ impl Daemon {
         }
         let listener = UnixListener::bind(path)?;
         listener.set_nonblocking(true)?;
+        self.spawn_lifecycle_listener();
         while !self.shutdown.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -271,6 +272,27 @@ impl Daemon {
     /// its bound run is parked so it stays resumable from the history picker.
     /// Sessions that crashed (non-zero exit or signal) are left in place so
     /// their ended row stays visible. A no-op when nothing exited cleanly.
+    /// Subscribes to the conductor's lifecycle pokes and reaps/parks/refreshes on
+    /// each one, so a session exit is reflected promptly instead of only on the
+    /// watch poll. A no-op for engines with no push channel.
+    fn spawn_lifecycle_listener(self: &Arc<Self>) {
+        let Some(events) = self.conductor.lifecycle_events() else {
+            return;
+        };
+        let daemon = Arc::clone(self);
+        thread::spawn(move || {
+            while events.recv().is_ok() {
+                if daemon.shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                // reap_and_park notifies watchers when it reaps a clean exit;
+                // the extra notify refreshes on a crash exit (kept visible) too.
+                daemon.reap_and_park();
+                daemon.notify_watchers();
+            }
+        });
+    }
+
     fn reap_and_park(&self) {
         let reaped = self.conductor.reap();
         if reaped.is_empty() {

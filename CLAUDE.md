@@ -66,7 +66,9 @@ tears down both processes.
 - `src/daemon.rs` is the broker: the control plane on `daemon.sock`. It owns
   tasks, hook→status mapping, watchers, and web spawn, and delegates every
   session fact to the conductor via the `Engine` trait. It is never in the data
-  path — clients attach straight to the conductor — so it can restart freely.
+  path — clients attach straight to the conductor — so it can restart freely. It
+  reaps/parks and refreshes promptly on lifecycle pokes the conductor pushes when
+  a session exits (`WatchLifecycle`), with its watch poll as a fallback.
 - `src/protocol.rs` is line-delimited JSON between clients and the broker (one-
   shot requests and streaming messages). Bump `VERSION` on every wire-shape or
   semantic wire change. The conductor's socket protocol carries its own
