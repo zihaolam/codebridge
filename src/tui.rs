@@ -2407,15 +2407,14 @@ fn detect_host_theme(stdout: &mut impl Write) -> crate::terminal_theme::Terminal
 
 struct View {
     sidebar: Rect,
-    header: Option<Rect>,
     pane: Rect,
     footer: Option<Rect>,
     scrollbar: Option<Rect>,
 }
 
 /// Split the screen into chrome and the agent pane. The footer keybar spans
-/// the full width; the header bar spans the main column only. Both give way
-/// on tiny terminals so the agent pane always survives.
+/// the full width; the agent pane fills the whole main column. The footer
+/// gives way on tiny terminals so the agent pane always survives.
 fn view(scrollback: bool, area: Rect) -> View {
     let footer_height = u16::from(area.height >= 6);
     let [content, footer] = Layout::default()
@@ -2426,22 +2425,15 @@ fn view(scrollback: bool, area: Rect) -> View {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)])
         .areas(content);
-    let header_height = u16::from(main.height >= 4);
-    let [header, pane_area] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(header_height), Constraint::Min(1)])
-        .areas(main);
-    let has_scrollbar = scrollback && pane_area.width > 1;
+    let has_scrollbar = scrollback && main.width > 1;
     View {
         sidebar,
-        header: (header_height > 0).then_some(header),
         pane: Rect {
-            width: pane_area.width.saturating_sub(u16::from(has_scrollbar)),
-            ..pane_area
+            width: main.width.saturating_sub(u16::from(has_scrollbar)),
+            ..main
         },
         footer: (footer_height > 0).then_some(footer),
-        scrollbar: has_scrollbar
-            .then(|| Rect::new(pane_area.right() - 1, pane_area.y, 1, pane_area.height)),
+        scrollbar: has_scrollbar.then(|| Rect::new(main.right() - 1, main.y, 1, main.height)),
     }
 }
 
@@ -2462,9 +2454,6 @@ fn compute_view(model: &mut Model, area: Rect) {
 fn render(model: &Model, frame: &mut Frame) {
     let view = model_view(model, frame.area());
     render_sidebar(model, frame, view.sidebar);
-    if let Some(header) = view.header {
-        render_header(model, frame, header);
-    }
     render_terminal(model, frame);
     if let Some(scrollbar) = view.scrollbar {
         render_scrollbar(model, frame, scrollbar);
@@ -2536,139 +2525,6 @@ fn shorten_path(path: &str, home: Option<&str>, max: usize) -> String {
     format!("…{tail}")
 }
 
-fn agent_name(session: &SessionInfo) -> Option<String> {
-    session
-        .argv
-        .first()
-        .map(|argv0| {
-            Path::new(argv0)
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| argv0.clone())
-        })
-        .filter(|name| !name.is_empty())
-}
-
-fn render_header(model: &Model, frame: &mut Frame, area: Rect) {
-    let palette = &model.palette;
-    let bar = Style::default()
-        .bg(palette.surface_dim)
-        .fg(palette.subtext0);
-    let Some(session) = model.attached_session() else {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                " ◇ codebridge",
-                Style::default().fg(palette.overlay0),
-            ))
-            .style(bar),
-            area,
-        );
-        return;
-    };
-    let (glyph, glyph_color) = indicator(session, model.spin, palette);
-    let agent = agent_name(session).unwrap_or_default();
-    let right = match model.frame.as_ref().filter(|terminal| terminal.offset > 0) {
-        Some(terminal) => Span::styled(
-            format!("⇅ {}/{} ", terminal.offset, terminal.max_offset),
-            Style::default()
-                .fg(palette.yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        None => Span::styled(
-            format!(
-                "{} ",
-                shorten_path(
-                    &session.cwd,
-                    std::env::var("HOME").ok().as_deref(),
-                    usize::from(area.width / 3),
-                )
-            ),
-            Style::default().fg(palette.overlay1),
-        ),
-    };
-    let right_width = Line::from(right.clone()).width();
-    let fixed = 3 + if agent.is_empty() {
-        0
-    } else {
-        agent.chars().count() + 2
-    };
-    let title_max = usize::from(area.width)
-        .saturating_sub(fixed + right_width)
-        .saturating_sub(2);
-    let title = truncate_with_ellipsis(session_label(session, &model.tasks), title_max);
-    let title_color = if model.focus == Focus::Screen {
-        palette.text
-    } else {
-        palette.subtext0
-    };
-    let mut spans = vec![
-        Span::raw(" "),
-        Span::styled(glyph.to_string(), Style::default().fg(glyph_color)),
-        Span::raw(" "),
-        Span::styled(
-            title,
-            Style::default()
-                .fg(title_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if !agent.is_empty() {
-        spans.push(Span::styled(
-            format!("  {agent}"),
-            Style::default().fg(palette.overlay1),
-        ));
-    }
-    let used = Line::from(spans.clone()).width();
-    let gap = usize::from(area.width).saturating_sub(used + right_width);
-    if gap > 0 {
-        spans.push(Span::raw(" ".repeat(gap)));
-        spans.push(right);
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
-}
-
-/// Colored per-status counters for the footer, non-zero counts only.
-fn status_count_spans(model: &Model) -> Vec<Span<'static>> {
-    let palette = &model.palette;
-    let count = |status| {
-        model
-            .sidebar
-            .sessions()
-            .iter()
-            .filter(|session| session.status == status)
-            .count()
-    };
-    let mut spans = Vec::new();
-    let states = [
-        (
-            SPINNERS[model.spin % SPINNERS.len()],
-            palette.green,
-            count(Status::Working),
-        ),
-        ('⚑', palette.red, count(Status::NeedsApproval)),
-        ('●', palette.green, count(Status::WaitingUser)),
-        ('●', palette.yellow, count(Status::Idle)),
-        ('✗', palette.overlay0, count(Status::Ended)),
-    ];
-    for (glyph, color, total) in states {
-        if total == 0 {
-            continue;
-        }
-        if !spans.is_empty() {
-            spans.push(Span::raw("  "));
-        }
-        spans.push(Span::styled(
-            format!("{glyph} "),
-            Style::default().fg(color),
-        ));
-        spans.push(Span::styled(
-            total.to_string(),
-            Style::default().fg(palette.subtext0),
-        ));
-    }
-    spans
-}
-
 fn badge(text: &str, background: Color, palette: &Palette) -> Span<'static> {
     Span::styled(
         format!(" {text} "),
@@ -2716,32 +2572,44 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     } else {
-        let prefix_help = format!("{prefix} ?");
         let hints: &[(&str, &str)] = match model.focus {
             Focus::Sidebar => &[
                 ("j/k", "move"),
                 ("enter", "attach"),
-                (prefix_help.as_str(), "commands"),
+                ("prefix ?", "commands"),
             ],
-            Focus::Screen => &[
-                (prefix.as_str(), "prefix"),
-                ("shift+drag", "select"),
-                (prefix_help.as_str(), "commands"),
-            ],
+            Focus::Screen => &[(prefix.as_str(), "prefix"), ("prefix ?", "commands")],
         };
         left.extend(hint_spans(palette, hints));
     }
 
-    let mut right = status_count_spans(model);
-    let scope = if model.sidebar.accordion() {
-        "all workspaces".to_owned()
-    } else {
-        scope_display_name(model.sidebar.current_scope())
-    };
-    if !right.is_empty() {
-        right.push(Span::styled("  │  ", Style::default().fg(palette.overlay0)));
+    // The footer's right edge tracks the attached pane: an optional scroll
+    // position, the pane's own status indicator, then its working directory.
+    let mut right: Vec<Span> = Vec::new();
+    if let Some(terminal) = model.frame.as_ref().filter(|terminal| terminal.offset > 0) {
+        right.push(Span::styled(
+            format!("⇅ {}/{}", terminal.offset, terminal.max_offset),
+            Style::default()
+                .fg(palette.yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
-    right.push(Span::styled(scope, Style::default().fg(palette.overlay1)));
+    if let Some(session) = model.attached_session() {
+        if !right.is_empty() {
+            right.push(Span::styled("  │  ", Style::default().fg(palette.overlay0)));
+        }
+        let (glyph, glyph_color) = indicator(session, model.spin, palette);
+        right.push(Span::styled(
+            format!("{glyph} "),
+            Style::default().fg(glyph_color),
+        ));
+        let dir = shorten_path(
+            &session.cwd,
+            std::env::var("HOME").ok().as_deref(),
+            usize::from(area.width / 3),
+        );
+        right.push(Span::styled(dir, Style::default().fg(palette.overlay1)));
+    }
     right.push(Span::raw(" "));
 
     let left_width = Line::from(left.clone()).width();
@@ -3426,9 +3294,9 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
     }
 
     let (icon, scope) = if model.sidebar.accordion() {
-        ('⌗', "all workspaces".to_owned())
+        ('≡', "all workspaces".to_owned())
     } else {
-        ('⌂', scope_display_name(model.sidebar.current_scope()))
+        ('📁', scope_display_name(model.sidebar.current_scope()))
     };
     let scope = truncate_with_ellipsis(scope, usize::from(inner.width).saturating_sub(3));
     frame.render_widget(
@@ -3986,36 +3854,33 @@ mod tests {
     }
 
     #[test]
-    fn view_reserves_header_and_footer_around_the_pane() {
+    fn view_reserves_footer_around_the_pane() {
         let area = Rect::new(0, 0, 120, 40);
         let live = view(false, area);
-        // Footer spans the full width on the last row; header tops the main
-        // column; the pane fills the rest of the main column.
+        // Footer spans the full width on the last row; the pane fills the whole
+        // main column (no titlebar).
         assert_eq!(live.footer, Some(Rect::new(0, 39, 120, 1)));
-        assert_eq!(live.header, Some(Rect::new(SIDEBAR_WIDTH, 0, 90, 1)));
-        assert_eq!(live.pane, Rect::new(SIDEBAR_WIDTH, 1, 90, 38));
+        assert_eq!(live.pane, Rect::new(SIDEBAR_WIDTH, 0, 90, 39));
         assert_eq!(live.sidebar, Rect::new(0, 0, SIDEBAR_WIDTH, 39));
         assert!(live.scrollbar.is_none());
 
-        // Scrollback claims the pane's rightmost column, below the header.
+        // Scrollback claims the pane's rightmost column, full height.
         let scrolled = view(true, area);
         assert_eq!(scrolled.pane.width, 89);
-        assert_eq!(scrolled.scrollbar, Some(Rect::new(119, 1, 1, 38)));
+        assert_eq!(scrolled.scrollbar, Some(Rect::new(119, 0, 1, 39)));
     }
 
     #[test]
     fn view_degrades_gracefully_on_tiny_terminals() {
-        // Too short for any chrome: the pane takes everything.
+        // Too short for a footer: the pane takes everything.
         let tiny = view(false, Rect::new(0, 0, 80, 3));
         assert!(tiny.footer.is_none());
-        assert!(tiny.header.is_none());
         assert_eq!(tiny.pane, Rect::new(SIDEBAR_WIDTH, 0, 50, 3));
 
-        // Four rows fit a header but not yet a footer.
-        let short = view(false, Rect::new(0, 0, 80, 4));
-        assert!(short.footer.is_none());
-        assert!(short.header.is_some());
-        assert_eq!(short.pane, Rect::new(SIDEBAR_WIDTH, 1, 50, 3));
+        // Six rows fit the footer keybar.
+        let short = view(false, Rect::new(0, 0, 80, 6));
+        assert!(short.footer.is_some());
+        assert_eq!(short.pane, Rect::new(SIDEBAR_WIDTH, 0, 50, 5));
     }
 
     fn test_model() -> Model {
@@ -4071,8 +3936,8 @@ mod tests {
         // Empty state with header/footer bars.
         draw(&mut model);
 
-        // A live attached session with scrollback drives the header session
-        // path, sidebar rows, terminal cells, and the scrollbar.
+        // A live attached session with scrollback drives the footer working
+        // directory, sidebar rows, terminal cells, and the scrollbar.
         let session = SessionInfo {
             id: "abcd1234-rest".to_owned(),
             name: String::new(),
