@@ -3055,10 +3055,12 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
     if let Some(modal) = model.history_modal.as_ref() {
         let inner = panel_inner_width(area, 82);
         let entries = history_entries(model);
-        // Two panel rows belong to the hints and two to the border. Window the
-        // history itself to the remaining height so the selected row never
-        // disappears below the panel.
-        let visible = usize::from(area.height.saturating_sub(4).max(1));
+        // Cap the panel at 80% of the terminal height so a long history never
+        // fills the whole screen. Two of those rows belong to the hints and two
+        // to the border; window the history itself to what remains so the
+        // selected row never disappears below the panel.
+        let max_panel = area.height.saturating_mul(4) / 5;
+        let visible = usize::from(max_panel.saturating_sub(4).max(1));
         let start = history_viewport_start(modal.cursor, entries.len(), visible);
         let mut lines = Vec::new();
         if entries.is_empty() {
