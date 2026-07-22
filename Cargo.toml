@@ -1,6 +1,6 @@
 [package]
 name = "codebridge"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 build = "build.rs"
 description = "An agent-session multiplexer and manager"
@@ -17,6 +17,7 @@ libc = "0.2"
 portable-pty = "0.9"
 qrcode = { version = "0.14", default-features = false }
 ratatui = "0.30"
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -5,8 +5,9 @@
 //! `--resume` picker shows. The value is regenerated as the conversation
 //! evolves and its latest occurrence sits within the final few percent of the
 //! file, so a bounded tail read finds the current title regardless of transcript
-//! size. Codex keeps one `{"id":"…","thread_name":"…"}` row per thread in
-//! `session_index.jsonl`, most recent last.
+//! size. Current Codex versions keep thread titles in `state_5.sqlite`; older
+//! versions used `{"id":"…","thread_name":"…"}` rows in
+//! `session_index.jsonl`, which remains a fallback for historical installs.
 //!
 //! Both are keyed by an id Codebridge already stores, so the historical-session
 //! picker (`prefix m`) can label rows with the agent's own summary and fall back
@@ -31,7 +32,7 @@ const TAIL_BYTES: u64 = 256 * 1024;
 pub struct TitleCache {
     /// Claude: keyed by transcript path -> (source fingerprint, title).
     claude: Mutex<HashMap<PathBuf, ClaudeEntry>>,
-    /// Codex: the whole `session_index.jsonl` parsed to id -> thread_name.
+    /// Codex: current SQLite titles merged over the legacy JSONL index.
     codex: Mutex<CodexEntry>,
 }
 
@@ -43,9 +44,21 @@ struct ClaudeEntry {
 
 #[derive(Default)]
 struct CodexEntry {
+    fingerprint: CodexFingerprint,
+    names: HashMap<String, String>,
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct CodexFingerprint {
+    database: FileFingerprint,
+    wal: FileFingerprint,
+    index: FileFingerprint,
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct FileFingerprint {
     mtime: Option<SystemTime>,
     len: u64,
-    names: HashMap<String, String>,
 }
 
 impl TitleCache {
@@ -98,20 +111,36 @@ impl TitleCache {
         if id.is_empty() {
             return None;
         }
-        let path = codex_index_path()?;
-        let meta = fs::metadata(&path).ok();
-        let mtime = meta.as_ref().and_then(|m| m.modified().ok());
-        let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let base = codex_home()?;
+        let database = base.join("state_5.sqlite");
+        let wal = base.join("state_5.sqlite-wal");
+        let index = base.join("session_index.jsonl");
+        let fingerprint = CodexFingerprint {
+            database: file_fingerprint(&database),
+            wal: file_fingerprint(&wal),
+            index: file_fingerprint(&index),
+        };
         let mut cache = self.codex.lock().ok()?;
-        if cache.mtime != mtime || cache.len != len {
-            cache.names = fs::read(&path)
+        if cache.fingerprint != fingerprint {
+            let mut names = fs::read(&index)
                 .ok()
                 .map(|bytes| parse_codex_index(&bytes))
                 .unwrap_or_default();
-            cache.mtime = mtime;
-            cache.len = len;
+            // SQLite is the current source of truth. Insert it last so it also
+            // wins when an old index row exists for the same thread.
+            names.extend(read_codex_database(&database));
+            cache.names = names;
+            cache.fingerprint = fingerprint;
         }
         cache.names.get(id).cloned()
+    }
+}
+
+fn file_fingerprint(path: &Path) -> FileFingerprint {
+    let meta = fs::metadata(path).ok();
+    FileFingerprint {
+        mtime: meta.as_ref().and_then(|meta| meta.modified().ok()),
+        len: meta.as_ref().map(|meta| meta.len()).unwrap_or(0),
     }
 }
 
@@ -147,16 +176,15 @@ fn claude_projects_dir() -> Option<PathBuf> {
     Some(base.join("projects"))
 }
 
-fn codex_index_path() -> Option<PathBuf> {
-    let base = std::env::var_os("CODEX_HOME")
+fn codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME")
                 .filter(|value| !value.is_empty())
                 .map(|home| PathBuf::from(home).join(".codex"))
-        })?;
-    Some(base.join("session_index.jsonl"))
+        })
 }
 
 /// Claude encodes a project directory into its `projects/` folder name by
@@ -230,6 +258,32 @@ fn parse_codex_index(bytes: &[u8]) -> HashMap<String, String> {
     map
 }
 
+fn read_codex_database(path: &Path) -> HashMap<String, String> {
+    use rusqlite::{Connection, OpenFlags};
+
+    let Ok(connection) = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return HashMap::new();
+    };
+    let Ok(mut statement) = connection.prepare("SELECT id, title FROM threads WHERE title != ''")
+    else {
+        return HashMap::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) else {
+        return HashMap::new();
+    };
+    rows.filter_map(Result::ok)
+        .filter_map(|(id, title)| {
+            let title = title.trim();
+            (!id.is_empty() && !title.is_empty()).then(|| (id, title.to_owned()))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +341,34 @@ mod tests {
         let map = parse_codex_index(jsonl.as_bytes());
         assert_eq!(map.get("a"), Some(&"new name".to_owned()));
         assert_eq!(map.get("b"), Some(&"other".to_owned()));
+    }
+
+    #[test]
+    fn reads_codex_titles_from_current_database() {
+        let path = std::env::temp_dir().join(format!(
+            "cb-codex-title-{}-{}.sqlite",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, title) VALUES (?1, ?2), (?3, ?4)",
+                ("current", "Summarised title", "blank", "  "),
+            )
+            .unwrap();
+        drop(connection);
+
+        let names = read_codex_database(&path);
+        assert_eq!(names.get("current"), Some(&"Summarised title".to_owned()));
+        assert!(!names.contains_key("blank"));
+        let _ = fs::remove_file(path);
     }
 
     #[test]
