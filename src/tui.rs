@@ -16,7 +16,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, size, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
@@ -1717,6 +1717,17 @@ fn handle_history_modal(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => keep_open = false,
+        // Ctrl+Up/Ctrl+Down scroll by half a page and clamp at the ends, like
+        // Neovim's Ctrl-U/Ctrl-D. Half of the on-screen viewport keeps them in
+        // step with what the panel actually shows.
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) && !entries.is_empty() => {
+            let step = (history_visible_rows(size().map_or(24, |(_, rows)| rows)) / 2).max(1);
+            modal.cursor = modal.cursor.saturating_sub(step);
+        }
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) && !entries.is_empty() => {
+            let step = (history_visible_rows(size().map_or(24, |(_, rows)| rows)) / 2).max(1);
+            modal.cursor = (modal.cursor + step).min(entries.len().saturating_sub(1));
+        }
         KeyCode::Up | KeyCode::Char('k') if !entries.is_empty() => {
             modal.cursor = previous_history_cursor(modal.cursor, entries.len());
         }
@@ -1782,6 +1793,13 @@ fn next_history_cursor(cursor: usize, entry_count: usize) -> usize {
     } else {
         (cursor + 1) % entry_count
     }
+}
+
+/// Rows of history the panel shows: capped at 80% of the terminal height, less
+/// the four rows spent on the border and hints. Shared by the renderer and the
+/// keyboard handler so half-page scrolling matches what is on screen.
+fn history_visible_rows(term_height: u16) -> usize {
+    usize::from((term_height.saturating_mul(4) / 5).saturating_sub(4).max(1))
 }
 
 /// Keep the selected history row within a fixed-height viewport. The viewport
@@ -3056,11 +3074,9 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
         let inner = panel_inner_width(area, 82);
         let entries = history_entries(model);
         // Cap the panel at 80% of the terminal height so a long history never
-        // fills the whole screen. Two of those rows belong to the hints and two
-        // to the border; window the history itself to what remains so the
-        // selected row never disappears below the panel.
-        let max_panel = area.height.saturating_mul(4) / 5;
-        let visible = usize::from(max_panel.saturating_sub(4).max(1));
+        // fills the whole screen; window the history itself to what remains so
+        // the selected row never disappears below the panel.
+        let visible = history_visible_rows(area.height);
         let start = history_viewport_start(modal.cursor, entries.len(), visible);
         let mut lines = Vec::new();
         if entries.is_empty() {
@@ -4340,6 +4356,15 @@ mod tests {
         assert_eq!(next_history_cursor(2, 3), 0);
         assert_eq!(previous_history_cursor(2, 3), 1);
         assert_eq!(previous_history_cursor(0, 3), 2);
+    }
+
+    #[test]
+    fn history_visible_rows_caps_at_eighty_percent_less_chrome() {
+        // 80% of 50 rows is 40; four go to border + hints, leaving 36.
+        assert_eq!(history_visible_rows(50), 36);
+        // A tiny terminal still yields at least one row.
+        assert_eq!(history_visible_rows(1), 1);
+        assert_eq!(history_visible_rows(0), 1);
     }
 
     #[test]
