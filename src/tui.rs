@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,14 +19,14 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::{Frame, Terminal};
 use time::OffsetDateTime;
 
-use crate::conductor::{conductor_socket_path, ConductorRequest};
+use crate::conductor::{conductor_socket_path, ConductorRequest, ConductorResponse};
 use crate::config::Config;
 use crate::daemon::socket_path;
 use crate::protocol::{
@@ -55,6 +56,28 @@ enum Focus {
 struct Attach {
     id: String,
     writer: BufWriter<UnixStream>,
+}
+
+/// A terminal editor (e.g. nvim) hosted inside cb as a floating popup. It is a
+/// hidden conductor PTY session cb attaches to a second time and renders over
+/// the main UI; it never appears in the sidebar. Closed when its process exits
+/// (the attach reports `Gone`), which is the only close path — there is no
+/// keyboard shortcut, so every key reaches the editor.
+struct Popup {
+    attach: Attach,
+    frame: Option<TerminalFrame>,
+    title: String,
+    /// The inner grid size last sent to the PTY, so a terminal resize only
+    /// re-sends when the popup's interior actually changes.
+    size: (u16, u16),
+}
+
+/// A popup open deferred to the main loop, where the `Sender` needed to start
+/// the second attach is in scope (the key handler has no access to it).
+struct PendingPopup {
+    argv: Vec<String>,
+    cwd: String,
+    title: String,
 }
 
 struct Toast {
@@ -190,6 +213,8 @@ struct Model {
     scroll_mode: bool,
     frame: Option<TerminalFrame>,
     attach: Option<Attach>,
+    popup: Option<Popup>,
+    pending_popup: Option<PendingPopup>,
     error: String,
     previous_status: HashMap<String, Status>,
     pending_notifications: HashMap<String, PendingNotification>,
@@ -279,6 +304,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         scroll_mode: false,
         frame: None,
         attach: None,
+        popup: None,
+        pending_popup: None,
         error: String::new(),
         previous_status: HashMap::new(),
         pending_notifications: HashMap::new(),
@@ -314,6 +341,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let size = terminal.size()?;
         compute_view(&mut model, Rect::new(0, 0, size.width, size.height));
         sync_attach(&mut model, sender.clone())?;
+        if model.pending_popup.is_some() {
+            open_popup(&mut model, sender.clone())?;
+        }
+        resize_popup(&mut model)?;
         // Focusing a session's screen clears any toast still standing for it,
         // however focus arrived — keyboard, a click into the pane, or a jump.
         // Run it here (after `sync_attach` reconciles `attach` with the current
@@ -339,7 +370,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Event::Resize(_, _) => resize_attached(&mut model)?,
-                Event::Paste(text) => handle_paste(&mut model, &text)?,
+                Event::Paste(text) => {
+                    if model.popup.is_some() {
+                        send_popup_paste(&mut model, &text)?;
+                    } else {
+                        handle_paste(&mut model, &text)?;
+                    }
+                }
                 Event::FocusGained => {
                     model.outer_focused = true;
                     send_focus(&mut model, true)?;
@@ -564,6 +601,27 @@ fn drain_events(model: &mut Model, receiver: &Receiver<UiEvent>) {
                 expire_toasts(model);
             }
             UiEvent::Frame(id, frame)
+                if model
+                    .popup
+                    .as_ref()
+                    .is_some_and(|popup| popup.attach.id == id) =>
+            {
+                if let Some(popup) = model.popup.as_mut() {
+                    popup.frame = Some(frame);
+                }
+            }
+            UiEvent::Gone(id, _)
+                if model
+                    .popup
+                    .as_ref()
+                    .is_some_and(|popup| popup.attach.id == id) =>
+            {
+                // The editor process exited (however it quit) — this is the only
+                // way the popup closes. Kill cleans up the hidden session's map
+                // entry; the exit itself already reaped the child.
+                close_popup(model);
+            }
+            UiEvent::Frame(id, frame)
                 if model.attach.as_ref().is_some_and(|attach| attach.id == id) =>
             {
                 model.frame = Some(frame);
@@ -786,6 +844,32 @@ fn short_id(id: &str) -> String {
 }
 
 fn handle_key(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
+    // While the editor popup is open the cb prefix stays reserved as an escape
+    // hatch — `prefix` + the kill binding force-closes a wedged editor. Every
+    // other key belongs to the editor, and a doubled prefix sends a literal
+    // prefix byte through, so nvim behaves like a bare terminal (ctrl+a and all).
+    // The normal close path is still the editor process exiting (`Gone`).
+    if model.popup.is_some() {
+        if model.prefix {
+            model.prefix = false;
+            if model.config.action_for_key(&key_name(key)) == Some("kill") {
+                close_popup(model);
+                return Ok(false);
+            }
+            if let Some(bytes) = encode_key(key) {
+                send_popup_input(model, &bytes)?;
+            }
+            return Ok(false);
+        }
+        if key_name(key) == model.config.effective_prefix() {
+            model.prefix = true;
+            return Ok(false);
+        }
+        if let Some(bytes) = encode_key(key) {
+            send_popup_input(model, &bytes)?;
+        }
+        return Ok(false);
+    }
     if model.task_modal.is_some() {
         return handle_task_modal(model, key);
     }
@@ -956,6 +1040,7 @@ fn handle_prefix(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
         Some("session_history") => {
             model.history_modal = Some(HistoryModal { cursor: 0 });
         }
+        Some("open_ide") => open_ide(model),
         Some("yank") => {
             copy_selection(model)?;
         }
@@ -1633,10 +1718,10 @@ fn handle_history_modal(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
         KeyCode::Esc | KeyCode::Char('q') => keep_open = false,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => keep_open = false,
         KeyCode::Up | KeyCode::Char('k') if !entries.is_empty() => {
-            modal.cursor = (modal.cursor + entries.len() - 1) % entries.len();
+            modal.cursor = previous_history_cursor(modal.cursor, entries.len());
         }
         KeyCode::Down | KeyCode::Char('j') if !entries.is_empty() => {
-            modal.cursor = (modal.cursor + 1) % entries.len();
+            modal.cursor = next_history_cursor(modal.cursor, entries.len());
         }
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
             if let Some(entry) = entries.get(modal.cursor) {
@@ -1681,6 +1766,31 @@ fn handle_history_modal(model: &mut Model, key: KeyEvent) -> io::Result<bool> {
         model.history_modal = Some(modal);
     }
     Ok(false)
+}
+
+fn previous_history_cursor(cursor: usize, entry_count: usize) -> usize {
+    if entry_count == 0 {
+        cursor
+    } else {
+        (cursor + entry_count - 1) % entry_count
+    }
+}
+
+fn next_history_cursor(cursor: usize, entry_count: usize) -> usize {
+    if entry_count == 0 {
+        cursor
+    } else {
+        (cursor + 1) % entry_count
+    }
+}
+
+/// Keep the selected history row within a fixed-height viewport. The viewport
+/// follows the cursor at its bottom edge, then snaps back to the first page
+/// when navigation wraps from the last entry to the first.
+fn history_viewport_start(cursor: usize, entry_count: usize, visible: usize) -> usize {
+    cursor
+        .saturating_sub(visible.saturating_sub(1))
+        .min(entry_count.saturating_sub(visible))
 }
 
 fn jump_to_session(model: &mut Model, id: &str) {
@@ -2353,6 +2463,223 @@ fn request(value: Request) -> io::Result<Response> {
     serde_json::from_str(&line).map_err(io::Error::other)
 }
 
+/// The directory to open in the editor: the focused pane's session cwd, falling
+/// back to the attached session and finally cb's launch directory.
+fn focused_cwd(model: &Model) -> PathBuf {
+    model
+        .selected()
+        .or_else(|| model.attached_session())
+        .map(|session| PathBuf::from(&session.cwd))
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| model.launch_cwd.clone())
+}
+
+/// Substitutes `{dir}` in each command argument with the target directory. A
+/// non-popup command that never mentions `{dir}` gets the directory appended (so
+/// a bare `cursor`/`code` still opens it); a popup command relies on the PTY's
+/// working directory instead, so nothing is appended.
+fn substitute_dir(command: &[String], dir: &Path, popup: bool) -> Vec<String> {
+    let dir = dir.display().to_string();
+    let mut used = false;
+    let mut argv: Vec<String> = command
+        .iter()
+        .map(|arg| {
+            if arg.contains("{dir}") {
+                used = true;
+                arg.replace("{dir}", &dir)
+            } else {
+                arg.clone()
+            }
+        })
+        .collect();
+    if !used && !popup {
+        argv.push(dir);
+    }
+    argv
+}
+
+/// Opens the configured editor (prefix `i`) for the focused pane's directory. A
+/// GUI editor launches as a detached process; a terminal editor is deferred to
+/// the main loop, which opens it in cb's popup.
+fn open_ide(model: &mut Model) {
+    // A second popup would orphan the first hidden session, so ignore the
+    // request until the current editor closes.
+    if model.popup.is_some() {
+        return;
+    }
+    let cwd = focused_cwd(model);
+    let resolved = model.config.ide.resolve();
+    let argv = substitute_dir(&resolved.command, &cwd, resolved.popup);
+    if argv.is_empty() {
+        model.error = "ide command is empty".to_owned();
+        return;
+    }
+    if resolved.popup {
+        let title = argv.first().cloned().unwrap_or_else(|| "editor".to_owned());
+        model.pending_popup = Some(PendingPopup {
+            argv,
+            cwd: cwd.display().to_string(),
+            title,
+        });
+    } else {
+        launch_gui(model, &argv, &cwd);
+    }
+}
+
+/// Launches a GUI editor as a detached process — stdio to `/dev/null` so it
+/// cannot corrupt the raw-mode display, and a throwaway reaper thread so the
+/// short-lived launcher shim never lingers as a zombie.
+fn launch_gui(model: &mut Model, argv: &[String], cwd: &Path) {
+    let mut command = Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match command.spawn() {
+        Ok(mut child) => {
+            model.error.clear();
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(error) => model.error = format!("open {}: {error}", argv[0]),
+    }
+}
+
+/// Spawns the hidden editor session on the conductor and starts the second
+/// attach that feeds the popup. Runs from the main loop, where the frame-stream
+/// `Sender` is in scope.
+fn open_popup(model: &mut Model, sender: Sender<UiEvent>) -> io::Result<()> {
+    let Some(pending) = model.pending_popup.take() else {
+        return Ok(());
+    };
+    let inner = popup_inner(model.screen);
+    let response = conductor_oneshot(&ConductorRequest::Spawn {
+        argv: pending.argv,
+        cwd: pending.cwd,
+        rows: inner.height.max(1),
+        cols: inner.width.max(1),
+        prefill: String::new(),
+        hidden: true,
+    })?;
+    if !response.ok {
+        model.error = response.error;
+        return Ok(());
+    }
+    let attach = start_attach(response.id, inner, sender)?;
+    model.popup = Some(Popup {
+        attach,
+        frame: None,
+        title: pending.title,
+        size: (inner.width.max(1), inner.height.max(1)),
+    });
+    Ok(())
+}
+
+/// Tears down the editor popup: detach, then kill the hidden session so its PTY
+/// never lingers on the conductor.
+fn close_popup(model: &mut Model) {
+    // Clear any armed prefix so it never leaks into normal key handling once the
+    // popup (which owns the prefix while open) is gone.
+    model.prefix = false;
+    if let Some(mut popup) = model.popup.take() {
+        let _ = write_json(
+            &mut popup.attach.writer,
+            &StreamUp {
+                kind: "detach".to_owned(),
+                ..StreamUp::default()
+            },
+        );
+        let _ = conductor_oneshot(&ConductorRequest::Kill {
+            id: popup.attach.id.clone(),
+        });
+    }
+}
+
+/// Re-sizes the popup's PTY when the terminal (and thus the popup's interior)
+/// changes, so the editor reflows to the new geometry.
+fn resize_popup(model: &mut Model) -> io::Result<()> {
+    let inner = popup_inner(model.screen);
+    let size = (inner.width.max(1), inner.height.max(1));
+    if let Some(popup) = model.popup.as_mut() {
+        if popup.size != size {
+            write_json(
+                &mut popup.attach.writer,
+                &StreamUp {
+                    kind: "resize".to_owned(),
+                    rows: size.1,
+                    cols: size.0,
+                    ..StreamUp::default()
+                },
+            )?;
+            popup.size = size;
+        }
+    }
+    Ok(())
+}
+
+/// Forwards keystrokes to the editor popup's PTY.
+fn send_popup_input(model: &mut Model, bytes: &[u8]) -> io::Result<()> {
+    if let Some(popup) = model.popup.as_mut() {
+        write_json(
+            &mut popup.attach.writer,
+            &StreamUp {
+                kind: "input".to_owned(),
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                ..StreamUp::default()
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Forwards pasted text to the editor popup's PTY; the conductor wraps it in the
+/// child's bracketed-paste markers, so the editor treats it as a paste.
+fn send_popup_paste(model: &mut Model, text: &str) -> io::Result<()> {
+    if let Some(popup) = model.popup.as_mut() {
+        write_json(
+            &mut popup.attach.writer,
+            &StreamUp {
+                kind: "paste".to_owned(),
+                data: base64::engine::general_purpose::STANDARD.encode(text),
+                ..StreamUp::default()
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// A single request/response against the conductor's socket (the data plane cb
+/// already uses for attaches), bypassing the broker entirely so the hidden
+/// editor session stays invisible to the control plane.
+fn conductor_oneshot(request: &ConductorRequest) -> io::Result<ConductorResponse> {
+    let mut stream = UnixStream::connect(conductor_socket_path())?;
+    write_json(&mut stream, request)?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    serde_json::from_str(&line).map_err(io::Error::other)
+}
+
+/// The centered rectangle (≈90% of the screen) the editor popup occupies.
+fn popup_rect(area: Rect) -> Rect {
+    let width = (u32::from(area.width) * 90 / 100) as u16;
+    let height = (u32::from(area.height) * 90 / 100) as u16;
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+/// The popup's interior (inside its one-cell border), used both to size the PTY
+/// and to place its cells.
+fn popup_inner(area: Rect) -> Rect {
+    popup_rect(area).inner(Margin::new(1, 1))
+}
+
 /// Queries the host terminal for its default foreground/background colors and
 /// reads the `OSC 10/11` replies straight off fd 0 under a short deadline. Must
 /// run in raw mode and before the crossterm event loop starts consuming stdin.
@@ -2469,6 +2796,7 @@ fn render(model: &Model, frame: &mut Frame) {
         );
     }
     render_overlays(model, frame);
+    render_popup(model, frame);
 }
 
 /// `key desc · key desc` hint spans: keys in accent, descriptions dim. An
@@ -2551,7 +2879,21 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
     } else if model.prefix {
         left.push(badge(&prefix, palette.accent, palette));
         left.push(Span::raw(" "));
-        left.extend(hint_spans(palette, &[("?", "commands"), ("esc", "cancel")]));
+        if model.popup.is_some() {
+            // The prefix is reserved over the popup only to force-close it.
+            let close = model
+                .config
+                .bindings
+                .get("kill")
+                .map(|key| key_display(key))
+                .unwrap_or_else(|| "x".to_owned());
+            left.extend(hint_spans(
+                palette,
+                &[(close.as_str(), "close editor"), ("esc", "cancel")],
+            ));
+        } else {
+            left.extend(hint_spans(palette, &[("?", "commands"), ("esc", "cancel")]));
+        }
     } else if model.scroll_mode {
         left.push(badge("SCROLL", palette.yellow, palette));
         left.push(Span::raw(" "));
@@ -2713,6 +3055,11 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
     if let Some(modal) = model.history_modal.as_ref() {
         let inner = panel_inner_width(area, 82);
         let entries = history_entries(model);
+        // Two panel rows belong to the hints and two to the border. Window the
+        // history itself to the remaining height so the selected row never
+        // disappears below the panel.
+        let visible = usize::from(area.height.saturating_sub(4).max(1));
+        let start = history_viewport_start(modal.cursor, entries.len(), visible);
         let mut lines = Vec::new();
         if entries.is_empty() {
             lines.push(Line::styled(
@@ -2720,7 +3067,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 Style::default().fg(model.palette.overlay0),
             ));
         }
-        for (cursor, entry) in entries.iter().enumerate() {
+        for (cursor, entry) in entries.iter().enumerate().skip(start).take(visible) {
             let selected = cursor == modal.cursor;
             // Prefer the agent-summarised title; fall back to the first prompt
             // until (or unless) the agent generates one.
@@ -3502,6 +3849,7 @@ fn render_empty_state(model: &Model, frame: &mut Frame) {
         (binding("new_worktree"), "session in a worktree"),
         (binding("session_history"), "resume a past session"),
         (binding("task_backlog"), "task backlog"),
+        (binding("open_ide"), "open dir in editor"),
         ("?".to_owned(), "all commands"),
     ];
     let mut lines = vec![
@@ -3586,6 +3934,70 @@ fn render_terminal(model: &Model, frame: &mut Frame) {
             model.pane.x + terminal.cursor_x,
             model.pane.y + terminal.cursor_y,
         ));
+    }
+}
+
+/// Draws the editor popup: a bordered ≈90% box over the UI with the editor's
+/// terminal grid inside. The popup owns every key while open, so its cursor is
+/// always the one shown.
+fn render_popup(model: &Model, frame: &mut Frame) {
+    let Some(popup) = model.popup.as_ref() else {
+        return;
+    };
+    let palette = &model.palette;
+    let area = popup_rect(frame.area());
+    let inner = area.inner(Margin::new(1, 1));
+    let close_key = model
+        .config
+        .bindings
+        .get("kill")
+        .map(|key| key_display(key))
+        .unwrap_or_else(|| "x".to_owned());
+    let hint = format!(
+        " {} {} close ",
+        key_display(&model.config.effective_prefix()),
+        close_key
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(palette.accent))
+            .title(Line::styled(
+                format!(" {} ", popup.title),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Line::styled(hint, Style::default().fg(palette.overlay1)).right_aligned())
+            .style(Style::default().bg(palette.panel_bg)),
+        area,
+    );
+    let Some(terminal) = popup.frame.as_ref() else {
+        return;
+    };
+    let width = inner.width.min(terminal.cols);
+    let height = inner.height.min(terminal.rows);
+    let buffer = frame.buffer_mut();
+    for y in 0..height {
+        for x in 0..width {
+            let source = usize::from(y) * usize::from(terminal.cols) + usize::from(x);
+            let Some(cell) = terminal.cells.get(source) else {
+                continue;
+            };
+            let target = &mut buffer[(inner.x + x, inner.y + y)];
+            target.reset();
+            target.set_symbol(&cell.symbol);
+            target.set_fg(decode_color(cell.fg));
+            target.set_bg(decode_color(cell.bg));
+            target.set_style(
+                Style::default().add_modifier(Modifier::from_bits_truncate(cell.modifiers)),
+            );
+        }
+    }
+    if terminal.cursor_visible && terminal.cursor_x < width && terminal.cursor_y < height {
+        frame.set_cursor_position((inner.x + terminal.cursor_x, inner.y + terminal.cursor_y));
     }
 }
 
@@ -3893,6 +4305,8 @@ mod tests {
             scroll_mode: false,
             frame: None,
             attach: None,
+            popup: None,
+            pending_popup: None,
             error: String::new(),
             previous_status: HashMap::new(),
             pending_notifications: HashMap::new(),
@@ -3916,6 +4330,26 @@ mod tests {
             pane: Rect::default(),
             screen: Rect::default(),
         }
+    }
+
+    #[test]
+    fn history_navigation_wraps_in_both_directions() {
+        assert_eq!(next_history_cursor(0, 3), 1);
+        assert_eq!(next_history_cursor(2, 3), 0);
+        assert_eq!(previous_history_cursor(2, 3), 1);
+        assert_eq!(previous_history_cursor(0, 3), 2);
+    }
+
+    #[test]
+    fn history_viewport_follows_cursor_and_resets_after_wrap() {
+        assert_eq!(history_viewport_start(0, 10, 4), 0);
+        assert_eq!(history_viewport_start(3, 10, 4), 0);
+        assert_eq!(history_viewport_start(4, 10, 4), 1);
+        assert_eq!(history_viewport_start(9, 10, 4), 6);
+
+        let wrapped = next_history_cursor(9, 10);
+        assert_eq!(wrapped, 0);
+        assert_eq!(history_viewport_start(wrapped, 10, 4), 0);
     }
 
     /// Drive `render` across every chrome surface — bars, empty state, live
@@ -4028,6 +4462,35 @@ mod tests {
         });
         draw(&mut model);
 
+        // The editor popup draws its border and cells over everything else,
+        // both before the first frame arrives and once it has one.
+        let (popup_stream, _popup_peer) = UnixStream::pair().unwrap();
+        model.popup = Some(Popup {
+            attach: Attach {
+                id: "popup-session".to_owned(),
+                writer: BufWriter::new(popup_stream),
+            },
+            frame: None,
+            title: "nvim".to_owned(),
+            size: (0, 0),
+        });
+        draw(&mut model);
+        if let Some(popup) = model.popup.as_mut() {
+            popup.frame = Some(TerminalFrame {
+                rows: 3,
+                cols: 6,
+                cells: Vec::new(),
+                cursor_x: 1,
+                cursor_y: 1,
+                cursor_visible: true,
+                mouse_reporting: false,
+                offset: 0,
+                max_offset: 0,
+            });
+        }
+        draw(&mut model);
+        model.popup = None;
+
         // A terminal too small for any chrome still renders.
         let tiny_area = Rect::new(0, 0, 10, 2);
         let mut tiny = Terminal::new(TestBackend::new(tiny_area.width, tiny_area.height)).unwrap();
@@ -4040,6 +4503,27 @@ mod tests {
         assert_eq!(key_display("ctrl+a"), "^a");
         assert_eq!(key_display("enter"), "enter");
         assert_eq!(key_display("["), "[");
+    }
+
+    #[test]
+    fn substitute_dir_replaces_placeholder_or_appends_for_gui() {
+        let dir = Path::new("/work/app");
+        // `{dir}` is substituted wherever it appears.
+        assert_eq!(
+            substitute_dir(&["cursor".to_owned(), "{dir}".to_owned()], dir, false),
+            vec!["cursor".to_owned(), "/work/app".to_owned()],
+        );
+        // A GUI command with no placeholder gets the directory appended.
+        assert_eq!(
+            substitute_dir(&["code".to_owned()], dir, false),
+            vec!["code".to_owned(), "/work/app".to_owned()],
+        );
+        // A popup command without a placeholder relies on the PTY cwd instead,
+        // so nothing is appended (`nvim .` opens the working directory).
+        assert_eq!(
+            substitute_dir(&["nvim".to_owned(), ".".to_owned()], dir, true),
+            vec!["nvim".to_owned(), ".".to_owned()],
+        );
     }
 
     #[test]

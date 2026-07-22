@@ -89,6 +89,11 @@ pub const ACTIONS: &[Action] = &[
         default: "m",
     },
     Action {
+        id: "open_ide",
+        label: "open dir in editor",
+        default: "i",
+    },
+    Action {
         id: "config",
         label: "open config menu",
         default: "o",
@@ -100,6 +105,69 @@ pub const ACTIONS: &[Action] = &[
     },
 ];
 
+/// Which editor `open_ide` (prefix `i`) launches for the focused pane's
+/// directory. A bare string is a named preset; the object form is the escape
+/// hatch for any command line. `{dir}` in a custom command is replaced with the
+/// directory (and, for a non-popup command with no `{dir}`, the directory is
+/// appended). See [`Ide::resolve`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Ide {
+    /// A named preset: `nvim`/`vim`/`hx` (terminal editors, opened in a popup),
+    /// `cursor`/`vscode`/`code` (GUI editors, launched detached), or any other
+    /// binary name (treated as a GUI editor taking the directory).
+    Preset(String),
+    /// A fully explicit command. `popup` true runs it inside cb's editor popup
+    /// (a PTY session); false launches it as a detached process.
+    Custom {
+        command: Vec<String>,
+        #[serde(default)]
+        popup: bool,
+    },
+}
+
+impl Default for Ide {
+    fn default() -> Self {
+        Ide::Preset("nvim".to_owned())
+    }
+}
+
+/// A resolved editor launch: the argv (before `{dir}` substitution) and whether
+/// it runs inside cb's popup (a terminal editor) or as a detached GUI process.
+pub struct ResolvedIde {
+    pub command: Vec<String>,
+    pub popup: bool,
+}
+
+impl Ide {
+    pub fn resolve(&self) -> ResolvedIde {
+        match self {
+            Ide::Custom { command, popup } => ResolvedIde {
+                command: command.clone(),
+                popup: *popup,
+            },
+            Ide::Preset(name) => {
+                let popup_editor = |binary: &str| ResolvedIde {
+                    command: vec![binary.to_owned(), ".".to_owned()],
+                    popup: true,
+                };
+                let gui_editor = |binary: &str| ResolvedIde {
+                    command: vec![binary.to_owned(), "{dir}".to_owned()],
+                    popup: false,
+                };
+                match name.trim().to_ascii_lowercase().as_str() {
+                    "nvim" | "neovim" => popup_editor("nvim"),
+                    "vim" => popup_editor("vim"),
+                    "hx" | "helix" => popup_editor("hx"),
+                    "cursor" => gui_editor("cursor"),
+                    "code" | "vscode" => gui_editor("code"),
+                    other => gui_editor(other),
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Config {
@@ -107,6 +175,7 @@ pub struct Config {
     pub bindings: HashMap<String, String>,
     pub theme: ThemeConfig,
     pub notifications: NotificationConfig,
+    pub ide: Ide,
 }
 
 impl Default for Config {
@@ -119,6 +188,7 @@ impl Default for Config {
                 .collect(),
             theme: ThemeConfig::default(),
             notifications: NotificationConfig::default(),
+            ide: Ide::default(),
         }
     }
 }
@@ -149,6 +219,7 @@ impl Config {
         }
         config.theme = stored.theme;
         config.notifications = stored.notifications;
+        config.ide = stored.ide;
         config
     }
 
@@ -208,6 +279,51 @@ mod tests {
         assert_eq!(config.bindings["quit"], "q");
         assert!(!config.bindings.contains_key("unknown"));
         assert_eq!(config.theme.name, crate::theme::DEFAULT_THEME);
+    }
+
+    #[test]
+    fn ide_defaults_to_nvim_popup_and_presets_resolve() {
+        assert_eq!(Config::default().ide, Ide::Preset("nvim".to_owned()));
+
+        let nvim = Ide::Preset("nvim".to_owned()).resolve();
+        assert!(nvim.popup);
+        assert_eq!(nvim.command, vec!["nvim".to_owned(), ".".to_owned()]);
+
+        let cursor = Ide::Preset("cursor".to_owned()).resolve();
+        assert!(!cursor.popup);
+        assert_eq!(
+            cursor.command,
+            vec!["cursor".to_owned(), "{dir}".to_owned()]
+        );
+
+        // `vscode` maps to the `code` CLI; an unknown name is treated as a GUI
+        // binary taking the directory.
+        assert_eq!(
+            Ide::Preset("vscode".to_owned()).resolve().command[0],
+            "code"
+        );
+        let other = Ide::Preset("zed".to_owned()).resolve();
+        assert!(!other.popup);
+        assert_eq!(other.command, vec!["zed".to_owned(), "{dir}".to_owned()]);
+    }
+
+    #[test]
+    fn ide_parses_preset_string_and_custom_object() {
+        let path = std::env::temp_dir().join(format!("cb-ide-preset-{}.json", std::process::id()));
+        fs::write(&path, br#"{"ide":"cursor"}"#).unwrap();
+        let config = Config::load_from(Some(path.clone()));
+        let _ = fs::remove_file(path);
+        assert_eq!(config.ide, Ide::Preset("cursor".to_owned()));
+
+        let path = std::env::temp_dir().join(format!("cb-ide-custom-{}.json", std::process::id()));
+        fs::write(&path, br#"{"ide":{"command":["hx","{dir}"],"popup":true}}"#).unwrap();
+        let config = Config::load_from(Some(path.clone()));
+        let _ = fs::remove_file(path);
+        let resolved = config.ide.resolve();
+        assert!(resolved.popup);
+        assert_eq!(resolved.command, vec!["hx".to_owned(), "{dir}".to_owned()]);
+        // An absent `ide` key still keeps every binding default.
+        assert_eq!(config.bindings["quit"], "q");
     }
 
     #[test]

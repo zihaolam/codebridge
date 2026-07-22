@@ -38,7 +38,7 @@ use crate::terminal_theme::TerminalTheme;
 /// against an already-running conductor as long as this stays unchanged, which
 /// is what lets agent sessions survive a broker restart. Keep this protocol
 /// minimal and stable.
-pub const CONDUCTOR_VERSION: u32 = 1;
+pub const CONDUCTOR_VERSION: u32 = 2;
 
 /// Path to the conductor's control/attach socket. Separate from the broker's
 /// `daemon.sock` so the two processes have independent lifecycles.
@@ -63,6 +63,13 @@ pub enum ConductorRequest {
         cols: u16,
         #[serde(default)]
         prefill: String,
+        /// A hidden session is owned by a single client for an ephemeral purpose
+        /// (today: the in-TUI editor popup). It is kept out of `snapshot`,
+        /// `session_liveness`, and the `reap` return, so no sidebar, task store,
+        /// or other client ever sees it — the conductor still hosts its PTY and
+        /// terminal exactly like any session.
+        #[serde(default)]
+        hidden: bool,
     },
     Kill {
         id: String,
@@ -209,6 +216,11 @@ fn clear_cloexec(fd: RawFd) -> io::Result<()> {
 pub struct Conductor {
     sessions: RwLock<HashMap<String, Arc<Session>>>,
     order: RwLock<Vec<String>>,
+    /// Ids of hidden sessions (see `ConductorRequest::Spawn::hidden`). They live
+    /// in `sessions` but never in `order`, so `snapshot`/`upgrade_records` skip
+    /// them for free; this set lets `session_liveness` and `reap` (which walk the
+    /// map directly) recognise and exclude them too.
+    hidden: Mutex<HashSet<String>>,
     codex_claimed: Arc<Mutex<HashSet<String>>>,
     shutdown: AtomicBool,
     boot_id: String,
@@ -226,6 +238,7 @@ impl Conductor {
         Arc::new(Self {
             sessions: RwLock::new(HashMap::new()),
             order: RwLock::new(Vec::new()),
+            hidden: Mutex::new(HashSet::new()),
             codex_claimed: Arc::new(Mutex::new(HashSet::new())),
             shutdown: AtomicBool::new(false),
             boot_id: Uuid::new_v4().to_string(),
@@ -340,6 +353,19 @@ impl Conductor {
         }
     }
 
+    /// Marks a freshly-spawned session hidden: drops it from `order` (so
+    /// `snapshot`/`upgrade_records` never surface it) and records its id so the
+    /// map-walking `session_liveness`/`reap` exclude it too. Called by the spawn
+    /// handler immediately after the session lands, before any response is sent.
+    fn mark_hidden(&self, id: &str) {
+        if let Ok(mut order) = self.order.write() {
+            order.retain(|session_id| session_id != id);
+        }
+        if let Ok(mut hidden) = self.hidden.lock() {
+            hidden.insert(id.to_owned());
+        }
+    }
+
     /// Removes a session from the engine and signals its process group. Returns
     /// the session's captured harness id and the kill result, or `None` when no
     /// such session exists. The harness id is returned even if the kill itself
@@ -353,6 +379,9 @@ impl Conductor {
         if let Ok(mut order) = self.order.write() {
             order.retain(|session_id| session_id != id);
         }
+        if let Ok(mut hidden) = self.hidden.lock() {
+            hidden.remove(id);
+        }
         let harness = session.snapshot().harness_session_id;
         let result = session.kill().map_err(|error| error.to_string());
         Some((harness, result))
@@ -364,7 +393,7 @@ impl Conductor {
     /// in place so their ended row stays visible. A no-op when nothing exited
     /// cleanly.
     pub fn reap(&self) -> Vec<(String, String)> {
-        let reaped: Vec<(String, String)> = {
+        let mut reaped: Vec<(String, String)> = {
             let Ok(mut sessions) = self.sessions.write() else {
                 return Vec::new();
             };
@@ -384,6 +413,15 @@ impl Conductor {
         if !reaped.is_empty() {
             if let Ok(mut order) = self.order.write() {
                 order.retain(|id| !reaped.iter().any(|(reaped_id, _)| reaped_id == id));
+            }
+        }
+        // Hidden sessions are cleaned out of the map here too (a client that died
+        // without killing its popup leaves one exited), but the broker must never
+        // learn about them: drop them from the set and from the returned list so
+        // no run is parked for a session that never had a task.
+        if let Ok(mut hidden) = self.hidden.lock() {
+            if !hidden.is_empty() {
+                reaped.retain(|(id, _)| !hidden.remove(id));
             }
         }
         reaped
@@ -472,11 +510,17 @@ impl Conductor {
     /// Per-session `(ended, harness_session_id)` used by the broker to
     /// reconcile task runs against the live session map.
     pub fn session_liveness(&self) -> HashMap<String, (bool, String)> {
+        let hidden = self
+            .hidden
+            .lock()
+            .map(|hidden| hidden.clone())
+            .unwrap_or_default();
         self.sessions
             .read()
             .map(|sessions| {
                 sessions
                     .iter()
+                    .filter(|(id, _)| !hidden.contains(id.as_str()))
                     .map(|(id, session)| {
                         let snapshot = session.snapshot();
                         (
@@ -899,12 +943,18 @@ impl Conductor {
                 rows,
                 cols,
                 prefill,
+                hidden,
             } => match self.spawn_session(argv, cwd, rows, cols, prefill) {
-                Ok(id) => ConductorResponse {
-                    ok: true,
-                    id,
-                    ..ConductorResponse::default()
-                },
+                Ok(id) => {
+                    if hidden {
+                        self.mark_hidden(&id);
+                    }
+                    ConductorResponse {
+                        ok: true,
+                        id,
+                        ..ConductorResponse::default()
+                    }
+                }
                 Err(error) => ConductorResponse {
                     error,
                     ..ConductorResponse::default()
@@ -1275,6 +1325,7 @@ impl Engine for ConductorClient {
             rows,
             cols,
             prefill,
+            hidden: false,
         }) {
             Ok(response) if response.ok => Ok(response.id),
             Ok(response) => Err(response.error),
@@ -1686,6 +1737,7 @@ mod tests {
             rows: 4,
             cols: 40,
             prefill: String::new(),
+            hidden: false,
         });
         assert!(spawned.ok, "spawn failed: {}", spawned.error);
         let id = spawned.id;
@@ -1715,5 +1767,45 @@ mod tests {
         }
         let _ = handle.join();
         let _ = fs::remove_file(&socket);
+    }
+
+    #[test]
+    fn hidden_spawn_is_absent_from_list_but_still_addressable() {
+        let conductor = Conductor::new();
+
+        let visible = conductor
+            .spawn_session(
+                vec!["/bin/cat".to_owned()],
+                "/tmp".to_owned(),
+                4,
+                40,
+                String::new(),
+            )
+            .expect("spawn visible");
+        let hidden = conductor
+            .spawn_session(
+                vec!["/bin/cat".to_owned()],
+                "/tmp".to_owned(),
+                4,
+                40,
+                String::new(),
+            )
+            .expect("spawn hidden");
+        conductor.mark_hidden(&hidden);
+
+        // The hidden session is invisible to the control plane: it never shows
+        // up in the snapshot the broker turns into the sidebar, nor in the
+        // liveness map used to reconcile task runs.
+        let listed: Vec<String> = conductor.snapshot().into_iter().map(|s| s.id).collect();
+        assert_eq!(listed, vec![visible.clone()]);
+        assert!(!conductor.session_liveness().contains_key(&hidden));
+        assert!(conductor.session_liveness().contains_key(&visible));
+
+        // It still exists in the map, so the owning client can attach to and
+        // kill it by id; killing also clears its hidden-set entry.
+        assert!(conductor.kill(&hidden).is_some());
+        assert!(conductor.hidden.lock().unwrap().is_empty());
+
+        let _ = conductor.kill(&visible);
     }
 }
