@@ -2115,7 +2115,10 @@ fn toast_cards(toasts: &[Toast], area: Rect) -> Vec<(usize, Rect)> {
         if area.height < offset {
             break;
         }
-        let inner = (toast.text.chars().count() as u16).min(inner_cap).max(1);
+        // Two extra columns carry the status icon in front of the text.
+        let inner = (toast.text.chars().count() as u16 + 2)
+            .min(inner_cap)
+            .max(1);
         let width = inner + 4;
         let card = Rect::new(
             area.x + TOAST_MARGIN_X,
@@ -2404,47 +2407,72 @@ fn detect_host_theme(stdout: &mut impl Write) -> crate::terminal_theme::Terminal
 
 struct View {
     sidebar: Rect,
-    main: Rect,
+    header: Option<Rect>,
+    pane: Rect,
+    footer: Option<Rect>,
     scrollbar: Option<Rect>,
 }
 
-fn view(model: &Model, area: Rect) -> View {
+/// Split the screen into chrome and the agent pane. The footer keybar spans
+/// the full width; the header bar spans the main column only. Both give way
+/// on tiny terminals so the agent pane always survives.
+fn view(scrollback: bool, area: Rect) -> View {
+    let footer_height = u16::from(area.height >= 6);
+    let [content, footer] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(footer_height)])
+        .areas(area);
     let [sidebar, main] = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)])
-        .areas(area);
-    let has_scrollbar = model
-        .frame
-        .as_ref()
-        .is_some_and(|terminal| terminal.max_offset > 0 && main.width > 1);
+        .areas(content);
+    let header_height = u16::from(main.height >= 4);
+    let [header, pane_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(header_height), Constraint::Min(1)])
+        .areas(main);
+    let has_scrollbar = scrollback && pane_area.width > 1;
     View {
         sidebar,
-        main,
-        scrollbar: has_scrollbar.then(|| Rect::new(main.right() - 1, main.y, 1, main.height)),
+        header: (header_height > 0).then_some(header),
+        pane: Rect {
+            width: pane_area.width.saturating_sub(u16::from(has_scrollbar)),
+            ..pane_area
+        },
+        footer: (footer_height > 0).then_some(footer),
+        scrollbar: has_scrollbar
+            .then(|| Rect::new(pane_area.right() - 1, pane_area.y, 1, pane_area.height)),
     }
 }
 
+fn model_view(model: &Model, area: Rect) -> View {
+    let scrollback = model
+        .frame
+        .as_ref()
+        .is_some_and(|terminal| terminal.max_offset > 0);
+    view(scrollback, area)
+}
+
 fn compute_view(model: &mut Model, area: Rect) {
-    let view = view(model, area);
+    let view = model_view(model, area);
     model.screen = area;
-    model.pane = Rect {
-        width: view
-            .main
-            .width
-            .saturating_sub(u16::from(view.scrollbar.is_some())),
-        ..view.main
-    };
+    model.pane = view.pane;
 }
 
 fn render(model: &Model, frame: &mut Frame) {
-    let view = view(model, frame.area());
+    let view = model_view(model, frame.area());
     render_sidebar(model, frame, view.sidebar);
-
+    if let Some(header) = view.header {
+        render_header(model, frame, header);
+    }
     render_terminal(model, frame);
     if let Some(scrollbar) = view.scrollbar {
         render_scrollbar(model, frame, scrollbar);
     }
-    if !model.error.is_empty() && frame.area().height > 0 {
+    if let Some(footer) = view.footer {
+        render_footer(model, frame, footer);
+    } else if !model.error.is_empty() && frame.area().height > 0 {
+        // Tiny terminal without a footer bar: overlay the error on the last row.
         let area = Rect::new(0, frame.area().bottom() - 1, frame.area().width, 1);
         frame.render_widget(
             Paragraph::new(model.error.clone()).style(Style::default().fg(model.palette.red)),
@@ -2454,9 +2482,368 @@ fn render(model: &Model, frame: &mut Frame) {
     render_overlays(model, frame);
 }
 
+/// `key desc · key desc` hint spans: keys in accent, descriptions dim. An
+/// empty key renders the description alone as a plain dim note.
+fn hint_spans(palette: &Palette, hints: &[(&str, &str)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, (key, description)) in hints.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(palette.overlay0)));
+        }
+        if !key.is_empty() {
+            spans.push(Span::styled(
+                (*key).to_owned(),
+                Style::default().fg(palette.accent),
+            ));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            (*description).to_owned(),
+            Style::default().fg(palette.overlay1),
+        ));
+    }
+    spans
+}
+
+/// Compact display form of a binding: `ctrl+a` reads as `^a` everywhere the
+/// chrome references the prefix.
+fn key_display(name: &str) -> String {
+    name.strip_prefix("ctrl+")
+        .map(|rest| format!("^{rest}"))
+        .unwrap_or_else(|| name.to_owned())
+}
+
+/// Home-relative, tail-biased path for the header bar: long paths keep their
+/// most specific segments.
+fn shorten_path(path: &str, home: Option<&str>, max: usize) -> String {
+    let display = match home.filter(|home| !home.is_empty()) {
+        Some(home) if path == home => "~".to_owned(),
+        Some(home) => path
+            .strip_prefix(home)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .map(|rest| format!("~/{rest}"))
+            .unwrap_or_else(|| path.to_owned()),
+        None => path.to_owned(),
+    };
+    let width = display.chars().count();
+    if width <= max {
+        return display;
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let tail: String = display.chars().skip(width - (max - 1)).collect();
+    format!("…{tail}")
+}
+
+fn agent_name(session: &SessionInfo) -> Option<String> {
+    session
+        .argv
+        .first()
+        .map(|argv0| {
+            Path::new(argv0)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| argv0.clone())
+        })
+        .filter(|name| !name.is_empty())
+}
+
+fn render_header(model: &Model, frame: &mut Frame, area: Rect) {
+    let palette = &model.palette;
+    let bar = Style::default()
+        .bg(palette.surface_dim)
+        .fg(palette.subtext0);
+    let Some(session) = model.attached_session() else {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                " ◇ codebridge",
+                Style::default().fg(palette.overlay0),
+            ))
+            .style(bar),
+            area,
+        );
+        return;
+    };
+    let (glyph, glyph_color) = indicator(session, model.spin, palette);
+    let agent = agent_name(session).unwrap_or_default();
+    let right = match model.frame.as_ref().filter(|terminal| terminal.offset > 0) {
+        Some(terminal) => Span::styled(
+            format!("⇅ {}/{} ", terminal.offset, terminal.max_offset),
+            Style::default()
+                .fg(palette.yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        None => Span::styled(
+            format!(
+                "{} ",
+                shorten_path(
+                    &session.cwd,
+                    std::env::var("HOME").ok().as_deref(),
+                    usize::from(area.width / 3),
+                )
+            ),
+            Style::default().fg(palette.overlay1),
+        ),
+    };
+    let right_width = Line::from(right.clone()).width();
+    let fixed = 3 + if agent.is_empty() {
+        0
+    } else {
+        agent.chars().count() + 2
+    };
+    let title_max = usize::from(area.width)
+        .saturating_sub(fixed + right_width)
+        .saturating_sub(2);
+    let title = truncate_with_ellipsis(session_label(session, &model.tasks), title_max);
+    let title_color = if model.focus == Focus::Screen {
+        palette.text
+    } else {
+        palette.subtext0
+    };
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(glyph.to_string(), Style::default().fg(glyph_color)),
+        Span::raw(" "),
+        Span::styled(
+            title,
+            Style::default()
+                .fg(title_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !agent.is_empty() {
+        spans.push(Span::styled(
+            format!("  {agent}"),
+            Style::default().fg(palette.overlay1),
+        ));
+    }
+    let used = Line::from(spans.clone()).width();
+    let gap = usize::from(area.width).saturating_sub(used + right_width);
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(right);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
+}
+
+/// Colored per-status counters for the footer, non-zero counts only.
+fn status_count_spans(model: &Model) -> Vec<Span<'static>> {
+    let palette = &model.palette;
+    let count = |status| {
+        model
+            .sidebar
+            .sessions()
+            .iter()
+            .filter(|session| session.status == status)
+            .count()
+    };
+    let mut spans = Vec::new();
+    let states = [
+        (
+            SPINNERS[model.spin % SPINNERS.len()],
+            palette.green,
+            count(Status::Working),
+        ),
+        ('⚑', palette.red, count(Status::NeedsApproval)),
+        ('●', palette.green, count(Status::WaitingUser)),
+        ('●', palette.yellow, count(Status::Idle)),
+        ('✗', palette.overlay0, count(Status::Ended)),
+    ];
+    for (glyph, color, total) in states {
+        if total == 0 {
+            continue;
+        }
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            format!("{glyph} "),
+            Style::default().fg(color),
+        ));
+        spans.push(Span::styled(
+            total.to_string(),
+            Style::default().fg(palette.subtext0),
+        ));
+    }
+    spans
+}
+
+fn badge(text: &str, background: Color, palette: &Palette) -> Span<'static> {
+    Span::styled(
+        format!(" {text} "),
+        Style::default()
+            .bg(background)
+            .fg(palette.panel_bg)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
+    let palette = &model.palette;
+    let bar = Style::default()
+        .bg(palette.surface_dim)
+        .fg(palette.subtext0);
+    let prefix = key_display(&model.config.effective_prefix());
+
+    let mut left: Vec<Span> = vec![Span::raw(" ")];
+    if !model.error.is_empty() {
+        left.push(Span::styled(
+            format!("⚠ {}", model.error),
+            Style::default().fg(palette.red),
+        ));
+    } else if model.prefix {
+        left.push(badge(&prefix, palette.accent, palette));
+        left.push(Span::raw(" "));
+        left.extend(hint_spans(palette, &[("?", "commands"), ("esc", "cancel")]));
+    } else if model.scroll_mode {
+        left.push(badge("SCROLL", palette.yellow, palette));
+        left.push(Span::raw(" "));
+        left.extend(hint_spans(
+            palette,
+            &[
+                ("↑/↓", "line"),
+                ("b/f", "page"),
+                ("g", "top"),
+                ("q", "live"),
+            ],
+        ));
+    } else if !model.hooks_ok {
+        left.push(Span::styled(
+            "⚠ hooks not installed — run: cb install-hooks",
+            Style::default()
+                .fg(palette.peach)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        let prefix_help = format!("{prefix} ?");
+        let hints: &[(&str, &str)] = match model.focus {
+            Focus::Sidebar => &[
+                ("j/k", "move"),
+                ("enter", "attach"),
+                (prefix_help.as_str(), "commands"),
+            ],
+            Focus::Screen => &[
+                (prefix.as_str(), "prefix"),
+                ("shift+drag", "select"),
+                (prefix_help.as_str(), "commands"),
+            ],
+        };
+        left.extend(hint_spans(palette, hints));
+    }
+
+    let mut right = status_count_spans(model);
+    let scope = if model.sidebar.accordion() {
+        "all workspaces".to_owned()
+    } else {
+        scope_display_name(model.sidebar.current_scope())
+    };
+    if !right.is_empty() {
+        right.push(Span::styled("  │  ", Style::default().fg(palette.overlay0)));
+    }
+    right.push(Span::styled(scope, Style::default().fg(palette.overlay1)));
+    right.push(Span::raw(" "));
+
+    let left_width = Line::from(left.clone()).width();
+    let right_width = Line::from(right.clone()).width();
+    let gap = usize::from(area.width).saturating_sub(left_width + right_width);
+    let mut spans = left;
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
+}
+
+/// A floating chrome panel: rounded dim border, accent title, padded body,
+/// and a structured key-hint footer. Every modal and picker renders through
+/// this so the chrome reads as one system.
+struct Panel {
+    title: String,
+    lines: Vec<Line<'static>>,
+    hints: Vec<(&'static str, &'static str)>,
+    max_width: u16,
+    bottom: bool,
+}
+
+fn panel_width(area: Rect, max_width: u16) -> u16 {
+    area.width.saturating_sub(4).clamp(1, max_width)
+}
+
+/// Content columns available inside a panel of `max_width` (borders + padding).
+fn panel_inner_width(area: Rect, max_width: u16) -> usize {
+    usize::from(panel_width(area, max_width).saturating_sub(4))
+}
+
+fn render_panel(model: &Model, frame: &mut Frame, area: Rect, panel: Panel) {
+    let palette = &model.palette;
+    let mut lines = panel.lines;
+    if !panel.hints.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(hint_spans(palette, &panel.hints)));
+    }
+    let height = (lines.len() as u16 + 2).min(area.height).max(3);
+    let width = panel_width(area, panel.max_width);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = if panel.bottom {
+        area.bottom().saturating_sub(height + 1)
+    } else {
+        area.y + area.height.saturating_sub(height) / 2
+    };
+    let rect = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(palette.text).bg(palette.panel_bg))
+            .block(
+                Block::default()
+                    .title(Line::styled(
+                        format!(" {} ", panel.title),
+                        Style::default()
+                            .fg(palette.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(palette.overlay0))
+                    .padding(Padding::horizontal(1)),
+            ),
+        rect,
+    );
+}
+
+/// A cursor-selectable row: accent gutter bar when selected, plus a
+/// full-width surface highlight padded to `width` content columns.
+fn select_line(
+    palette: &Palette,
+    selected: bool,
+    spans: Vec<Span<'static>>,
+    width: usize,
+) -> Line<'static> {
+    let mut all = vec![Span::styled(
+        if selected { "▌ " } else { "  " }.to_owned(),
+        Style::default().fg(palette.accent),
+    )];
+    all.extend(spans);
+    let mut line = Line::from(all);
+    if selected {
+        let used = line.width();
+        if width > used {
+            line.push_span(Span::raw(" ".repeat(width - used)));
+        }
+        line = line.style(
+            Style::default()
+                .bg(palette.surface0)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    line
+}
+
 fn render_overlays(model: &Model, frame: &mut Frame) {
     let area = frame.area();
     if let Some(modal) = model.history_modal.as_ref() {
+        let inner = panel_inner_width(area, 82);
         let entries = history_entries(model);
         let mut lines = Vec::new();
         if entries.is_empty() {
@@ -2488,60 +2875,68 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
             } else {
                 ('‖', model.palette.yellow)
             };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    if selected { "▌ " } else { "  " },
-                    Style::default().fg(model.palette.accent),
-                ),
-                Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
-                Span::styled(
-                    format!("{:<8} ", entry.agent),
-                    Style::default().fg(model.palette.overlay1),
-                ),
-                Span::styled(
-                    format!("{:>4} ", relative_time(entry.updated_at)),
-                    Style::default().fg(model.palette.overlay0),
-                ),
-                Span::raw(label),
-            ]));
+            lines.push(select_line(
+                &model.palette,
+                selected,
+                vec![
+                    Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
+                    Span::styled(
+                        format!("{:<8} ", entry.agent),
+                        Style::default().fg(model.palette.overlay1),
+                    ),
+                    Span::styled(
+                        format!("{:>4} ", relative_time(entry.updated_at)),
+                        Style::default().fg(model.palette.overlay0),
+                    ),
+                    Span::raw(label),
+                ],
+                inner,
+            ));
         }
-        lines.push(Line::styled(
-            "enter open/resume · x delete · esc close",
-            Style::default().fg(model.palette.overlay0),
-        ));
-        let title = format!(
-            "history — {}",
-            scope_display_name(model.sidebar.current_scope())
-        );
-        let height = (lines.len() as u16 + 2).min(area.height).max(3);
-        let width = area.width.saturating_sub(4).clamp(1, 82);
-        let panel = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(height) / 2,
-            width,
-            height,
-        );
-        frame.render_widget(Clear, panel);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .style(
-                    Style::default()
-                        .fg(model.palette.text)
-                        .bg(model.palette.panel_bg),
-                )
-                .block(
-                    Block::default()
-                        .title(format!(" {title} "))
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(model.palette.accent)),
+        render_panel(
+            model,
+            frame,
+            area,
+            Panel {
+                title: format!(
+                    "history — {}",
+                    scope_display_name(model.sidebar.current_scope())
                 ),
-            panel,
+                lines,
+                hints: vec![("enter", "open/resume"), ("x", "delete"), ("esc", "close")],
+                max_width: 82,
+                bottom: false,
+            },
         );
         return;
     }
     if let Some(modal) = model.task_modal.as_ref() {
+        let inner = panel_inner_width(area, 82);
         let mut lines = Vec::new();
-        let title = match &modal.stage {
+        // Shared title/description editor body for the New and Detail stages.
+        let editor = |lines: &mut Vec<Line<'static>>, title: &str, desc: &str, title_active| {
+            lines.push(Line::styled(
+                "title",
+                Style::default().fg(model.palette.overlay0),
+            ));
+            lines.push(Line::from(vec![
+                Span::raw(title.to_owned()),
+                Span::styled(
+                    if title_active { "▎" } else { "" },
+                    Style::default().fg(model.palette.accent),
+                ),
+            ]));
+            lines.push(Line::default());
+            lines.push(Line::styled(
+                "description",
+                Style::default().fg(model.palette.overlay0),
+            ));
+            lines.extend(desc.lines().map(|line| Line::from(line.to_owned())));
+            if !title_active {
+                lines.push(Line::styled("▎", Style::default().fg(model.palette.accent)));
+            }
+        };
+        let (title, hints): (String, Vec<(&'static str, &'static str)>) = match &modal.stage {
             TaskStage::List => {
                 let indices = visible_task_indices(model);
                 if indices.is_empty() {
@@ -2554,6 +2949,9 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 for (cursor, index) in indices.into_iter().enumerate() {
                     let task = &model.tasks[index];
                     if prior != Some(task.status) {
+                        if prior.is_some() {
+                            lines.push(Line::default());
+                        }
                         lines.push(Line::styled(
                             format!("{:?}", task.status).to_ascii_lowercase(),
                             Style::default().fg(model.palette.overlay0),
@@ -2566,30 +2964,38 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                         TaskStatus::Pending => ('○', model.palette.overlay1),
                         TaskStatus::Completed => ('✓', model.palette.overlay0),
                     };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            if cursor == modal.cursor { "▌ " } else { "  " },
-                            Style::default().fg(model.palette.accent),
-                        ),
+                    let mut spans = vec![
                         Span::styled(glyph.to_string(), Style::default().fg(color)),
-                        Span::raw(format!(
-                            " {}{}",
-                            task.title,
-                            if task.runs.is_empty() {
-                                String::new()
-                            } else {
-                                format!("  {} session(s)", task.runs.len())
-                            }
-                        )),
-                    ]));
+                        Span::raw(format!(" {}", task.title)),
+                    ];
+                    if !task.runs.is_empty() {
+                        spans.push(Span::styled(
+                            format!("  {} session(s)", task.runs.len()),
+                            Style::default().fg(model.palette.overlay1),
+                        ));
+                    }
+                    lines.push(select_line(
+                        &model.palette,
+                        cursor == modal.cursor,
+                        spans,
+                        inner,
+                    ));
                 }
-                lines.push(Line::styled(
-                    "n new · enter open · e edit · s start · r resume · K sessions · c done · x delete",
-                    Style::default().fg(model.palette.overlay0),
-                ));
-                format!(
-                    "tasks — {}",
-                    scope_display_name(model.sidebar.current_scope())
+                (
+                    format!(
+                        "tasks — {}",
+                        scope_display_name(model.sidebar.current_scope())
+                    ),
+                    vec![
+                        ("n", "new"),
+                        ("enter", "open"),
+                        ("e", "edit"),
+                        ("s", "start"),
+                        ("r", "resume"),
+                        ("K", "sessions"),
+                        ("c", "done"),
+                        ("x", "delete"),
+                    ],
                 )
             }
             TaskStage::New {
@@ -2597,27 +3003,11 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 desc,
                 title_active,
             } => {
-                lines.push(Line::styled(
-                    "title",
-                    Style::default().fg(model.palette.overlay0),
-                ));
-                lines.push(Line::from(format!(
-                    "{title}{}",
-                    if *title_active { "▎" } else { "" }
-                )));
-                lines.push(Line::styled(
-                    "description",
-                    Style::default().fg(model.palette.overlay0),
-                ));
-                lines.extend(desc.lines().map(|line| Line::from(line.to_owned())));
-                if !*title_active {
-                    lines.push(Line::from("▎"));
-                }
-                lines.push(Line::styled(
-                    "tab switch · ctrl+enter add · esc cancel",
-                    Style::default().fg(model.palette.overlay0),
-                ));
-                "new task".to_owned()
+                editor(&mut lines, title, desc, *title_active);
+                (
+                    "new task".to_owned(),
+                    vec![("tab", "switch"), ("ctrl+enter", "add"), ("esc", "cancel")],
+                )
             }
             TaskStage::Detail {
                 title,
@@ -2625,221 +3015,160 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 title_active,
                 ..
             } => {
-                lines.push(Line::styled(
-                    "title",
-                    Style::default().fg(model.palette.overlay0),
-                ));
-                lines.push(Line::from(format!(
-                    "{title}{}",
-                    if *title_active { "▎" } else { "" }
-                )));
-                lines.push(Line::styled(
-                    "description",
-                    Style::default().fg(model.palette.overlay0),
-                ));
-                lines.extend(desc.lines().map(|line| Line::from(line.to_owned())));
-                if !*title_active {
-                    lines.push(Line::from("▎"));
-                }
-                lines.push(Line::styled(
-                    "tab switch · esc save",
-                    Style::default().fg(model.palette.overlay0),
-                ));
-                "edit task".to_owned()
+                editor(&mut lines, title, desc, *title_active);
+                (
+                    "edit task".to_owned(),
+                    vec![("tab", "switch"), ("esc", "save")],
+                )
             }
             TaskStage::Agent { cursor, .. } => {
                 for (index, agent) in worktree::available_agents().iter().enumerate() {
-                    lines.push(Line::from(format!(
-                        "{} {}",
-                        if index == *cursor { "▌" } else { " " },
-                        agent.label
-                    )));
+                    lines.push(select_line(
+                        &model.palette,
+                        index == *cursor,
+                        vec![Span::raw(agent.label.to_owned())],
+                        inner,
+                    ));
                 }
-                lines.push(Line::styled(
-                    "enter start · esc back",
-                    Style::default().fg(model.palette.overlay0),
-                ));
-                "choose task agent".to_owned()
+                (
+                    "choose task agent".to_owned(),
+                    vec![("enter", "start"), ("esc", "back")],
+                )
             }
             TaskStage::Runs { id, cursor } => {
                 if let Some(task) = model.tasks.iter().find(|task| task.id == *id) {
                     for (index, run) in task.runs.iter().enumerate() {
-                        lines.push(Line::from(format!(
-                            "{} {} · {:?} · {}",
-                            if index == *cursor { "▌" } else { " " },
-                            run.agent,
-                            run.status,
-                            short_id(&run.cb_session_id)
-                        )));
+                        lines.push(select_line(
+                            &model.palette,
+                            index == *cursor,
+                            vec![
+                                Span::raw(run.agent.clone()),
+                                Span::styled(
+                                    format!(
+                                        " · {:?} · {}",
+                                        run.status,
+                                        short_id(&run.cb_session_id)
+                                    ),
+                                    Style::default().fg(model.palette.overlay1),
+                                ),
+                            ],
+                            inner,
+                        ));
                     }
                 }
-                lines.push(Line::styled(
-                    "enter jump · x kill · esc back",
-                    Style::default().fg(model.palette.overlay0),
-                ));
-                "task sessions".to_owned()
+                (
+                    "task sessions".to_owned(),
+                    vec![("enter", "jump"), ("x", "kill"), ("esc", "back")],
+                )
             }
         };
-        let height = (lines.len() as u16 + 2).min(area.height).max(3);
-        let width = area.width.saturating_sub(4).clamp(1, 82);
-        let panel = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(height) / 2,
-            width,
-            height,
-        );
-        frame.render_widget(Clear, panel);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .style(
-                    Style::default()
-                        .fg(model.palette.text)
-                        .bg(model.palette.panel_bg),
-                )
-                .block(
-                    Block::default()
-                        .title(format!(" {title} "))
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(model.palette.accent)),
-                ),
-            panel,
+        render_panel(
+            model,
+            frame,
+            area,
+            Panel {
+                title,
+                lines,
+                hints,
+                max_width: 82,
+                bottom: false,
+            },
         );
         return;
     }
     if let Some(menu) = model.config_menu.as_ref() {
         if let Some(cursor) = menu.theme_cursor {
-            let mut lines = vec![Line::styled(
-                "↑↓ preview · enter apply · esc cancel",
-                Style::default().fg(model.palette.overlay0),
-            )];
-            let visible = usize::from(area.height.saturating_sub(3).max(1));
+            let inner = panel_inner_width(area, 42);
+            let visible = usize::from(area.height.saturating_sub(6).max(1));
             let start = cursor
                 .saturating_sub(visible.saturating_sub(1))
                 .min(THEME_NAMES.len().saturating_sub(visible));
-            lines.extend(
-                THEME_NAMES
-                    .iter()
-                    .enumerate()
-                    .skip(start)
-                    .take(visible)
-                    .map(|(index, name)| {
-                        let selected = index == cursor;
-                        Line::styled(
-                            format!("{} {name}", if selected { "▌" } else { " " }),
-                            Style::default()
-                                .fg(if selected {
-                                    model.palette.text
-                                } else {
-                                    model.palette.subtext0
-                                })
-                                .bg(if selected {
-                                    model.palette.surface0
-                                } else {
-                                    model.palette.panel_bg
-                                })
-                                .add_modifier(if selected {
-                                    Modifier::BOLD
-                                } else {
-                                    Modifier::empty()
-                                }),
-                        )
-                    }),
-            );
-            let height = (lines.len() as u16 + 2).min(area.height).max(3);
-            let width = area.width.saturating_sub(4).clamp(1, 42);
-            let panel = Rect::new(
-                area.x + area.width.saturating_sub(width) / 2,
-                area.y + area.height.saturating_sub(height) / 2,
-                width,
-                height,
-            );
-            frame.render_widget(Clear, panel);
-            frame.render_widget(
-                Paragraph::new(lines)
-                    .style(
-                        Style::default()
-                            .fg(model.palette.text)
-                            .bg(model.palette.panel_bg),
+            let lines = THEME_NAMES
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible)
+                .map(|(index, name)| {
+                    select_line(
+                        &model.palette,
+                        index == cursor,
+                        vec![Span::styled(
+                            (*name).to_owned(),
+                            Style::default().fg(if index == cursor {
+                                model.palette.text
+                            } else {
+                                model.palette.subtext0
+                            }),
+                        )],
+                        inner,
                     )
-                    .block(
-                        Block::default()
-                            .title(" choose theme ")
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(model.palette.accent)),
-                    ),
-                panel,
+                })
+                .collect();
+            render_panel(
+                model,
+                frame,
+                area,
+                Panel {
+                    title: "choose theme".to_owned(),
+                    lines,
+                    hints: vec![("↑/↓", "preview"), ("enter", "apply"), ("esc", "cancel")],
+                    max_width: 42,
+                    bottom: false,
+                },
             );
             return;
         }
         if let Some(cursor) = menu.notification_cursor {
-            let mut lines = vec![Line::styled(
-                "↑↓ select · enter apply · esc cancel",
-                Style::default().fg(model.palette.overlay0),
-            )];
-            lines.extend(
-                crate::notify::DELIVERY_NAMES
-                    .iter()
-                    .enumerate()
-                    .map(|(index, name)| {
-                        let selected = index == cursor;
-                        let description = match *name {
-                            "all" => "in-app + native system",
-                            "codebridge" => "clickable in-app toast",
-                            "terminal" => "Ghostty/iTerm/Kitty/WezTerm OSC",
-                            "system" => "native OS notification",
-                            "off" => "disable notifications",
-                            _ => "",
-                        };
-                        Line::styled(
-                            format!(
-                                "{} {name:<12} {description}",
-                                if selected { "▌" } else { " " }
-                            ),
-                            Style::default()
-                                .fg(if selected {
+            let inner = panel_inner_width(area, 58);
+            let lines = crate::notify::DELIVERY_NAMES
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    let selected = index == cursor;
+                    let description = match *name {
+                        "all" => "in-app + native system",
+                        "codebridge" => "clickable in-app toast",
+                        "terminal" => "Ghostty/iTerm/Kitty/WezTerm OSC",
+                        "system" => "native OS notification",
+                        "off" => "disable notifications",
+                        _ => "",
+                    };
+                    select_line(
+                        &model.palette,
+                        selected,
+                        vec![
+                            Span::styled(
+                                format!("{name:<12} "),
+                                Style::default().fg(if selected {
                                     model.palette.text
                                 } else {
                                     model.palette.subtext0
-                                })
-                                .bg(if selected {
-                                    model.palette.surface0
-                                } else {
-                                    model.palette.panel_bg
-                                })
-                                .add_modifier(if selected {
-                                    Modifier::BOLD
-                                } else {
-                                    Modifier::empty()
                                 }),
-                        )
-                    }),
-            );
-            let height = (lines.len() as u16 + 2).min(area.height).max(3);
-            let width = area.width.saturating_sub(4).clamp(1, 58);
-            let panel = Rect::new(
-                area.x + area.width.saturating_sub(width) / 2,
-                area.y + area.height.saturating_sub(height) / 2,
-                width,
-                height,
-            );
-            frame.render_widget(Clear, panel);
-            frame.render_widget(
-                Paragraph::new(lines)
-                    .style(
-                        Style::default()
-                            .fg(model.palette.text)
-                            .bg(model.palette.panel_bg),
+                            ),
+                            Span::styled(
+                                description.to_owned(),
+                                Style::default().fg(model.palette.overlay1),
+                            ),
+                        ],
+                        inner,
                     )
-                    .block(
-                        Block::default()
-                            .title(" notification delivery ")
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(model.palette.accent)),
-                    ),
-                panel,
+                })
+                .collect();
+            render_panel(
+                model,
+                frame,
+                area,
+                Panel {
+                    title: "notification delivery".to_owned(),
+                    lines,
+                    hints: vec![("↑/↓", "select"), ("enter", "apply"), ("esc", "cancel")],
+                    max_width: 58,
+                    bottom: false,
+                },
             );
             return;
         }
+        let inner = panel_inner_width(area, 66);
         let mut rows = Vec::with_capacity(crate::config::ACTIONS.len() + 4);
         rows.push((
             "prefix".to_owned(),
@@ -2871,68 +3200,55 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
             )
         }));
         rows.push(("reset all to defaults".to_owned(), String::new()));
-        let mut lines = vec![Line::styled(
-            "enter edits · theme previews live · saved automatically",
-            Style::default().fg(model.palette.overlay0),
-        )];
-        lines.extend(rows.into_iter().enumerate().map(|(index, (label, value))| {
-            let value = if menu.capture && menu.cursor == index {
-                "[press key · esc cancel]".to_owned()
-            } else {
-                value
-            };
-            Line::styled(
-                format!(
-                    "{} {label:<30} {value}",
-                    if index == menu.cursor { "▌" } else { " " }
-                ),
-                Style::default()
-                    .fg(if index == menu.cursor {
-                        model.palette.text
-                    } else {
-                        model.palette.subtext0
-                    })
-                    .bg(if index == menu.cursor {
-                        model.palette.surface0
-                    } else {
-                        model.palette.panel_bg
-                    })
-                    .add_modifier(if index == menu.cursor {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            )
-        }));
+        let mut lines: Vec<Line<'static>> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, (label, value))| {
+                let selected = index == menu.cursor;
+                let value = if menu.capture && selected {
+                    "[press key · esc cancel]".to_owned()
+                } else {
+                    value
+                };
+                select_line(
+                    &model.palette,
+                    selected,
+                    vec![
+                        Span::styled(
+                            format!("{label:<30} "),
+                            Style::default().fg(if selected {
+                                model.palette.text
+                            } else {
+                                model.palette.subtext0
+                            }),
+                        ),
+                        Span::styled(value, Style::default().fg(model.palette.accent)),
+                    ],
+                    inner,
+                )
+            })
+            .collect();
         if !menu.error.is_empty() {
             lines.push(Line::styled(
                 menu.error.clone(),
                 Style::default().fg(model.palette.red),
             ));
         }
-        let height = (lines.len() as u16 + 2).min(area.height).max(3);
-        let width = area.width.saturating_sub(4).clamp(1, 66);
-        let panel = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(height) / 2,
-            width,
-            height,
-        );
-        frame.render_widget(Clear, panel);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .style(
-                    Style::default()
-                        .fg(model.palette.text)
-                        .bg(model.palette.panel_bg),
-                )
-                .block(
-                    Block::default()
-                        .title(" codebridge config ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(model.palette.accent)),
-                ),
-            panel,
+        render_panel(
+            model,
+            frame,
+            area,
+            Panel {
+                title: "codebridge config".to_owned(),
+                lines,
+                hints: vec![
+                    ("enter", "edit"),
+                    ("esc", "close"),
+                    ("", "previews live · saved automatically"),
+                ],
+                max_width: 66,
+                bottom: false,
+            },
         );
         return;
     }
@@ -2966,144 +3282,98 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
                 picker.agent_cursor,
             ),
         };
-        let height = (choices.len() as u16 + 4).min(area.height).max(3);
-        let width = area.width.saturating_sub(4).clamp(1, 60);
-        let panel = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(height) / 2,
-            width,
-            height,
-        );
+        let inner = panel_inner_width(area, 60);
         let lines = std::iter::once(Line::styled(
             subtitle.to_owned(),
             Style::default().fg(model.palette.overlay0),
         ))
+        .chain(std::iter::once(Line::default()))
         .chain(choices.into_iter().enumerate().map(|(index, choice)| {
-            Line::styled(
-                format!("{} {choice}", if index == cursor { "▌" } else { " " }),
-                Style::default()
-                    .fg(if index == cursor {
+            select_line(
+                &model.palette,
+                index == cursor,
+                vec![Span::styled(
+                    choice,
+                    Style::default().fg(if index == cursor {
                         model.palette.text
                     } else {
                         model.palette.subtext0
-                    })
-                    .bg(if index == cursor {
-                        model.palette.surface0
-                    } else {
-                        model.palette.panel_bg
-                    })
-                    .add_modifier(if index == cursor {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
                     }),
+                )],
+                inner,
             )
         }))
         .collect::<Vec<_>>();
-        frame.render_widget(Clear, panel);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .style(
-                    Style::default()
-                        .fg(model.palette.text)
-                        .bg(model.palette.panel_bg),
-                )
-                .block(
-                    Block::default()
-                        .title(format!(" {title} "))
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(model.palette.accent)),
-                ),
-            panel,
+        render_panel(
+            model,
+            frame,
+            area,
+            Panel {
+                title: title.to_owned(),
+                lines,
+                hints: vec![("enter", "select"), ("esc", "cancel")],
+                max_width: 60,
+                bottom: false,
+            },
         );
         return;
     }
     if let Some(rename) = model.rename.as_ref() {
-        let width = area.width.saturating_sub(4).clamp(1, 54);
-        let prompt = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(3) / 2,
-            width,
-            3.min(area.height),
-        );
-        frame.render_widget(Clear, prompt);
-        frame.render_widget(
-            Paragraph::new(rename.input.clone())
-                .block(
-                    Block::default()
-                        .title(" rename ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(model.palette.accent)),
-                )
-                .style(
-                    Style::default()
-                        .fg(model.palette.text)
-                        .bg(model.palette.panel_bg),
-                ),
-            prompt,
+        render_panel(
+            model,
+            frame,
+            area,
+            Panel {
+                title: "rename session".to_owned(),
+                lines: vec![Line::from(vec![
+                    Span::raw(rename.input.clone()),
+                    Span::styled("▎", Style::default().fg(model.palette.accent)),
+                ])],
+                hints: vec![("enter", "save"), ("esc", "cancel")],
+                max_width: 54,
+                bottom: false,
+            },
         );
         return;
     }
     if model.prefix || model.help {
-        let mut lines = vec![Line::styled(
-            format!("prefix = {}", model.config.effective_prefix()),
-            Style::default().fg(model.palette.overlay0),
-        )];
+        let mut lines = Vec::new();
         let actions = crate::config::ACTIONS;
+        let label_width = actions
+            .iter()
+            .map(|action| action.label.chars().count())
+            .max()
+            .unwrap_or(0);
         for pair in actions.chunks(2) {
-            let text = pair
-                .iter()
-                .map(|action| {
-                    format!(
-                        "{:>8}  {:<24}",
-                        model.config.bindings[action.id], action.label
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("  ");
-            lines.push(Line::from(text));
+            let mut spans = Vec::new();
+            for action in pair {
+                spans.push(Span::styled(
+                    format!("{:>10}", key_display(&model.config.bindings[action.id])),
+                    Style::default().fg(model.palette.accent),
+                ));
+                spans.push(Span::styled(
+                    format!("  {:<label_width$}", action.label),
+                    Style::default().fg(model.palette.subtext0),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
-        lines.push(Line::styled(
-            "h/← sidebar  → screen  ? close",
-            Style::default().fg(model.palette.overlay0),
-        ));
-        let height = (lines.len() as u16 + 2).min(area.height).max(3);
-        let width = area.width.saturating_sub(4).clamp(1, 78);
-        let panel = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.bottom().saturating_sub(height + 1),
-            width,
-            height,
-        );
-        frame.render_widget(Clear, panel);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .style(
-                    Style::default()
-                        .fg(model.palette.text)
-                        .bg(model.palette.panel_bg),
-                )
-                .block(
-                    Block::default()
-                        .title(" prefix commands ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(model.palette.accent)),
+        render_panel(
+            model,
+            frame,
+            area,
+            Panel {
+                title: format!(
+                    "commands — prefix {}",
+                    key_display(&model.config.effective_prefix())
                 ),
-            panel,
+                lines,
+                hints: vec![("h/←", "sidebar"), ("→", "screen"), ("?", "close")],
+                max_width: (label_width as u16 + 12) * 2 + 4,
+                bottom: true,
+            },
         );
         return;
-    }
-    if !model.hooks_ok && area.width > 2 && area.height > 2 {
-        let warning = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), 1);
-        frame.render_widget(Clear, warning);
-        frame.render_widget(
-            Paragraph::new("⚠ hooks not installed — run: cb install-hooks").style(
-                Style::default()
-                    .fg(model.palette.peach)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            warning,
-        );
     }
     for (index, card) in toast_cards(&model.toasts, model.screen) {
         let toast = &model.toasts[index];
@@ -3112,13 +3382,20 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
             Status::WaitingUser => model.palette.green,
             _ => model.palette.text,
         };
-        let text = truncate_ellipsis(&toast.text, card.width.saturating_sub(4) as usize);
+        let glyph = match toast.status {
+            Status::NeedsApproval => '⚑',
+            _ => '●',
+        };
+        let text = truncate_ellipsis(&toast.text, card.width.saturating_sub(6) as usize);
         frame.render_widget(Clear, card);
         frame.render_widget(
-            Paragraph::new(Line::styled(
-                text,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ))
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("{glyph} "),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(text, Style::default().fg(model.palette.text)),
+            ]))
             .style(Style::default().bg(model.palette.surface0))
             .block(
                 Block::default()
@@ -3136,7 +3413,7 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
 fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(model.palette.overlay0))
+        .border_style(Style::default().fg(model.palette.surface1))
         .style(
             Style::default()
                 .fg(model.palette.text)
@@ -3148,18 +3425,36 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    let scope = if model.sidebar.accordion() {
-        "scope: all".to_owned()
+    let (icon, scope) = if model.sidebar.accordion() {
+        ('⌗', "all workspaces".to_owned())
     } else {
-        format!(
-            "scope: {}",
-            scope_display_name(model.sidebar.current_scope())
-        )
+        ('⌂', scope_display_name(model.sidebar.current_scope()))
     };
+    let scope = truncate_with_ellipsis(scope, usize::from(inner.width).saturating_sub(3));
     frame.render_widget(
-        Paragraph::new(scope).style(Style::default().fg(model.palette.overlay0)),
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {icon} "),
+                Style::default().fg(model.palette.accent),
+            ),
+            Span::styled(
+                scope,
+                Style::default()
+                    .fg(model.palette.text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
+    if inner.height >= 2 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "─".repeat(usize::from(inner.width)),
+                Style::default().fg(model.palette.surface1),
+            )),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
+    }
 
     let mut display_rows: Vec<(Option<usize>, Line<'static>)> = Vec::new();
     for (index, row) in model.sidebar.rows().iter().enumerate() {
@@ -3178,12 +3473,12 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
         display_rows.push((
             None,
             Line::from(Span::styled(
-                " no sessions",
+                " no sessions yet",
                 Style::default().fg(model.palette.overlay0),
             )),
         ));
     }
-    let list_height = inner.height.saturating_sub(3) as usize;
+    let list_height = inner.height.saturating_sub(2) as usize;
     let cursor_row = display_rows
         .iter()
         .position(|(index, _)| *index == Some(model.sidebar.cursor()))
@@ -3202,12 +3497,6 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
             Rect::new(inner.x, inner.y + 2 + row as u16, inner.width, 1),
         );
     }
-    if inner.height >= 2 {
-        frame.render_widget(
-            Paragraph::new(status_counts(model)),
-            Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
-        );
-    }
 }
 
 fn sidebar_row(model: &Model, row: &Row, index: usize, width: u16) -> Line<'static> {
@@ -3218,6 +3507,19 @@ fn sidebar_row(model: &Model, row: &Row, index: usize, width: u16) -> Line<'stat
     } else {
         model.palette.overlay0
     };
+    let width = usize::from(width);
+    // A selected row is highlighted across the sidebar's full width; the line
+    // style supplies the surface so span backgrounds stay untouched.
+    let fill = |mut line: Line<'static>| {
+        if !selected {
+            return line;
+        }
+        let used = line.width();
+        if width > used {
+            line.push_span(Span::raw(" ".repeat(width - used)));
+        }
+        line.style(Style::default().bg(model.palette.surface0))
+    };
     match row {
         Row::Scope {
             key,
@@ -3225,38 +3527,46 @@ fn sidebar_row(model: &Model, row: &Row, index: usize, width: u16) -> Line<'stat
             expanded,
         } => {
             let glyph = if *expanded { '▾' } else { '▸' };
-            let trailer = format!("{count} {glyph}");
-            let trailer_width = Line::from(trailer.as_str()).width();
-            let name_width = usize::from(width)
-                .saturating_sub(1 + trailer_width)
-                .saturating_sub(1);
+            let trailer = count.to_string();
+            let trailer_width = trailer.chars().count();
+            let name_width = width.saturating_sub(3 + trailer_width).saturating_sub(1);
             let name = truncate_with_ellipsis(scope_display_name(key), name_width);
-            let left_width = 1 + Line::from(name.as_str()).width();
-            let gap = usize::from(width)
-                .saturating_sub(left_width + trailer_width)
-                .max(1);
-            Line::from(vec![
+            let left_width = 3 + Line::from(name.as_str()).width();
+            let gap = width.saturating_sub(left_width + trailer_width).max(1);
+            fill(Line::from(vec![
                 Span::styled(gutter.to_owned(), Style::default().fg(gutter_color)),
-                Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{glyph} "),
+                    Style::default().fg(model.palette.overlay1),
+                ),
+                Span::styled(
+                    name,
+                    Style::default()
+                        .fg(model.palette.text)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" ".repeat(gap)),
-                Span::raw(trailer),
-            ])
+                Span::styled(trailer, Style::default().fg(model.palette.overlay1)),
+            ]))
         }
         Row::Session { session, .. } => {
             let (glyph, color) = indicator(session, model.spin, &model.palette);
+            let ended = session.status == Status::Ended;
+            let marker = model.worktree_cwds.contains(&session.cwd);
+            let label_max = width.saturating_sub(4 + if marker { 2 } else { 0 });
+            let label = truncate_with_ellipsis(session_label(session, &model.tasks), label_max);
             let mut spans = vec![
                 Span::styled(gutter.to_owned(), Style::default().fg(gutter_color)),
                 Span::raw(" "),
                 Span::styled(glyph.to_string(), Style::default().fg(color)),
                 Span::raw(" "),
                 Span::styled(
-                    session_label(session, &model.tasks),
+                    label,
                     Style::default()
-                        .fg(model.palette.text)
-                        .bg(if selected {
-                            model.palette.surface0
+                        .fg(if ended {
+                            model.palette.overlay1
                         } else {
-                            model.palette.panel_bg
+                            model.palette.text
                         })
                         .add_modifier(if selected {
                             Modifier::BOLD
@@ -3265,13 +3575,13 @@ fn sidebar_row(model: &Model, row: &Row, index: usize, width: u16) -> Line<'stat
                         }),
                 ),
             ];
-            if model.worktree_cwds.contains(&session.cwd) {
+            if marker {
                 spans.push(Span::styled(
                     " ⎇",
                     Style::default().fg(model.palette.overlay0),
                 ));
             }
-            Line::from(spans)
+            fill(Line::from(spans))
         }
     }
 }
@@ -3303,34 +3613,64 @@ fn is_linked_worktree(cwd: &Path) -> bool {
     }
 }
 
-fn status_counts(model: &Model) -> Line<'static> {
-    let count = |status| {
-        model
-            .sidebar
-            .sessions()
-            .iter()
-            .filter(|session| session.status == status)
-            .count()
-    };
-    Line::from(vec![
-        Span::styled("⠴", Style::default().fg(model.palette.green)),
-        Span::raw(format!(" {} ", count(Status::Working))),
-        Span::styled("⚑", Style::default().fg(model.palette.red)),
-        Span::raw(format!(" {} ", count(Status::NeedsApproval))),
-        Span::styled("●", Style::default().fg(model.palette.green)),
-        Span::raw(format!(" {} ", count(Status::WaitingUser))),
-        Span::styled("●", Style::default().fg(model.palette.yellow)),
-        Span::raw(format!(" {}", count(Status::Idle))),
-    ])
+/// Welcome screen for the pane while no session is attached: the real
+/// bindings, centred, instead of a lone grey sentence.
+fn render_empty_state(model: &Model, frame: &mut Frame) {
+    let pane = model.pane;
+    let palette = &model.palette;
+    let prefix = key_display(&model.config.effective_prefix());
+    if pane.width < 34 || pane.height < 10 {
+        frame.render_widget(
+            Paragraph::new(format!("no sessions — {prefix} n starts one"))
+                .style(Style::default().fg(palette.overlay0)),
+            pane,
+        );
+        return;
+    }
+    let binding = |id: &str| model.config.bindings.get(id).cloned().unwrap_or_default();
+    let entries = [
+        (binding("new_claude"), "new claude session"),
+        (binding("new_codex"), "new codex session"),
+        (binding("new_worktree"), "session in a worktree"),
+        (binding("session_history"), "resume a past session"),
+        (binding("task_backlog"), "task backlog"),
+        ("?".to_owned(), "all commands"),
+    ];
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("◇ ", Style::default().fg(palette.accent)),
+            Span::styled(
+                "codebridge",
+                Style::default()
+                    .fg(palette.text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::default(),
+    ];
+    for (key, label) in &entries {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{prefix} {key}"),
+                Style::default().fg(palette.accent),
+            ),
+            Span::styled(format!("   {label}"), Style::default().fg(palette.subtext0)),
+        ]));
+    }
+    let block_width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let block_height = lines.len() as u16;
+    let rect = Rect::new(
+        pane.x + pane.width.saturating_sub(block_width) / 2,
+        pane.y + pane.height.saturating_sub(block_height) / 2,
+        block_width.min(pane.width),
+        block_height.min(pane.height),
+    );
+    frame.render_widget(Paragraph::new(lines), rect);
 }
 
 fn render_terminal(model: &Model, frame: &mut Frame) {
     let Some(terminal) = model.frame.as_ref() else {
-        frame.render_widget(
-            Paragraph::new("No sessions. Ctrl-a n starts Claude; Ctrl-a c starts Codex.")
-                .style(Style::default().fg(model.palette.overlay0)),
-            model.pane,
-        );
+        render_empty_state(model, frame);
         return;
     };
     let width = model.pane.width.min(terminal.cols);
@@ -3399,9 +3739,9 @@ fn render_scrollbar(model: &Model, frame: &mut Frame, area: Rect) {
         frame.buffer_mut()[(area.x, area.y + y)]
             .set_symbol(if active { "┃" } else { "│" })
             .set_fg(if active {
-                model.palette.mauve
+                model.palette.accent
             } else {
-                model.palette.overlay0
+                model.palette.surface1
             });
     }
 }
@@ -3643,6 +3983,216 @@ mod tests {
     fn color_wire_format_round_trips_rgb_and_palette() {
         assert_eq!(decode_color(0x1000_00f0), Color::Indexed(0xf0));
         assert_eq!(decode_color(0x2012_3456), Color::Rgb(0x12, 0x34, 0x56));
+    }
+
+    #[test]
+    fn view_reserves_header_and_footer_around_the_pane() {
+        let area = Rect::new(0, 0, 120, 40);
+        let live = view(false, area);
+        // Footer spans the full width on the last row; header tops the main
+        // column; the pane fills the rest of the main column.
+        assert_eq!(live.footer, Some(Rect::new(0, 39, 120, 1)));
+        assert_eq!(live.header, Some(Rect::new(SIDEBAR_WIDTH, 0, 90, 1)));
+        assert_eq!(live.pane, Rect::new(SIDEBAR_WIDTH, 1, 90, 38));
+        assert_eq!(live.sidebar, Rect::new(0, 0, SIDEBAR_WIDTH, 39));
+        assert!(live.scrollbar.is_none());
+
+        // Scrollback claims the pane's rightmost column, below the header.
+        let scrolled = view(true, area);
+        assert_eq!(scrolled.pane.width, 89);
+        assert_eq!(scrolled.scrollbar, Some(Rect::new(119, 1, 1, 38)));
+    }
+
+    #[test]
+    fn view_degrades_gracefully_on_tiny_terminals() {
+        // Too short for any chrome: the pane takes everything.
+        let tiny = view(false, Rect::new(0, 0, 80, 3));
+        assert!(tiny.footer.is_none());
+        assert!(tiny.header.is_none());
+        assert_eq!(tiny.pane, Rect::new(SIDEBAR_WIDTH, 0, 50, 3));
+
+        // Four rows fit a header but not yet a footer.
+        let short = view(false, Rect::new(0, 0, 80, 4));
+        assert!(short.footer.is_none());
+        assert!(short.header.is_some());
+        assert_eq!(short.pane, Rect::new(SIDEBAR_WIDTH, 1, 50, 3));
+    }
+
+    fn test_model() -> Model {
+        Model {
+            sidebar: Sidebar::new(Path::new("/tmp")),
+            launch_cwd: PathBuf::from("/tmp"),
+            focus: Focus::Sidebar,
+            prefix: false,
+            help: false,
+            scroll_mode: false,
+            frame: None,
+            attach: None,
+            error: String::new(),
+            previous_status: HashMap::new(),
+            pending_notifications: HashMap::new(),
+            outer_focused: true,
+            worktree_cwds: Default::default(),
+            hooks_ok: true,
+            toasts: Vec::new(),
+            rename: None,
+            worktree_picker: None,
+            config: Config::default(),
+            palette: Palette::catppuccin(),
+            config_menu: None,
+            selection: None,
+            last_click: None,
+            word_selecting: false,
+            tasks: Vec::new(),
+            task_modal: None,
+            history_modal: None,
+            pending_jump: None,
+            spin: 0,
+            pane: Rect::default(),
+            screen: Rect::default(),
+        }
+    }
+
+    /// Drive `render` across every chrome surface — bars, empty state, live
+    /// session, and each modal — so a geometry regression panics here rather
+    /// than in a live terminal.
+    #[test]
+    fn chrome_renders_every_surface_without_panicking() {
+        use ratatui::backend::TestBackend;
+
+        let mut model = test_model();
+        let area = Rect::new(0, 0, 100, 30);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let mut draw = |model: &mut Model| {
+            compute_view(model, area);
+            terminal.draw(|frame| render(model, frame)).unwrap();
+        };
+
+        // Empty state with header/footer bars.
+        draw(&mut model);
+
+        // A live attached session with scrollback drives the header session
+        // path, sidebar rows, terminal cells, and the scrollbar.
+        let session = SessionInfo {
+            id: "abcd1234-rest".to_owned(),
+            name: String::new(),
+            argv: vec!["claude".to_owned()],
+            cwd: "/tmp".to_owned(),
+            status: Status::Working,
+            last_message: String::new(),
+            harness_session_id: String::new(),
+            exited: false,
+            status_since_unix_ms: 0,
+            transcript_path: String::new(),
+        };
+        model.sidebar.update(vec![session]);
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        model.attach = Some(Attach {
+            id: "abcd1234-rest".to_owned(),
+            writer: BufWriter::new(stream),
+        });
+        model.frame = Some(TerminalFrame {
+            rows: 5,
+            cols: 10,
+            cells: Vec::new(),
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: true,
+            mouse_reporting: false,
+            offset: 3,
+            max_offset: 40,
+        });
+        draw(&mut model);
+
+        // Footer variants: error, armed prefix, scroll mode, hook warning.
+        model.error = "broker unreachable".to_owned();
+        draw(&mut model);
+        model.error.clear();
+        model.prefix = true;
+        draw(&mut model);
+        model.prefix = false;
+        model.scroll_mode = true;
+        draw(&mut model);
+        model.scroll_mode = false;
+        model.hooks_ok = false;
+        draw(&mut model);
+        model.hooks_ok = true;
+
+        // Every modal panel.
+        model.history_modal = Some(HistoryModal { cursor: 0 });
+        draw(&mut model);
+        model.history_modal = None;
+        model.task_modal = Some(TaskModal {
+            stage: TaskStage::List,
+            cursor: 0,
+        });
+        draw(&mut model);
+        model.task_modal = Some(TaskModal {
+            stage: TaskStage::New {
+                title: "ship it".to_owned(),
+                desc: "details".to_owned(),
+                title_active: true,
+            },
+            cursor: 0,
+        });
+        draw(&mut model);
+        model.task_modal = None;
+        model.rename = Some(Rename {
+            id: "abcd".to_owned(),
+            input: "new name".to_owned(),
+        });
+        draw(&mut model);
+        model.rename = None;
+        for (theme_cursor, notification_cursor) in [(None, None), (Some(2), None), (None, Some(1))]
+        {
+            model.config_menu = Some(ConfigMenu {
+                cursor: 0,
+                capture: false,
+                error: String::new(),
+                theme_cursor,
+                notification_cursor,
+                original_theme: None,
+            });
+            draw(&mut model);
+        }
+        model.config_menu = None;
+        model.toasts.push(Toast {
+            session_id: "abcd1234-rest".to_owned(),
+            status: Status::NeedsApproval,
+            text: "approve command?".to_owned(),
+        });
+        draw(&mut model);
+
+        // A terminal too small for any chrome still renders.
+        let tiny_area = Rect::new(0, 0, 10, 2);
+        let mut tiny = Terminal::new(TestBackend::new(tiny_area.width, tiny_area.height)).unwrap();
+        compute_view(&mut model, tiny_area);
+        tiny.draw(|frame| render(&model, frame)).unwrap();
+    }
+
+    #[test]
+    fn key_display_compacts_ctrl_bindings() {
+        assert_eq!(key_display("ctrl+a"), "^a");
+        assert_eq!(key_display("enter"), "enter");
+        assert_eq!(key_display("["), "[");
+    }
+
+    #[test]
+    fn shorten_path_prefers_home_and_keeps_the_tail() {
+        assert_eq!(shorten_path("/home/dev", Some("/home/dev"), 20), "~");
+        assert_eq!(
+            shorten_path("/home/dev/src/app", Some("/home/dev"), 20),
+            "~/src/app"
+        );
+        assert_eq!(
+            shorten_path("/home/devotion", Some("/home/dev"), 20),
+            "/home/devotion"
+        );
+        assert_eq!(
+            shorten_path("/home/dev/very/deep/nested/dir", Some("/home/dev"), 12),
+            "…/nested/dir"
+        );
+        assert_eq!(shorten_path("/x", None, 0), "");
     }
 
     #[test]

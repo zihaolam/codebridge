@@ -292,16 +292,19 @@ aside header .conn-dot {
   background: currentColor;
   flex: none;
 }
-.status-dot.pulse {
-  animation: dot-pulse 1.6s ease-out infinite;
+/* Working: a spinning ring instead of a dot, matching the TUI's spinner. */
+.status-spinner {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, currentColor 30%, transparent);
+  border-top-color: currentColor;
+  animation: spinner-turn 0.9s linear infinite;
+  flex: none;
 }
-@keyframes dot-pulse {
-  0% {
-    box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 45%, transparent);
-  }
-  70%,
-  100% {
-    box-shadow: 0 0 0 6px transparent;
+@keyframes spinner-turn {
+  to {
+    transform: rotate(360deg);
   }
 }
 
@@ -669,6 +672,55 @@ main {
   font-family: var(--mono);
 }
 
+/* Session-history picker rows: live/paused runs labelled by first message. */
+.history-row {
+  align-items: center;
+}
+.history-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Prefix-command chrome: the armed indicator and the `?` help overlay. */
+.prefix-chip {
+  position: fixed;
+  right: 14px;
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  z-index: 20;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--dim);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.help-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+}
+.help-row kbd {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  padding: 1px 6px;
+  min-width: 34px;
+  text-align: center;
+}
+.help-row span {
+  color: var(--dim);
+  font-size: 13px;
+}
+
 /* ---- Banners, empty states, token gate ---- */
 
 .banner {
@@ -792,7 +844,7 @@ main > .empty {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .status-dot.pulse {
+  .status-spinner {
     animation: none;
   }
   .chevron {

@@ -4,7 +4,8 @@
 // React render cycle.
 //
 // FitAddon reports this client's viewport without resizing the shared PTY.
-// The top-bar resize button is the only browser action that claims PTY size.
+// Attaching claims the PTY at this browser's grid once per session; the
+// top-bar resize button re-claims on demand (e.g. after a desktop `prefix z`).
 import { useEffect, useRef } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
@@ -30,13 +31,6 @@ function measureCols(lines: string[]): number {
   return max
 }
 
-// Phones use the swappable list/term layout below this width (see the CSS
-// `@media (max-width: 768px)` breakpoint). Only there do we auto-claim the PTY
-// size — a desktop browser leaves the canonical size to the host TUI.
-function isMobile(): boolean {
-  return window.matchMedia('(max-width: 768px)').matches
-}
-
 function writeFrame(term: Terminal, f: Down, lines: string[]) {
   // Home + repaint each line with clear-to-EOL (avoids a full-screen clear,
   // which flickers), clear below, then park the cursor where the frame says.
@@ -57,7 +51,7 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
   // the wire traffic.
   const scrollRef = useRef({ target: 0, sent: 0, max: 0 })
   const sentRef = useRef({ rows: 0, cols: 0 })
-  // Whether this phone has already claimed the PTY size for the current
+  // Whether this client has already claimed the PTY size for the current
   // session. One-shot per attach so a later desktop `prefix z` reclaim isn't
   // immediately fought back on the next viewport tick.
   const claimedRef = useRef(false)
@@ -122,7 +116,7 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
         }
         // Fallback auto-claim for when the pane wasn't measurable at attach
         // time (mobile list→term transition): claim once it has a real size.
-        if (isMobile() && !claimedRef.current) {
+        if (!claimedRef.current) {
           claimedRef.current = true
           client.resize(g.rows, g.cols)
         }
@@ -160,15 +154,12 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
       client.attach(sessionId)
       if (g) {
         client.viewport(g.rows, g.cols)
-        // On phones, claim the PTY at this screen's grid on load so the agent
-        // reflows to the phone width and vertical history (keybar ↑/↓) pages
-        // readably. Desktop stays presentation-only. If the pane isn't measured
-        // yet the ResizeObserver claims once it is; `prefix z` on the terminal
-        // reclaims the desktop size.
-        if (isMobile()) {
-          claimedRef.current = true
-          client.resize(g.rows, g.cols)
-        }
+        // Claim the PTY at this browser's grid on attach so the agent reflows
+        // to fit without a manual resize. One-shot per attach; if the pane
+        // isn't measured yet the ResizeObserver claims once it is, and
+        // `prefix z` on the host TUI reclaims its size at any time.
+        claimedRef.current = true
+        client.resize(g.rows, g.cols)
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -225,7 +216,7 @@ export default function Term({ client, sessionId }: { client: CbClient; sessionI
     return clamped
   }
 
-  // A vertical finger drag browses that same daemon scrollback. After the mobile
+  // A vertical finger drag browses that same daemon scrollback. After the
   // auto-resize the frame fits the pane, so there is no native pan to fight (the
   // reason this used to be button-only) — map drag distance straight to the
   // scroll offset. Drag down (dy>0) reveals earlier output (offset up). A

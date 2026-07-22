@@ -4,10 +4,12 @@ import SessionList from './SessionList'
 import TaskList from './TaskList'
 import Term from './Term'
 import WorktreePicker, { type PickerData } from './WorktreePicker'
+import HistoryModal from './HistoryModal'
 import KeyBar from './KeyBar'
 import StatusDot from './StatusDot'
 import { basename, sessionLabel } from './format'
-import { IconChevronLeft, IconMaximize, IconX } from './icons'
+import { DEFAULT_BINDINGS, DEFAULT_PREFIX, WEB_ACTIONS, keyName } from './prefix'
+import { IconChevronLeft, IconHistory, IconMaximize, IconX } from './icons'
 
 const TOKEN_KEY = 'cb-token'
 
@@ -72,6 +74,13 @@ function Dashboard({ token, onAuthFailed }: { token: string; onAuthFailed: () =>
   // The sidebar shows either the session list or the backlog (list icon toggle).
   const [screen, setScreen] = useState<'sessions' | 'tasks'>('sessions')
   const [picker, setPicker] = useState<PickerData | null>(null)
+  // The TUI's prefix-command state: the configured keymap (hello carries the
+  // user's real config; defaults until then), whether the prefix is armed,
+  // and the help / session-history overlays it opens.
+  const [keymap, setKeymap] = useState({ prefix: DEFAULT_PREFIX, bindings: DEFAULT_BINDINGS })
+  const [armed, setArmed] = useState(false)
+  const [help, setHelp] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
   const selectedRef = useRef(selected)
   selectedRef.current = selected
 
@@ -94,6 +103,8 @@ function Dashboard({ token, onAuthFailed }: { token: string; onAuthFailed: () =>
       if (!selectedRef.current && list.length > 0) setSelected(list[0].id)
     }
     client.onTasks = setTasks
+    client.onKeymap = (prefix, bindings) =>
+      setKeymap({ prefix, bindings: { ...DEFAULT_BINDINGS, ...bindings } })
     client.onAgents = setAgents
     client.onError = (msg) => setErrors((e) => [...e.slice(-4), msg])
     client.onSpawned = (id) => {
@@ -138,6 +149,109 @@ function Dashboard({ token, onAuthFailed }: { token: string; onAuthFailed: () =>
     setView('list')
   }
 
+  // Prefix-command dispatch, mirroring tui.rs handle_prefix for the actions a
+  // browser can perform. The TUI spawns in its launch cwd; the browser has no
+  // launch cwd, so new sessions land next to the current one (or the first
+  // listed session as a fallback).
+  const runPrefixAction = (action?: string) => {
+    const cwd = current?.cwd ?? sessions[0]?.cwd
+    switch (action) {
+      case 'new_claude':
+      case 'new_codex':
+        if (cwd) client.spawn([action === 'new_claude' ? 'claude' : 'codex'], cwd)
+        break
+      case 'new_worktree':
+        if (cwd) {
+          setPicker({ cwd, worktrees: null, agents: [] })
+          client.worktrees(cwd)
+        }
+        break
+      case 'kill':
+        killCurrent()
+        break
+      case 'jump_pending': {
+        const s = sessions.find((x) => x.status === 'needs_approval')
+        if (s) {
+          setSelected(s.id)
+          setView('term')
+        }
+        break
+      }
+      case 'resize_pane':
+        window.dispatchEvent(new Event('cb-resize-session'))
+        break
+      case 'newline':
+        client.input('\n')
+        break
+      case 'task_backlog':
+        setScreen('tasks')
+        setView('list')
+        break
+      case 'session_history':
+        setHistoryOpen(true)
+        break
+    }
+  }
+
+  // Snapshot the state the key handler needs; the listener itself registers
+  // once (capture phase, so xterm never sees a swallowed key) and reads the
+  // latest through this ref, the same pattern as selectedRef above.
+  const prefixCtx = useRef({ keymap, armed, help, modal: false, run: runPrefixAction })
+  prefixCtx.current = {
+    keymap,
+    armed,
+    help,
+    modal: picker !== null || historyOpen,
+    run: runPrefixAction,
+  }
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const ctx = prefixCtx.current
+      if (ctx.modal) return // pickers own their keys
+      // Leave real form fields alone (task editor, rename inputs); xterm's
+      // hidden textarea is the exception — it IS the terminal.
+      const target = e.target as HTMLElement | null
+      if (
+        target &&
+        (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') &&
+        !target.classList.contains('xterm-helper-textarea')
+      )
+        return
+      if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return
+      const name = keyName(e)
+      if (!ctx.armed && !ctx.help) {
+        if (name && name === ctx.keymap.prefix) {
+          e.preventDefault()
+          e.stopPropagation()
+          setArmed(true)
+        }
+        return
+      }
+      // Armed (or help open): the keystroke is a command, never terminal
+      // input — swallow it whether or not it maps to anything, like the TUI.
+      e.preventDefault()
+      e.stopPropagation()
+      if (name === ctx.keymap.prefix) {
+        // Pressing the prefix again just re-arms.
+        setHelp(false)
+        setArmed(true)
+        return
+      }
+      setArmed(false)
+      if (e.key === '?') {
+        setHelp(!ctx.help)
+        return
+      }
+      setHelp(false)
+      if (e.key === 'Escape') return
+      const action = Object.entries(ctx.keymap.bindings).find(([, key]) => key === name)?.[0]
+      ctx.run(action)
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [])
+
   return (
     <div className={`app view-${view}`}>
       <aside>
@@ -145,6 +259,13 @@ function Dashboard({ token, onAuthFailed }: { token: string; onAuthFailed: () =>
           <span className="brand-tile">cb</span>
           <span className="brand-name">codebridge</span>
           <span className={`conn-dot conn-${state}`} title={state} />
+          <button
+            className="icon-btn"
+            title="session history — resume past sessions (prefix m)"
+            onClick={() => setHistoryOpen(true)}
+          >
+            <IconHistory />
+          </button>
         </header>
         <nav className="seg">
           <button
@@ -253,6 +374,36 @@ function Dashboard({ token, onAuthFailed }: { token: string; onAuthFailed: () =>
           }}
         />
       )}
+      {historyOpen && (
+        <HistoryModal
+          tasks={tasks}
+          sessions={sessions}
+          onClose={() => setHistoryOpen(false)}
+          onJump={(id) => {
+            setSelected(id)
+            setView('term')
+            setHistoryOpen(false)
+          }}
+          onResume={(taskId, runId, cwd) => {
+            client.taskResume(taskId, runId, cwd)
+            setHistoryOpen(false)
+          }}
+        />
+      )}
+      {help && (
+        <div className="overlay" onClick={() => setHelp(false)}>
+          <div className="picker" onClick={(e) => e.stopPropagation()}>
+            <div className="picker-title">prefix = {keymap.prefix}</div>
+            {WEB_ACTIONS.map((a) => (
+              <div key={a.id} className="help-row">
+                <kbd>{keymap.bindings[a.id] ?? a.default}</kbd>
+                <span>{a.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {armed && <div className="prefix-chip">prefix — ? for help</div>}
     </div>
   )
 }

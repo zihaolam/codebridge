@@ -94,9 +94,12 @@ tears down both processes.
   filesystem scope data) and attaches straight to the conductor for the frame
   stream, adapting semantic frames to the PWA's ANSI/xterm contract. A browser
   attach carries `rows/cols = 0`, so the attach itself never resizes the
-  canonical PTY; the phone claims a size only via a separate `resize` message
-  (auto-claimed once on mobile load so the agent reflows to the phone, or on
-  demand from the top-bar button).
+  canonical PTY; the browser claims a size only via a separate `resize` message
+  (auto-claimed once per attach so the agent reflows to the browser, or on
+  demand from the top-bar button). The hello also carries the user's prefix key
+  and bindings so the PWA honours the TUI's prefix commands (the browser-
+  executable subset, plus a session-history picker resuming paused runs via
+  the proxied `task_resume`).
 - `src/config.rs`, `src/worktree.rs`, and `src/notify.rs` provide persistent
   bindings, per-launch worktree/agent selection, and delayed/focus-aware
   notification delivery through Codebridge, terminal OSC, or native services.
@@ -208,12 +211,12 @@ that picker.
 - Suppress intermediate frames while synchronized-output mode 2026 is active.
 - Preserve semantic cells on the daemon wire. The terminal client draws cells;
   only the web compatibility adapter produces ANSI.
-- A phone viewport is presentation-only except for an explicit size claim: a
-  phone claims the shared PTY at its own grid once on mobile load (so the agent
-  reflows narrow and daemon scrollback pages readably) and again via the top-bar
-  button; the claim is one-shot per attach so it never fights a desktop `prefix
-  z` reclaim. Transient viewport changes (keyboard, `viewport` messages) still
-  never resize the PTY.
+- A browser viewport is presentation-only except for an explicit size claim:
+  every web client claims the shared PTY at its own grid once per attach (so
+  the agent reflows to the browser and daemon scrollback pages readably) and
+  again via the top-bar button; the claim is one-shot per attach so it never
+  fights a desktop `prefix z` reclaim. Transient viewport changes (keyboard,
+  `viewport` messages) still never resize the PTY.
 - Mouse reporting belongs to the child when its terminal mode requests it.
   Shift is the local in-app selection override.
 - Hooks must be bounded, best-effort observers and always exit successfully.

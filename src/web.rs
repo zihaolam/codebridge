@@ -304,6 +304,9 @@ impl Server {
             .into_iter()
             .map(|agent| agent.binary.to_owned())
             .collect();
+        // Carry the user's prefix-command config so the browser honours the
+        // same prefix key and bindings as the TUI (defaults if never saved).
+        let keymap = crate::config::Config::load();
         send_latest(
             &out,
             WsDown {
@@ -311,6 +314,8 @@ impl Server {
                 protocol: Some(VERSION),
                 daemon: Some(ping_daemon()),
                 agents,
+                prefix: keymap.effective_prefix(),
+                bindings: keymap.bindings,
                 ..WsDown::default()
             },
         );
@@ -461,6 +466,12 @@ struct WsDown {
     worktrees: Vec<WebWorktree>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     agents: Vec<String>,
+    // Prefix-command keymap (hello only): the effective prefix key and the
+    // action -> key bindings, named as tui.rs `key_name` produces them.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    prefix: String,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    bindings: HashMap<String, String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     error: String,
 }
@@ -564,8 +575,9 @@ fn attach_browser(
     }
     // Attach the browser straight to the conductor's data plane rather than
     // hopping through the broker (which is this same process). Rows/cols stay 0
-    // so the conductor does not resize the canonical PTY — a phone viewport is
-    // presentation-only; only the explicit resize action resizes the shared PTY.
+    // so the attach itself never resizes the canonical PTY — a browser viewport
+    // is presentation-only; only an explicit `resize` message claims the shared
+    // PTY (sent once per attach by the client, or from its top-bar button).
     let mut stream = match UnixStream::connect(conductor_socket_path()) {
         Ok(stream) => stream,
         Err(error) => {

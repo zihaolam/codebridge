@@ -65,6 +65,10 @@ export type Down = {
   type: 'hello' | 'sessions' | 'tasks' | 'frame' | 'gone' | 'spawned' | 'worktrees' | 'error'
   protocol?: number
   daemon?: boolean
+  // The user's prefix-command config (hello only): the effective prefix key
+  // and action -> key bindings, named exactly as tui.rs key_name produces.
+  prefix?: string
+  bindings?: Record<string, string>
   sessions?: SessionInfo[]
   tasks?: TaskInfo[]
   id?: string
@@ -102,6 +106,7 @@ const MAX_RETRY_MS = 15_000
 export class CbClient {
   onState?: (s: ClientState) => void
   onHello?: (protocol: number, daemon: boolean) => void
+  onKeymap?: (prefix: string, bindings: Record<string, string>) => void
   onAgents?: (agents: string[]) => void
   onSessions?: (s: SessionInfo[]) => void
   onTasks?: (t: TaskInfo[]) => void
@@ -161,6 +166,8 @@ export class CbClient {
         this.retryMs = BASE_RETRY_MS
         this.onState?.('open')
         this.onHello?.(m.protocol ?? 0, m.daemon ?? false)
+        // Absent from a pre-keymap bridge; the client then keeps its defaults.
+        if (m.prefix) this.onKeymap?.(m.prefix, m.bindings ?? {})
         this.onAgents?.(m.agents ?? [])
         // Re-attach after a reconnect so the frame stream resumes.
         if (this.attachedId) {
@@ -259,5 +266,12 @@ export class CbClient {
 
   taskStart(id: string, agent: string, cwd: string) {
     this.send({ type: 'task_start', id, agent, cwd })
+  }
+
+  // Resume a paused run (the session-history picker). The daemon respawns in
+  // the run's origin cwd — the cwd here is only its fallback — and the bridge
+  // answers `spawned` with the fresh session id.
+  taskResume(id: string, runId: string, cwd: string) {
+    this.send({ type: 'task_resume', id, run_id: runId, cwd })
   }
 }

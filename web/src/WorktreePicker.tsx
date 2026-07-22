@@ -37,11 +37,17 @@ export default function WorktreePicker({
   const [chosen, setChosen] = useState<WorktreeEntry | null>(null)
 
   useEffect(() => {
+    // Capture phase, event swallowed: when the picker opens from the prefix
+    // key, focus still sits in xterm's hidden textarea, and xterm would
+    // otherwise consume the Escape and forward it into the agent.
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
+      if (e.key !== 'Escape') return
+      e.preventDefault()
+      e.stopPropagation()
+      onClose()
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
   }, [onClose])
 
   return (
