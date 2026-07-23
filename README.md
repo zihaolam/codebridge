@@ -185,6 +185,7 @@ bindings.
 | scroll mode    | `[`         | freeze the screen pane to browse scrollback |
 | new claude     | `n`         | start a new claude session |
 | new codex      | `c`         | start a new codex session |
+| new worktree   | `w`         | pick a git worktree to start a session in, or **＋ new worktree** to create one (requires [`sprout`](#creating-worktrees-requires-sprout)) |
 | kill           | `x`         | kill the current session |
 | rename         | `r`         | rename the selected session (defaults to its start folder) |
 | jump pending   | `g`         | jump to the session that most recently needs approval |
@@ -192,6 +193,19 @@ bindings.
 | yank           | `y`         | copy the held drag-selection to the system clipboard (OSC52) |
 | open config    | `o`         | open the config menu (see below) |
 | quit           | `q`         | quit cb (sessions keep running) |
+
+#### Creating worktrees requires `sprout`
+
+The `Ctrl-a w` picker always lists and opens your **existing** git worktrees. Its
+**＋ new worktree** row — which creates a fresh one — delegates to the **`sprout`** CLI
+(*git worktrees with CoW-cloned working state, macOS/APFS*), which runs `git worktree add`
+**and** copy-on-write clones your git-ignored working state (`.env`, `node_modules`, build
+caches, …) into the new worktree so it's ready to run immediately. cb calls `sprout new` to
+create it and `sprout path` to locate it, then spawns your chosen agent there.
+
+Install `sprout` and make sure it's on your `PATH` (check with `sprout --version`). Without
+it, the picker still works for existing worktrees but the **＋ new worktree** row is shown
+disabled.
 
 ### Config menu (`Ctrl-a o`)
 

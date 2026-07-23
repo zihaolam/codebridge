@@ -98,6 +98,7 @@ struct Rename {
 
 enum PickerStage {
     Worktree,
+    NewWorktree,
     Agent,
 }
 
@@ -105,9 +106,18 @@ struct WorktreePicker {
     stage: PickerStage,
     worktrees: Vec<Worktree>,
     agents: Vec<AgentChoice>,
+    /// Cursor into the Worktree list, where index 0 is the synthetic
+    /// "＋ new worktree" row and index `n` is `worktrees[n - 1]`.
     worktree_cursor: usize,
     agent_cursor: usize,
     chosen: Option<PathBuf>,
+    /// Worktree name being typed in the `NewWorktree` stage.
+    branch_input: String,
+    /// Last `sprout` failure, shown inline in the `NewWorktree` stage.
+    create_error: String,
+    /// Whether the `sprout` CLI is installed. When false the "＋ new worktree"
+    /// row is shown disabled, since creation delegates to `sprout`.
+    sprout_available: bool,
 }
 
 struct ConfigMenu {
@@ -1837,6 +1847,8 @@ fn open_worktree_picker(model: &mut Model) {
         .launch_cwd
         .canonicalize()
         .unwrap_or_else(|_| model.launch_cwd.clone());
+    // Row 0 is the synthetic "＋ new worktree" action, so the current worktree
+    // sits at its list index + 1.
     let worktree_cursor = worktrees
         .iter()
         .position(|worktree| {
@@ -1846,6 +1858,7 @@ fn open_worktree_picker(model: &mut Model) {
                 .unwrap_or_else(|_| worktree.path.clone())
                 == launch
         })
+        .map(|index| index + 1)
         .unwrap_or_default();
     model.error.clear();
     model.worktree_picker = Some(WorktreePicker {
@@ -1855,6 +1868,9 @@ fn open_worktree_picker(model: &mut Model) {
         worktree_cursor,
         agent_cursor: 0,
         chosen: None,
+        branch_input: String::new(),
+        create_error: String::new(),
+        sprout_available: worktree::sprout_available(),
     });
 }
 
@@ -1873,16 +1889,67 @@ fn handle_worktree_picker(model: &mut Model, key: KeyEvent) -> io::Result<bool> 
                 picker.worktree_cursor = picker.worktree_cursor.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                picker.worktree_cursor =
-                    (picker.worktree_cursor + 1).min(picker.worktrees.len().saturating_sub(1));
+                // The combined list is the "new worktree" row plus every
+                // worktree, so the last index is `worktrees.len()`.
+                picker.worktree_cursor = (picker.worktree_cursor + 1).min(picker.worktrees.len());
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                picker.chosen = picker
-                    .worktrees
-                    .get(picker.worktree_cursor)
-                    .map(|worktree| worktree.path.clone());
-                picker.stage = PickerStage::Agent;
-                picker.agent_cursor = 0;
+                if picker.worktree_cursor == 0 {
+                    // The create row is disabled without the sprout CLI, which
+                    // does the actual worktree creation. Its label says so.
+                    if picker.sprout_available {
+                        picker.stage = PickerStage::NewWorktree;
+                        picker.branch_input.clear();
+                        picker.create_error.clear();
+                    }
+                } else {
+                    picker.chosen = picker
+                        .worktrees
+                        .get(picker.worktree_cursor - 1)
+                        .map(|worktree| worktree.path.clone());
+                    picker.stage = PickerStage::Agent;
+                    picker.agent_cursor = 0;
+                }
+            }
+            _ => {}
+        },
+        PickerStage::NewWorktree => match key.code {
+            KeyCode::Esc | KeyCode::Left => picker.stage = PickerStage::Worktree,
+            KeyCode::Enter => {
+                let branch = picker.branch_input.trim().to_owned();
+                if branch.is_empty() {
+                    picker.create_error = "branch name required".to_owned();
+                } else {
+                    // Worktrees live under the main checkout's `.sprout`; fall
+                    // back to the launch cwd if the main row is somehow absent.
+                    let main = picker
+                        .worktrees
+                        .iter()
+                        .find(|worktree| worktree.main)
+                        .map(|worktree| worktree.path.clone())
+                        .unwrap_or_else(|| model.launch_cwd.clone());
+                    match worktree::create(&main, &branch) {
+                        Ok(path) => {
+                            picker.chosen = Some(path);
+                            picker.stage = PickerStage::Agent;
+                            picker.agent_cursor = 0;
+                            picker.create_error.clear();
+                        }
+                        Err(error) => picker.create_error = error.to_string(),
+                    }
+                }
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                picker.branch_input.pop();
+                picker.create_error.clear();
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                picker.branch_input.push(character);
+                picker.create_error.clear();
             }
             _ => {}
         },
@@ -3486,24 +3553,68 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
         return;
     }
     if let Some(picker) = model.worktree_picker.as_ref() {
+        if matches!(picker.stage, PickerStage::NewWorktree) {
+            let mut lines = vec![
+                Line::styled(
+                    "worktree / branch name",
+                    Style::default().fg(model.palette.overlay0),
+                ),
+                Line::from(vec![
+                    Span::raw(picker.branch_input.clone()),
+                    Span::styled("▎", Style::default().fg(model.palette.accent)),
+                ]),
+                Line::default(),
+                Line::styled(
+                    "sprout creates the worktree and copies your git-ignored files into it",
+                    Style::default().fg(model.palette.subtext0),
+                ),
+            ];
+            if !picker.create_error.is_empty() {
+                lines.push(Line::default());
+                lines.push(Line::styled(
+                    picker.create_error.clone(),
+                    Style::default().fg(model.palette.red),
+                ));
+            }
+            render_panel(
+                model,
+                frame,
+                area,
+                Panel {
+                    title: "new worktree".to_owned(),
+                    lines,
+                    hints: vec![("enter", "create"), ("esc", "back")],
+                    max_width: 60,
+                    bottom: false,
+                },
+            );
+            return;
+        }
+        // In the Worktree stage row 0 is the "create" action, disabled (dimmed,
+        // no-op on enter) when the sprout CLI it delegates to is absent.
+        let disabled_first =
+            matches!(picker.stage, PickerStage::Worktree) && !picker.sprout_available;
         let (title, subtitle, choices, cursor) = match picker.stage {
             PickerStage::Worktree => (
                 "start session in worktree",
                 "git worktree list",
-                picker
-                    .worktrees
-                    .iter()
-                    .map(|worktree| {
-                        let name = worktree
-                            .path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| worktree.path.display().to_string());
-                        format!("{name:<24} {}", worktree::tag(worktree))
-                    })
-                    .collect::<Vec<_>>(),
+                std::iter::once(if picker.sprout_available {
+                    "＋ new worktree".to_owned()
+                } else {
+                    "＋ new worktree  —  requires sprout".to_owned()
+                })
+                .chain(picker.worktrees.iter().map(|worktree| {
+                    let name = worktree
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| worktree.path.display().to_string());
+                    format!("{name:<24} {}", worktree::tag(worktree))
+                }))
+                .collect::<Vec<_>>(),
                 picker.worktree_cursor,
             ),
+            PickerStage::NewWorktree => unreachable!("handled above"),
             PickerStage::Agent => (
                 "choose agent",
                 "agent is selected for this launch only",
@@ -3522,17 +3633,18 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
         ))
         .chain(std::iter::once(Line::default()))
         .chain(choices.into_iter().enumerate().map(|(index, choice)| {
+            let disabled = disabled_first && index == 0;
+            let fg = if disabled {
+                model.palette.overlay0
+            } else if index == cursor {
+                model.palette.text
+            } else {
+                model.palette.subtext0
+            };
             select_line(
                 &model.palette,
                 index == cursor,
-                vec![Span::styled(
-                    choice,
-                    Style::default().fg(if index == cursor {
-                        model.palette.text
-                    } else {
-                        model.palette.subtext0
-                    }),
-                )],
+                vec![Span::styled(choice, Style::default().fg(fg))],
                 inner,
             )
         }))
