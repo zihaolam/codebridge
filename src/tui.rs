@@ -118,6 +118,17 @@ struct WorktreePicker {
     /// Whether the `sprout` CLI is installed. When false the "＋ new worktree"
     /// row is shown disabled, since creation delegates to `sprout`.
     sprout_available: bool,
+    /// A `sprout` creation running on a background thread. While set, the
+    /// `NewWorktree` stage shows a spinner and ignores input; the main loop
+    /// polls it via [`poll_worktree_creation`].
+    creating: Option<Creating>,
+}
+
+/// An in-flight background worktree creation: the name being created and the
+/// channel the worker thread reports its `sprout` result on.
+struct Creating {
+    name: String,
+    rx: Receiver<io::Result<PathBuf>>,
 }
 
 struct ConfigMenu {
@@ -347,6 +358,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         drain_events(&mut model, &receiver);
         deliver_due_notifications(&mut model);
+        poll_worktree_creation(&mut model);
         let previous_pane = model.pane;
         let size = terminal.size()?;
         compute_view(&mut model, Rect::new(0, 0, size.width, size.height));
@@ -1829,6 +1841,37 @@ fn jump_to_session(model: &mut Model, id: &str) {
     }
 }
 
+/// Advances a background `sprout` worktree creation. On success it jumps to the
+/// agent stage with the new worktree chosen; on failure it drops back to the
+/// name input with the error shown. A no-op unless a creation is in flight, so
+/// it is cheap to call every loop iteration.
+fn poll_worktree_creation(model: &mut Model) {
+    let Some(picker) = model.worktree_picker.as_mut() else {
+        return;
+    };
+    let Some(creating) = picker.creating.as_ref() else {
+        return;
+    };
+    match creating.rx.try_recv() {
+        Err(mpsc::TryRecvError::Empty) => {}
+        Ok(Ok(path)) => {
+            picker.chosen = Some(path);
+            picker.stage = PickerStage::Agent;
+            picker.agent_cursor = 0;
+            picker.create_error.clear();
+            picker.creating = None;
+        }
+        Ok(Err(error)) => {
+            picker.create_error = error.to_string();
+            picker.creating = None;
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            picker.create_error = "worktree creation failed".to_owned();
+            picker.creating = None;
+        }
+    }
+}
+
 fn open_worktree_picker(model: &mut Model) {
     let agents = worktree::available_agents();
     if agents.is_empty() {
@@ -1871,6 +1914,7 @@ fn open_worktree_picker(model: &mut Model) {
         branch_input: String::new(),
         create_error: String::new(),
         sprout_available: worktree::sprout_available(),
+        creating: None,
     });
 }
 
@@ -1913,6 +1957,9 @@ fn handle_worktree_picker(model: &mut Model, key: KeyEvent) -> io::Result<bool> 
             }
             _ => {}
         },
+        // While a creation is in flight the stage shows a spinner and swallows
+        // input; `poll_worktree_creation` advances it when `sprout` returns.
+        PickerStage::NewWorktree if picker.creating.is_some() => {}
         PickerStage::NewWorktree => match key.code {
             KeyCode::Esc | KeyCode::Left => picker.stage = PickerStage::Worktree,
             KeyCode::Enter => {
@@ -1928,15 +1975,16 @@ fn handle_worktree_picker(model: &mut Model, key: KeyEvent) -> io::Result<bool> 
                         .find(|worktree| worktree.main)
                         .map(|worktree| worktree.path.clone())
                         .unwrap_or_else(|| model.launch_cwd.clone());
-                    match worktree::create(&main, &branch) {
-                        Ok(path) => {
-                            picker.chosen = Some(path);
-                            picker.stage = PickerStage::Agent;
-                            picker.agent_cursor = 0;
-                            picker.create_error.clear();
-                        }
-                        Err(error) => picker.create_error = error.to_string(),
-                    }
+                    // `sprout new` CoW-clones git-ignored files and can take a
+                    // moment, so run it off the render thread and spin until it
+                    // reports back.
+                    picker.create_error.clear();
+                    let (tx, rx) = mpsc::channel();
+                    let name = branch.clone();
+                    thread::spawn(move || {
+                        let _ = tx.send(worktree::create(&main, &branch));
+                    });
+                    picker.creating = Some(Creating { name, rx });
                 }
             }
             KeyCode::Backspace | KeyCode::Delete => {
@@ -3554,6 +3602,39 @@ fn render_overlays(model: &Model, frame: &mut Frame) {
     }
     if let Some(picker) = model.worktree_picker.as_ref() {
         if matches!(picker.stage, PickerStage::NewWorktree) {
+            if let Some(creating) = picker.creating.as_ref() {
+                let glyph = SPINNERS[model.spin % SPINNERS.len()];
+                let lines = vec![
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{glyph} "),
+                            Style::default().fg(model.palette.green),
+                        ),
+                        Span::styled(
+                            format!("creating worktree “{}”", creating.name),
+                            Style::default().fg(model.palette.text),
+                        ),
+                    ]),
+                    Line::default(),
+                    Line::styled(
+                        "sprout is copying your git-ignored files — this can take a moment",
+                        Style::default().fg(model.palette.subtext0),
+                    ),
+                ];
+                render_panel(
+                    model,
+                    frame,
+                    area,
+                    Panel {
+                        title: "new worktree".to_owned(),
+                        lines,
+                        hints: vec![("", "working…")],
+                        max_width: 60,
+                        bottom: false,
+                    },
+                );
+                return;
+            }
             let mut lines = vec![
                 Line::styled(
                     "worktree / branch name",
